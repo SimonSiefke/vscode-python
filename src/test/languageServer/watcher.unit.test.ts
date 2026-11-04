@@ -3,6 +3,7 @@
 
 import * as assert from 'assert';
 import * as sinon from 'sinon';
+import * as TypeMoq from 'typemoq';
 import { ConfigurationChangeEvent, Uri, WorkspaceFolder, WorkspaceFoldersChangeEvent } from 'vscode';
 import { JediLanguageServerManager } from '../../client/activation/jedi/manager';
 import { NodeLanguageServerManager } from '../../client/activation/node/manager';
@@ -11,12 +12,14 @@ import { IApplicationShell, ICommandManager, IWorkspaceService } from '../../cli
 import { IFileSystem } from '../../client/common/platform/types';
 import {
     IConfigurationService,
+    IPythonSettings,
     IDisposable,
     IExperimentService,
     IExtensions,
     IInterpreterPathService,
 } from '../../client/common/types';
 import { LanguageService } from '../../client/common/utils/localize';
+import { Architecture } from '../../client/common/utils/platform';
 import { IEnvironmentVariablesProvider } from '../../client/common/variables/types';
 import { IInterpreterHelper, IInterpreterService } from '../../client/interpreter/contracts';
 import { IServiceContainer } from '../../client/ioc/types';
@@ -26,7 +29,92 @@ import { PylanceLSExtensionManager } from '../../client/languageServer/pylanceLS
 import { ILanguageServerExtensionManager } from '../../client/languageServer/types';
 import { LanguageServerWatcher } from '../../client/languageServer/watcher';
 import * as Logging from '../../client/logging';
-import { PythonEnvironment } from '../../client/pythonEnvironments/info';
+import { EnvironmentType, PythonEnvironment } from '../../client/pythonEnvironments/info';
+
+suite('Language server watcher lifetime', () => {
+    function createWatcher() {
+        const disposables: IDisposable[] = [];
+        const resource = Uri.file('/project');
+        const firstInterpreter: PythonEnvironment = {
+            path: '/python/one',
+            architecture: Architecture.x64,
+            sysPrefix: '/python',
+            envType: EnvironmentType.Venv,
+        };
+        const secondInterpreter: PythonEnvironment = { ...firstInterpreter, path: '/python/two' };
+        let interpreter = firstInterpreter;
+        const interpreterService = TypeMoq.Mock.ofType<IInterpreterService>();
+        interpreterService.setup((s) => s.getActiveInterpreter(TypeMoq.It.isAny())).returns(async () => interpreter);
+        const workspace = TypeMoq.Mock.ofType<IWorkspaceService>();
+        workspace
+            .setup((w) => w.getWorkspaceFolder(TypeMoq.It.isAny()))
+            .returns(() => ({ uri: resource, name: 'project', index: 0 }));
+        const settings = TypeMoq.Mock.ofType<IPythonSettings>();
+        settings.setup((s) => s.languageServer).returns(() => LanguageServerType.None);
+        settings.setup((s) => s.languageServerIsDefault).returns(() => false);
+        const configuration = TypeMoq.Mock.ofType<IConfigurationService>();
+        configuration.setup((c) => c.getSettings()).returns(() => settings.object);
+        const watcher = new LanguageServerWatcher(
+            TypeMoq.Mock.ofType<IServiceContainer>().object,
+            TypeMoq.Mock.ofType<ILanguageServerOutputChannel>().object,
+            configuration.object,
+            TypeMoq.Mock.ofType<IExperimentService>().object,
+            TypeMoq.Mock.ofType<IInterpreterHelper>().object,
+            TypeMoq.Mock.ofType<IInterpreterPathService>().object,
+            interpreterService.object,
+            TypeMoq.Mock.ofType<IEnvironmentVariablesProvider>().object,
+            workspace.object,
+            TypeMoq.Mock.ofType<ICommandManager>().object,
+            TypeMoq.Mock.ofType<IFileSystem>().object,
+            TypeMoq.Mock.ofType<IExtensions>().object,
+            TypeMoq.Mock.ofType<IApplicationShell>().object,
+            disposables,
+        );
+        return {
+            watcher,
+            disposables,
+            resource,
+            changeInterpreter: () => {
+                interpreter = secondInterpreter;
+            },
+        };
+    }
+
+    test('Replacing a language server does not grow the session disposal registry', async () => {
+        const { watcher, disposables, resource, changeInterpreter } = createWatcher();
+        try {
+            await watcher.startLanguageServer(LanguageServerType.None, resource);
+            const registeredDisposables = disposables.length;
+            changeInterpreter();
+            await watcher.startLanguageServer(LanguageServerType.None, resource);
+            assert.strictEqual(disposables.length, registeredDisposables);
+        } finally {
+            await Promise.all(disposables.map((disposable) => disposable.dispose()));
+        }
+    });
+
+    test('Session disposal cleans up the active server without stopping an old server again', async () => {
+        const { watcher, disposables, resource, changeInterpreter } = createWatcher();
+        const sandbox = sinon.createSandbox();
+        const stop = sandbox.spy(NoneLSExtensionManager.prototype, 'stopLanguageServer');
+        const dispose = sandbox.spy(NoneLSExtensionManager.prototype, 'dispose');
+        try {
+            await watcher.startLanguageServer(LanguageServerType.None, resource);
+            const oldServer = await watcher.get(resource);
+            changeInterpreter();
+            await watcher.startLanguageServer(LanguageServerType.None, resource);
+            const activeServer = await watcher.get(resource);
+            await Promise.all(disposables.map((disposable) => disposable.dispose()));
+            assert.strictEqual(stop.getCalls().filter((call) => call.thisValue === oldServer).length, 1);
+            assert.strictEqual(dispose.getCalls().filter((call) => call.thisValue === oldServer).length, 1);
+            assert.strictEqual(stop.getCalls().filter((call) => call.thisValue === activeServer).length, 1);
+            assert.strictEqual(dispose.getCalls().filter((call) => call.thisValue === activeServer).length, 1);
+        } finally {
+            await Promise.all(disposables.map((disposable) => disposable.dispose()));
+            sandbox.restore();
+        }
+    });
+});
 
 suite('Language server watcher', () => {
     let watcher: LanguageServerWatcher;
@@ -131,7 +219,7 @@ suite('Language server watcher', () => {
             disposables,
         );
         watcher.register();
-        assert.strictEqual(disposables.length, 11);
+        assert.strictEqual(disposables.length, 13);
     });
 
     test('The constructor should not add a listener to onDidChange to the list of disposables if it is not a trusted workspace', () => {
@@ -176,7 +264,7 @@ suite('Language server watcher', () => {
             disposables,
         );
         watcher.register();
-        assert.strictEqual(disposables.length, 10);
+        assert.strictEqual(disposables.length, 12);
     });
 
     test(`When starting the language server, the language server extension manager should not be undefined`, async () => {
