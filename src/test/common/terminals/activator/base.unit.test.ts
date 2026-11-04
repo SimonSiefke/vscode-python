@@ -4,10 +4,11 @@
 'use strict';
 
 import { expect } from 'chai';
+import { queryObjects } from 'node:v8';
 import * as TypeMoq from 'typemoq';
 import { Terminal } from 'vscode';
 import { BaseTerminalActivator } from '../../../../client/common/terminal/activator/base';
-import { ITerminalActivator, ITerminalHelper } from '../../../../client/common/terminal/types';
+import { ITerminalActivator, ITerminalHelper, TerminalShellType } from '../../../../client/common/terminal/types';
 import { noop } from '../../../../client/common/utils/misc';
 
 suite('Terminal Base Activator', () => {
@@ -22,6 +23,30 @@ suite('Terminal Base Activator', () => {
                 return Promise.resolve();
             }
         })(helper.object) as any) as ITerminalActivator;
+    });
+
+    test('Activation does not keep unused terminals alive', async () => {
+        class TestTerminal {
+            public readonly name = 'Python';
+        }
+        const unexpectedCall = (): never => {
+            throw new Error('Unexpected terminal helper call');
+        };
+        const activationHelper: ITerminalHelper = {
+            createTerminal: unexpectedCall,
+            identifyTerminalShell: () => TerminalShellType.bash,
+            buildCommandForTerminal: unexpectedCall,
+            getEnvironmentActivationCommands: async () => undefined,
+            getEnvironmentActivationShellCommands: unexpectedCall,
+        };
+        activator = new BaseTerminalActivator(activationHelper);
+        const activate = async () => {
+            await activator.activateEnvironmentInTerminal(new TestTerminal() as Terminal);
+        };
+
+        await activate();
+
+        expect(queryObjects(TestTerminal)).to.equal(0);
     });
     [
         { commandCount: 1, preserveFocus: false },
