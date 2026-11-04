@@ -49,6 +49,8 @@ export class LanguageServerWatcher implements IExtensionActivationService, ILang
     // When using Pylance, there will only be one language server for the project.
     private workspaceLanguageServers: Map<string, ILanguageServerExtensionManager | undefined>;
 
+    private readonly activeLanguageServers = new Set<ILanguageServerExtensionManager>();
+
     private registered = false;
 
     constructor(
@@ -70,6 +72,23 @@ export class LanguageServerWatcher implements IExtensionActivationService, ILang
         this.workspaceInterpreters = new Map();
         this.workspaceLanguageServers = new Map();
         this.languageServerType = this.configurationService.getSettings().languageServer;
+        this.disposables.push({
+            dispose: async () => {
+                const languageServers = [...this.activeLanguageServers];
+                this.activeLanguageServers.clear();
+                this.workspaceLanguageServers.clear();
+                this.workspaceInterpreters.clear();
+                await Promise.all(
+                    languageServers.map(async (languageServer) => {
+                        try {
+                            await languageServer.stopLanguageServer();
+                        } finally {
+                            languageServer.dispose();
+                        }
+                    }),
+                );
+            },
+        });
     }
 
     // IExtensionActivationService
@@ -221,9 +240,15 @@ export class LanguageServerWatcher implements IExtensionActivationService, ILang
         const languageServerExtensionManager = this.workspaceLanguageServers.get(key);
 
         if (languageServerExtensionManager) {
-            await languageServerExtensionManager.stopLanguageServer();
-            languageServerExtensionManager.dispose();
-            this.workspaceLanguageServers.delete(key);
+            try {
+                await languageServerExtensionManager.stopLanguageServer();
+            } finally {
+                this.activeLanguageServers.delete(languageServerExtensionManager);
+                if (this.workspaceLanguageServers.get(key) === languageServerExtensionManager) {
+                    this.workspaceLanguageServers.delete(key);
+                }
+                languageServerExtensionManager.dispose();
+            }
         }
     }
 
@@ -265,12 +290,7 @@ export class LanguageServerWatcher implements IExtensionActivationService, ILang
                 break;
         }
 
-        this.disposables.push({
-            dispose: async () => {
-                await lsManager.stopLanguageServer();
-                lsManager.dispose();
-            },
-        });
+        this.activeLanguageServers.add(lsManager);
         return lsManager;
     }
 
