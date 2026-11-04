@@ -5,12 +5,13 @@ import { expect } from 'chai';
 import * as path from 'path';
 import { SemVer } from 'semver';
 import * as TypeMoq from 'typemoq';
-import { Disposable, ThemeIcon, Uri, WorkspaceFolder } from 'vscode';
+import { Disposable, EventEmitter, Terminal, ThemeIcon, Uri, WorkspaceFolder } from 'vscode';
 import {
     IApplicationShell,
     ICommandManager,
     IDocumentManager,
     IWorkspaceService,
+    TerminalDataWriteEvent,
 } from '../../../client/common/application/types';
 import { IFileSystem, IPlatformService } from '../../../client/common/platform/types';
 import { createCondaEnv } from '../../../client/common/process/pythonEnvironment';
@@ -33,6 +34,84 @@ import * as sinon from 'sinon';
 import { assert } from 'chai';
 import { PythonEnvironment } from '../../../client/pythonEnvironments/info';
 import { IInterpreterService } from '../../../client/interpreter/contracts';
+import { buildPythonExecInfo } from '../../../client/pythonEnvironments/exec';
+
+suite('Terminal - REPL lifetime', () => {
+    function createExecutor() {
+        const closeListeners = new Set<() => void>();
+        const disposables: Disposable[] = [];
+        const dataWritten = new EventEmitter<TerminalDataWriteEvent>();
+        const terminal = TypeMoq.Mock.ofType<Terminal>();
+        const service = TypeMoq.Mock.ofType<ITerminalService>();
+        const factory = TypeMoq.Mock.ofType<ITerminalServiceFactory>();
+        const applicationShell = TypeMoq.Mock.ofType<IApplicationShell>();
+        factory.setup((f) => f.getTerminalService(TypeMoq.It.isAny())).returns(() => service.object);
+        applicationShell.setup((s) => s.onDidWriteTerminalData).returns(() => dataWritten.event);
+        service
+            .setup((s) => s.onDidCloseTerminal(TypeMoq.It.isAny()))
+            .returns((listener: () => void) => {
+                closeListeners.add(listener);
+                return new Disposable(() => closeListeners.delete(listener));
+            });
+        service
+            .setup((s) => s.sendCommand(TypeMoq.It.isAny(), TypeMoq.It.isAny()))
+            .returns(async () => {
+                dataWritten.fire({ terminal: terminal.object, data: '>>> ' });
+            });
+        const executor = new (class extends TerminalCodeExecutionProvider {
+            public async getExecutableInfo() {
+                return buildPythonExecInfo(PYTHON_PATH);
+            }
+        })(
+            factory.object,
+            TypeMoq.Mock.ofType<IConfigurationService>().object,
+            TypeMoq.Mock.ofType<IWorkspaceService>().object,
+            disposables,
+            TypeMoq.Mock.ofType<IPlatformService>().object,
+            TypeMoq.Mock.ofType<IInterpreterService>().object,
+            TypeMoq.Mock.ofType<ICommandManager>().object,
+            applicationShell.object,
+        );
+        return { executor, closeListeners, disposables, dataWritten };
+    }
+
+    test('Closing a REPL releases its close listener without growing the session registry', async () => {
+        const { executor, closeListeners, disposables, dataWritten } = createExecutor();
+        const clock = sinon.useFakeTimers();
+        try {
+            await executor.initializeRepl(undefined);
+            const registeredDisposables = disposables.length;
+            expect(closeListeners.size).to.equal(1);
+            [...closeListeners].forEach((listener) => listener());
+            expect(closeListeners.size).to.equal(0);
+
+            await executor.initializeRepl(undefined);
+            expect(closeListeners.size).to.equal(1);
+            expect(disposables.length).to.equal(registeredDisposables);
+            [...closeListeners].forEach((listener) => listener());
+            expect(closeListeners.size).to.equal(0);
+        } finally {
+            disposables.forEach((disposable) => disposable.dispose());
+            dataWritten.dispose();
+            clock.restore();
+        }
+    });
+
+    test('Session disposal releases the active REPL close listener', async () => {
+        const { executor, closeListeners, disposables, dataWritten } = createExecutor();
+        const clock = sinon.useFakeTimers();
+        try {
+            await executor.initializeRepl(undefined);
+            expect(closeListeners.size).to.equal(1);
+            disposables.forEach((disposable) => disposable.dispose());
+            expect(closeListeners.size).to.equal(0);
+        } finally {
+            disposables.forEach((disposable) => disposable.dispose());
+            dataWritten.dispose();
+            clock.restore();
+        }
+    });
+});
 
 suite('Terminal - Code Execution', () => {
     ['Terminal Execution', 'Repl Execution', 'Django Execution'].forEach((testSuiteName) => {

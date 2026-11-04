@@ -26,6 +26,7 @@ export class TerminalCodeExecutionProvider implements ICodeExecutionService {
     protected terminalTitle!: string;
     protected terminalIcon?: TerminalOptions['iconPath'];
     private replActive?: Promise<boolean>;
+    private replCloseListener?: IDisposable;
 
     constructor(
         @inject(ITerminalServiceFactory) protected readonly terminalServiceFactory: ITerminalServiceFactory,
@@ -36,7 +37,15 @@ export class TerminalCodeExecutionProvider implements ICodeExecutionService {
         @inject(IInterpreterService) protected readonly interpreterService: IInterpreterService,
         @inject(ICommandManager) protected readonly commandManager: ICommandManager,
         @inject(IApplicationShell) protected readonly applicationShell: IApplicationShell,
-    ) {}
+    ) {
+        this.disposables.push({
+            dispose: () => {
+                this.replCloseListener?.dispose();
+                this.replCloseListener = undefined;
+                this.replActive = undefined;
+            },
+        });
+    }
 
     public async executeFile(file: Uri, options?: { newTerminalPerFile: boolean }) {
         await this.setCwdForFileExecution(file, options);
@@ -103,11 +112,12 @@ export class TerminalCodeExecutionProvider implements ICodeExecutionService {
 
             await terminalService.sendCommand(replCommandArgs.command, replCommandArgs.args);
         });
-        this.disposables.push(
-            terminalService.onDidCloseTerminal(() => {
-                this.replActive = undefined;
-            }),
-        );
+        this.replCloseListener?.dispose();
+        this.replCloseListener = terminalService.onDidCloseTerminal(() => {
+            this.replActive = undefined;
+            this.replCloseListener?.dispose();
+            this.replCloseListener = undefined;
+        });
 
         await this.replActive;
     }
