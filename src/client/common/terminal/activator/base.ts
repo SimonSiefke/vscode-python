@@ -9,7 +9,7 @@ import { createDeferred, sleep } from '../../utils/async';
 import { ITerminalActivator, ITerminalHelper, TerminalActivationOptions, TerminalShellType } from '../types';
 
 export class BaseTerminalActivator implements ITerminalActivator {
-    private readonly activatedTerminals: Map<Terminal, Promise<boolean>> = new Map<Terminal, Promise<boolean>>();
+    private readonly activatedTerminals = new WeakMap<Terminal, Promise<boolean>>();
     constructor(private readonly helper: ITerminalHelper) {}
     public async activateEnvironmentInTerminal(
         terminal: Terminal,
