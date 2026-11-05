@@ -24,9 +24,31 @@ import { sleep } from '../utils/async';
 import { useEnvExtension } from '../../envExt/api.internal';
 import { ensureTerminalLegacy } from '../../envExt/api.legacy';
 
+const terminalServiceOwners = new WeakMap<Disposable[], Set<TerminalService>>();
+
+function getTerminalServices(registry: Disposable[]): Set<TerminalService> {
+    let services = terminalServiceOwners.get(registry);
+    if (!services) {
+        const owned = new Set<TerminalService>();
+        services = owned;
+        terminalServiceOwners.set(registry, owned);
+        registry.push({
+            dispose: () => {
+                const active = Array.from(owned);
+                owned.clear();
+                active.forEach((service) => service.dispose());
+            },
+        });
+    }
+    return services;
+}
+
 @injectable()
 export class TerminalService implements ITerminalService, Disposable {
     private terminal?: Terminal;
+    private readonly ownedServices: Set<TerminalService>;
+    private readonly terminalCloseListener: Disposable;
+    private disposed = false;
     private terminalShellType!: TerminalShellType;
     private terminalClosed = new EventEmitter<void>();
     private terminalManager: ITerminalManager;
@@ -47,24 +69,35 @@ export class TerminalService implements ITerminalService, Disposable {
     constructor(
         @inject(IServiceContainer) private serviceContainer: IServiceContainer,
         private readonly options?: TerminalCreationOptions,
+        private readonly disposeOnClose = false,
     ) {
         const disposableRegistry = this.serviceContainer.get<Disposable[]>(IDisposableRegistry);
-        disposableRegistry.push(this);
+        this.ownedServices = getTerminalServices(disposableRegistry);
+        this.ownedServices.add(this);
         this.terminalHelper = this.serviceContainer.get<ITerminalHelper>(ITerminalHelper);
         this.terminalManager = this.serviceContainer.get<ITerminalManager>(ITerminalManager);
         this.terminalAutoActivator = this.serviceContainer.get<ITerminalAutoActivation>(ITerminalAutoActivation);
         this.applicationShell = this.serviceContainer.get<IApplicationShell>(IApplicationShell);
-        this.terminalManager.onDidCloseTerminal(this.terminalCloseHandler, this, disposableRegistry);
+        this.terminalCloseListener = this.terminalManager.onDidCloseTerminal(this.terminalCloseHandler, this);
         this.terminalActivator = this.serviceContainer.get<ITerminalActivator>(ITerminalActivator);
     }
     public dispose() {
-        this.terminal?.dispose();
-        this.disposeReplListener();
-
-        if (this.executeCommandListeners && this.executeCommandListeners.size > 0) {
-            this.executeCommandListeners.forEach((d) => {
-                d?.dispose();
-            });
+        if (this.disposed) {
+            return;
+        }
+        this.disposed = true;
+        this.ownedServices.delete(this);
+        this.terminalCloseListener?.dispose();
+        const terminal = this.terminal;
+        this.terminal = undefined;
+        try {
+            terminal?.dispose();
+        } finally {
+            this.disposeReplListener();
+            this.pythonReplCommandQueue = [];
+            this.executeCommandListeners.forEach((disposable) => disposable?.dispose());
+            this.executeCommandListeners.clear();
+            this.terminalClosed.dispose();
         }
     }
     public async sendCommand(command: string, args: string[], _?: CancellationToken): Promise<void> {
@@ -221,16 +254,24 @@ export class TerminalService implements ITerminalService, Disposable {
     }
     // TODO: Debt switch to Promise<Terminal> ---> breaks 20 tests
     public async ensureTerminal(preserveFocus: boolean = true): Promise<void> {
+        if (this.disposed) {
+            throw new Error('Terminal service is disposed');
+        }
         if (this.terminal) {
             return;
         }
 
         if (useEnvExtension()) {
-            this.terminal = await ensureTerminalLegacy(this.options?.resource, {
+            const terminal = await ensureTerminalLegacy(this.options?.resource, {
                 name: this.options?.title || 'Python',
                 hideFromUser: this.options?.hideFromUser,
                 iconPath: this.options?.iconPath,
             });
+            if (this.disposed) {
+                terminal.dispose();
+                throw new Error('Terminal service is disposed');
+            }
+            this.terminal = terminal;
             return;
         } else {
             this.terminalShellType = this.terminalHelper.identifyTerminalShell(this.terminal);
@@ -242,6 +283,9 @@ export class TerminalService implements ITerminalService, Disposable {
             this.terminalAutoActivator.disableAutoActivation(this.terminal);
 
             await sleep(100);
+            if (this.disposed || !this.terminal) {
+                throw new Error('Terminal service was closed');
+            }
 
             await this.terminalActivator.activateEnvironmentInTerminal(this.terminal, {
                 resource: this.options?.resource,
@@ -260,11 +304,14 @@ export class TerminalService implements ITerminalService, Disposable {
     }
     private terminalCloseHandler(terminal: Terminal) {
         if (terminal === this.terminal) {
-            this.terminalClosed.fire();
             this.terminal = undefined;
             this.isReplReady = false;
             this.disposeReplListener();
             this.pythonReplCommandQueue = [];
+            this.terminalClosed.fire();
+            if (this.disposeOnClose) {
+                this.dispose();
+            }
         }
     }
 
