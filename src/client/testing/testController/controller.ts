@@ -25,6 +25,8 @@ import { IExtensionSingleActivationService } from '../../activation/types';
 import { ICommandManager, IWorkspaceService } from '../../common/application/types';
 import * as constants from '../../common/constants';
 import { IPythonExecutionFactory } from '../../common/process/types';
+import { isParentPath } from '../../common/platform/fs-paths';
+import { dispose, DisposableStore } from '../../common/utils/resourceLifecycle';
 import { IConfigurationService, IDisposableRegistry, Resource } from '../../common/types';
 import { DelayedTrigger, IDelayedTrigger } from '../../common/utils/delayTrigger';
 import { noop } from '../../common/utils/misc';
@@ -63,6 +65,7 @@ export class PythonTestController implements ITestController, IExtensionSingleAc
 
     // Legacy: Single workspace test adapter per workspace (backward compatibility)
     private readonly testAdapters: Map<Uri, WorkspaceTestAdapter> = new Map();
+    private readonly workspaceWatchers = new Map<string, DisposableStore>();
 
     // Registry for multi-project testing (one registry instance manages all projects across workspaces)
     private readonly projectRegistry: TestProjectRegistry;
@@ -204,12 +207,22 @@ export class PythonTestController implements ITestController, IExtensionSingleAc
     /**
      * Sets up file watchers for test discovery triggers.
      */
+    private disposeWorkspaceWatchers(workspace: WorkspaceFolder): void {
+        const key = workspace.uri.toString();
+        const watchers = this.workspaceWatchers.get(key);
+        this.workspaceWatchers.delete(key);
+        watchers?.dispose();
+    }
+
     private setupFileWatchers(workspace: WorkspaceFolder): void {
+        this.disposeWorkspaceWatchers(workspace);
         const settings = this.configSettings.getSettings(workspace.uri);
         if (settings.testing.autoTestDiscoverOnSaveEnabled) {
             traceVerbose(`Testing: Setting up watcher for ${workspace.uri.fsPath}`);
-            this.watchForSettingsChanges(workspace);
-            this.watchForTestContentChangeOnSave();
+            const disposables = new DisposableStore();
+            this.workspaceWatchers.set(workspace.uri.toString(), disposables);
+            this.watchForSettingsChanges(workspace, disposables);
+            this.watchForTestContentChangeOnSave(workspace, disposables);
         }
     }
 
@@ -223,6 +236,13 @@ export class PythonTestController implements ITestController, IExtensionSingleAc
      * Uses `Promise.allSettled` for resilient multi-workspace activation:
      */
     public async activate(): Promise<void> {
+        this.disposables.push({
+            dispose: () => {
+                dispose(this.workspaceWatchers.values());
+                this.workspaceWatchers.clear();
+                this.testAdapters.clear();
+            },
+        });
         const workspaces: readonly WorkspaceFolder[] = this.workspaceService.workspaceFolders || [];
 
         // PROJECT-BASED MODE: Uses Python Environments API to discover projects
@@ -268,6 +288,7 @@ export class PythonTestController implements ITestController, IExtensionSingleAc
         });
         this.disposables.push(
             this.workspaceService.onDidChangeWorkspaceFolders((evt) => {
+                evt.removed.forEach((workspace) => this.deactivateLegacyWorkspace(workspace));
                 evt.added.forEach((workspace) => {
                     this.activateLegacyWorkspace(workspace);
                 });
@@ -538,6 +559,17 @@ export class PythonTestController implements ITestController, IExtensionSingleAc
 
         this.testAdapters.set(workspace.uri, workspaceTestAdapter);
         this.setupFileWatchers(workspace);
+    }
+
+    private deactivateLegacyWorkspace(workspace: WorkspaceFolder): void {
+        const key = workspace.uri.toString();
+        for (const uri of this.testAdapters.keys()) {
+            if (uri.toString() === key) {
+                this.testAdapters.delete(uri);
+            }
+        }
+        this.disposeWorkspaceWatchers(workspace);
+        this.removeTestItemsForWorkspace(workspace);
     }
 
     public refreshTestData(uri?: Resource, options?: TestRefreshOptions): Promise<void> {
@@ -816,8 +848,17 @@ export class PythonTestController implements ITestController, IExtensionSingleAc
         const itemsToDelete: string[] = [];
 
         this.testController.items.forEach((testItem: TestItem) => {
-            const itemWorkspace = this.workspaceService.getWorkspaceFolder(testItem.uri);
-            if (itemWorkspace?.uri.fsPath === workspace.uri.fsPath) {
+            const uri = testItem.uri;
+            if (!uri) {
+                return;
+            }
+            const itemWorkspace = this.workspaceService.getWorkspaceFolder(uri);
+            const belongsToWorkspace = itemWorkspace
+                ? itemWorkspace.uri.toString() === workspace.uri.toString()
+                : uri.scheme === workspace.uri.scheme &&
+                  uri.authority === workspace.uri.authority &&
+                  isParentPath(uri.fsPath, workspace.uri.fsPath);
+            if (belongsToWorkspace) {
                 itemsToDelete.push(testItem.id);
             }
         });
@@ -1083,13 +1124,16 @@ export class PythonTestController implements ITestController, IExtensionSingleAc
         });
     }
 
-    private watchForSettingsChanges(workspace: WorkspaceFolder): void {
+    private watchForSettingsChanges(workspace: WorkspaceFolder, disposables: DisposableStore): void {
         const pattern = new RelativePattern(workspace, '**/{settings.json,pytest.ini,pyproject.toml,setup.cfg}');
         const watcher = this.workspaceService.createFileSystemWatcher(pattern);
-        this.disposables.push(watcher);
+        disposables.add(watcher);
 
-        this.disposables.push(
+        disposables.add(
             onDidSaveTextDocument(async (doc: TextDocument) => {
+                if (this.workspaceService.getWorkspaceFolder(doc.uri)?.uri.toString() !== workspace.uri.toString()) {
+                    return;
+                }
                 const file = doc.fileName;
                 // refresh on any settings file save
                 if (
@@ -1106,14 +1150,14 @@ export class PythonTestController implements ITestController, IExtensionSingleAc
         );
         /* Keep both watchers for create and delete since config files can change test behavior without content
         due to their impact on pythonPath. */
-        this.disposables.push(
+        disposables.add(
             watcher.onDidCreate((uri) => {
                 traceVerbose(`Testing: Trigger refresh after creating ${uri.fsPath}`);
                 this.sendTriggerTelemetry('watching');
                 this.refreshData.trigger(uri, false);
             }),
         );
-        this.disposables.push(
+        disposables.add(
             watcher.onDidDelete((uri) => {
                 traceVerbose(`Testing: Trigger refresh after deleting in ${uri.fsPath}`);
                 this.sendTriggerTelemetry('watching');
@@ -1122,9 +1166,12 @@ export class PythonTestController implements ITestController, IExtensionSingleAc
         );
     }
 
-    private watchForTestContentChangeOnSave(): void {
-        this.disposables.push(
+    private watchForTestContentChangeOnSave(workspace: WorkspaceFolder, disposables: DisposableStore): void {
+        disposables.add(
             onDidSaveTextDocument(async (doc: TextDocument) => {
+                if (this.workspaceService.getWorkspaceFolder(doc.uri)?.uri.toString() !== workspace.uri.toString()) {
+                    return;
+                }
                 const settings = this.configSettings.getSettings(doc.uri);
                 if (
                     settings.testing.autoTestDiscoverOnSaveEnabled &&
