@@ -21,8 +21,7 @@ export class ProcessServiceFactory implements IProcessServiceFactory {
         const customEnvVars = options?.doNotUseCustomEnvs
             ? undefined
             : await this.envVarsService.getEnvironmentVariables(resource);
-        const proc: IProcessService = new ProcessService(customEnvVars);
-        this.disposableRegistry.push(proc);
+        const proc: IProcessService = new ProcessService(customEnvVars, this.disposableRegistry);
         return proc.on('exec', this.processLogger.logProcess.bind(this.processLogger));
     }
 }

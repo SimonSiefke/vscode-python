@@ -120,9 +120,8 @@ export class PythonExecutionFactory implements IPythonExecutionFactory {
         const pythonPath = options.interpreter
             ? options.interpreter.path
             : this.configService.getSettings(options.resource).pythonPath;
-        const processService: IProcessService = new ProcessService({ ...envVars });
+        const processService: IProcessService = new ProcessService({ ...envVars }, this.disposables);
         processService.on('exec', this.logger.logProcess.bind(this.logger));
-        this.disposables.push(processService);
 
         if (await getPixi()) {
             const pixiExecutionService = await this.createPixiExecutionService(pythonPath, processService);
