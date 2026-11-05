@@ -77,17 +77,9 @@ export function shellExec(
         };
         let procExited = false;
         const proc = exec(command, shellOptions, callback); // NOSONAR
-        proc.once('close', () => {
-            procExited = true;
-        });
-        proc.once('exit', () => {
-            procExited = true;
-        });
-        proc.once('error', () => {
-            procExited = true;
-        });
         const disposable: IDisposable = {
             dispose: () => {
+                disposables?.delete(disposable);
                 // If process has not exited nor killed, force kill it.
                 if (!procExited && !proc.killed) {
                     if (proc.pid) {
@@ -98,9 +90,16 @@ export function shellExec(
                 }
             },
         };
-        if (disposables) {
-            disposables.add(disposable);
-        }
+        disposables?.add(disposable);
+        const release = () => {
+            procExited = true;
+            disposables?.delete(disposable);
+        };
+        proc.once('close', release);
+        proc.once('error', release);
+        proc.once('exit', () => {
+            procExited = true;
+        });
     });
 }
 
@@ -125,6 +124,7 @@ export function plainExec(
     const deferred = createDeferred<ExecutionResult<string>>();
     const disposable: IDisposable = {
         dispose: () => {
+            disposables?.delete(disposable);
             // If process has not exited nor killed, force kill it.
             if (!proc.killed && !deferred.completed) {
                 if (proc.pid) {
@@ -228,6 +228,7 @@ export function execObservable(
     let procExited = false;
     const disposable: IDisposable = {
         dispose() {
+            disposables?.delete(disposable);
             if (proc && proc.pid && !proc.killed && !procExited) {
                 killPid(proc.pid);
             }
@@ -237,6 +238,16 @@ export function execObservable(
         },
     };
     disposables?.add(disposable);
+    // Process ownership must end even when callers consume the streams directly.
+    const release = () => {
+        procExited = true;
+        disposables?.delete(disposable);
+    };
+    proc.once('close', release);
+    proc.once('error', release);
+    proc.once('exit', () => {
+        procExited = true;
+    });
 
     const output = new Observable<Output<string>>((subscriber) => {
         const internalDisposables: IDisposable[] = [];
