@@ -33,6 +33,7 @@ export function buildApi(
     serviceManager: IServiceManager,
     serviceContainer: IServiceContainer,
     discoveryApi: IDiscoveryAPI,
+    getActiveEnvironmentApi?: () => Promise<PythonExtension['environments'] | undefined>,
 ): PythonExtension {
     const configurationService = serviceContainer.get<IConfigurationService>(IConfigurationService);
     const interpreterService = serviceContainer.get<IInterpreterService>(IInterpreterService);
@@ -46,7 +47,12 @@ export function buildApi(
         TensorboardExtensionIntegration,
     );
     const jupyterPythonEnvApi = serviceContainer.get<JupyterPythonEnvironmentApi>(JupyterExtensionPythonEnvironments);
-    const environments = buildEnvironmentApi(discoveryApi, serviceContainer, jupyterPythonEnvApi);
+    const environments = buildEnvironmentApi(
+        discoveryApi,
+        serviceContainer,
+        jupyterPythonEnvApi,
+        getActiveEnvironmentApi,
+    );
     const jupyterIntegration = serviceContainer.get<JupyterExtensionIntegration>(JupyterExtensionIntegration);
     jupyterIntegration.registerEnvApi(environments);
     const tensorboardIntegration = serviceContainer.get<TensorboardExtensionIntegration>(

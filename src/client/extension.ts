@@ -55,6 +55,13 @@ durations.codeLoadingTime = stopWatch.elapsedTime;
 
 // These persist between activations:
 let activatedServiceContainer: IServiceContainer | undefined;
+let activeEnvironmentApi: PythonExtension['environments'] | undefined;
+let trustReactivation: Promise<void> | undefined;
+
+async function getActiveEnvironmentApi(): Promise<PythonExtension['environments'] | undefined> {
+    await trustReactivation;
+    return activeEnvironmentApi;
+}
 
 /////////////////////////////
 // public functions
@@ -69,11 +76,23 @@ export async function activate(context: IExtensionContext): Promise<PythonExtens
         const workspaceService = new WorkspaceService();
         context.subscriptions.push(
             workspaceService.onDidGrantWorkspaceTrust(async () => {
-                await deactivate();
-                await activate(context);
+                if (trustReactivation) {
+                    return trustReactivation;
+                }
+                // Publish the transition before deactivation can retire the previous resolver.
+                trustReactivation = Promise.resolve().then(async () => {
+                    await deactivate();
+                    await activate(context);
+                });
+                try {
+                    await trustReactivation;
+                } finally {
+                    trustReactivation = undefined;
+                }
             }),
         );
         [api, ready, serviceContainer] = await activateUnsafe(context, stopWatch, durations);
+        activeEnvironmentApi = api.environments;
     } catch (ex) {
         // We want to completely handle the error
         // before notifying VS Code.
@@ -89,6 +108,7 @@ export async function activate(context: IExtensionContext): Promise<PythonExtens
 }
 
 export async function deactivate(): Promise<void> {
+    activeEnvironmentApi = undefined;
     // Make sure to shutdown anybody who needs it.
     if (activatedServiceContainer) {
         const disposables = activatedServiceContainer.get<IDisposableRegistry>(IDisposableRegistry);
@@ -169,6 +189,7 @@ async function activateUnsafe(
         ext.legacyIOC.serviceManager,
         ext.legacyIOC.serviceContainer,
         components.pythonEnvs,
+        getActiveEnvironmentApi,
     );
     const proposedApi = buildProposedApi(components.pythonEnvs, ext.legacyIOC.serviceContainer);
     registerTools(context, components.pythonEnvs, api.environments, ext.legacyIOC.serviceContainer);

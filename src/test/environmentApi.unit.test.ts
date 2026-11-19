@@ -31,6 +31,7 @@ import { PythonEnvCollectionChangedEvent } from '../client/pythonEnvironments/ba
 import { normCasePath } from '../client/common/platform/fs-paths';
 import { IWorkspaceService } from '../client/common/application/types';
 import { IEnvironmentVariablesProvider } from '../client/common/variables/types';
+import { createDeferred } from '../client/common/utils/async';
 import * as workspaceApis from '../client/common/vscodeApis/workspaceApis';
 import {
     ActiveEnvironmentPathChangeEvent,
@@ -59,8 +60,10 @@ suite('Python Environment API', () => {
     let onDidChangeEnvironmentVariables: EventEmitter<Uri | undefined>;
 
     let environmentApi: PythonExtension['environments'];
+    let activeEnvironmentApi: Promise<PythonExtension['environments']> | undefined;
 
     setup(() => {
+        activeEnvironmentApi = undefined;
         serviceContainer = typemoq.Mock.ofType<IServiceContainer>();
         sinon.stub(workspaceApis, 'getWorkspaceFolders').returns([workspaceFolder]);
         sinon.stub(workspaceApis, 'getWorkspaceFolder').callsFake((resource: Resource) => {
@@ -100,7 +103,12 @@ suite('Python Environment API', () => {
             getPythonEnvironment: (_uri: Uri) => undefined,
         };
 
-        environmentApi = buildEnvironmentApi(discoverAPI.object, serviceContainer.object, jupyterApi);
+        environmentApi = buildEnvironmentApi(
+            discoverAPI.object,
+            serviceContainer.object,
+            jupyterApi,
+            async () => activeEnvironmentApi,
+        );
     });
 
     teardown(() => {
@@ -192,6 +200,21 @@ suite('Python Environment API', () => {
             id: normCasePath(pythonPath),
             path: pythonPath,
         });
+    });
+
+    test('a captured resolveEnvironment waits for the current activation', async () => {
+        const resolveOriginal = environmentApi.resolveEnvironment;
+        const activate = createDeferred<PythonExtension['environments']>();
+        const result = convertCompleteEnvInfo(buildEnvInfo({ executable: 'path/to/new/python' }));
+        const resolveCurrent = sinon.stub().resolves(result);
+        const replacement = { ...environmentApi, resolveEnvironment: resolveCurrent };
+        activeEnvironmentApi = activate.promise;
+
+        const resolving = resolveOriginal('python3');
+        assert.isTrue(resolveCurrent.notCalled);
+        activate.resolve(replacement);
+        assert.strictEqual(await resolving, result);
+        assert.isTrue(resolveCurrent.calledOnceWithExactly('python3'));
     });
 
     test('resolveEnvironment: invalid environment (when passed as string)', async () => {

@@ -18,11 +18,9 @@ import { ProcessLogger } from './logger';
 type ProcessTracker = (proc: ChildProcess, disposable: IDisposable) => void;
 
 function createProcessStopper(proc: ChildProcess): () => void {
-    let stopped = false;
     return () => {
-        // A child can report an error or receive a signal before it exits.
-        if (!stopped && proc.pid && proc.exitCode === null && proc.signalCode === null) {
-            stopped = true;
+        // A child can handle a previous stop signal and continue running.
+        if (proc.pid && proc.exitCode === null && proc.signalCode === null) {
             killPid(proc.pid);
         }
     };

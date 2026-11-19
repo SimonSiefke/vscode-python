@@ -19,11 +19,13 @@ import { ProcessLogger } from '../../../client/common/process/logger';
 import { ProcessService } from '../../../client/common/process/proc';
 import { registerTypes } from '../../../client/common/process/serviceRegistry';
 import {
+    ExecutionResult,
     IProcessLogger,
     IProcessServiceFactory,
     IPythonExecutionFactory,
     ObservableExecutionResult,
 } from '../../../client/common/process/types';
+import * as processWorkers from '../../../client/common/process/worker/rawProcessApiWrapper';
 import { IConfigurationService, IDisposableRegistry, IInterpreterPathService } from '../../../client/common/types';
 import { createDeferred } from '../../../client/common/utils/async';
 import { disposeAll } from '../../../client/common/utils/resourceLifecycle';
@@ -43,13 +45,13 @@ suite('Process service shutdown ownership', () => {
     let services: ServiceManager;
     const children = new Set<ObservableExecutionResult<string>>();
 
-    function createServices(): ServiceManager {
+    function createServices(disposables = registry): ServiceManager {
         const container = new Container({ skipBaseClassChecks: true });
         const serviceManager = new ServiceManager(container);
         const environment = mock(EnvironmentVariablesProvider);
         when(environment.getEnvironmentVariables(undefined)).thenResolve({});
         serviceManager.addSingletonInstance(IServiceContainer, new ServiceContainer(container));
-        serviceManager.addSingletonInstance(IDisposableRegistry, registry);
+        serviceManager.addSingletonInstance(IDisposableRegistry, disposables);
         serviceManager.addSingletonInstance(IEnvironmentVariablesProvider, instance(environment));
         serviceManager.addSingletonInstance(IProcessLogger, instance(mock(ProcessLogger)));
         registerTypes(serviceManager);
@@ -139,6 +141,30 @@ suite('Process service shutdown ownership', () => {
         await assert.rejects(previous.exec(process.execPath, ['-e', '']), /disposed/);
         const late = await previousFactory.create();
         await assert.rejects(late.exec(process.execPath, ['-e', '']), /disposed/);
+    });
+
+    test('a retired activation cannot first resolve its factory after shutdown and start a child', async () => {
+        const subscriptions: IDisposableRegistry = [];
+        const previous = createServices(subscriptions);
+        await disposeAll(subscriptions);
+        subscriptions.length = 0;
+
+        const current = createServices(subscriptions);
+        try {
+            const retiredFactory = previous.get<IProcessServiceFactory>(IProcessServiceFactory);
+            const retiredService = await retiredFactory.create();
+            await assert.rejects(retiredService.exec(process.execPath, ['-e', '']), /disposed/);
+
+            const currentFactory = current.get<IProcessServiceFactory>(IProcessServiceFactory);
+            const currentService = await currentFactory.create();
+            assert.strictEqual(
+                (await currentService.exec(process.execPath, ['-e', 'process.stdout.write("ready")'])).stdout,
+                'ready',
+            );
+            assert.strictEqual(subscriptions.length, 1);
+        } finally {
+            await disposeAll(subscriptions);
+        }
     });
 
     test('a synchronous execution listener cannot start a child after shutdown', async () => {
@@ -233,6 +259,38 @@ suite('Process service shutdown ownership', () => {
         assert.strictEqual((await running).stdout, 'ready');
     });
 
+    test('shutdown signals a child that survived an earlier stop request', async function () {
+        if (process.platform === 'win32') {
+            return this.skip();
+        }
+        const service = await factory.create();
+        const result = service.execObservable(process.execPath, [
+            '-e',
+            'process.once("SIGTERM", () => process.stdout.write("handled")); process.stdout.write("ready"); setInterval(() => {}, 1000);',
+        ]);
+        const proc = result.proc;
+        assert.ok(proc?.stdout && proc.pid);
+        const closed = once(proc, 'close');
+        try {
+            const [ready] = await once(proc.stdout, 'data', { signal: AbortSignal.timeout(5000) });
+            assert.strictEqual(ready.toString(), 'ready');
+            const handled = once(proc.stdout, 'data', { signal: AbortSignal.timeout(5000) });
+            result.dispose();
+            assert.strictEqual((await handled)[0].toString(), 'handled');
+
+            const stopped = sinon.spy(process, 'kill');
+            await disposeAll(registry);
+            assert.ok(stopped.calledOnceWithExactly(proc.pid));
+            const [, signal] = await closed;
+            assert.strictEqual(signal, 'SIGTERM');
+        } finally {
+            if (proc.exitCode === null && proc.signalCode === null) {
+                proc.kill('SIGKILL');
+            }
+            await closed;
+        }
+    });
+
     test('shutdown stops a pending shell execution', async () => {
         const service = await factory.create();
         const folder = await mkdtemp(join(tmpdir(), 'python-service-shell-'));
@@ -302,6 +360,48 @@ suite('Process service shutdown ownership', () => {
             result.dispose();
             await exit;
         }
+    });
+
+    test('an unfinished worker keeps a service owned after its other executions complete', async () => {
+        const service = await factory.create();
+        const plainWorker = createDeferred<ExecutionResult<string>>();
+        const shellWorker = createDeferred<ExecutionResult<string>>();
+        sinon.stub(processWorkers, 'workerPlainExec').returns(plainWorker.promise);
+        sinon.stub(processWorkers, 'workerShellExec').returns(shellWorker.promise);
+        const plain = service.exec(process.execPath, ['-e', ''], { useWorker: true });
+        const shell = service.shellExec('echo ready', { useWorker: true });
+
+        try {
+            await service.exec(process.execPath, ['-e', '']);
+            plainWorker.resolve({ stdout: 'worker ready' });
+            assert.strictEqual((await plain).stdout, 'worker ready');
+            const disposed = sinon.spy(service, 'dispose');
+            await disposeAll(registry);
+            assert.ok(disposed.calledOnce);
+        } finally {
+            plainWorker.resolve({ stdout: '' });
+            shellWorker.resolve({ stdout: '' });
+            await Promise.all([plain, shell]);
+        }
+    });
+
+    test('successful and failed worker executions leave the shutdown owner', async () => {
+        const completed = await factory.create();
+        const failed = await factory.create();
+        const failure = new Error('worker failed');
+        sinon.stub(processWorkers, 'workerPlainExec').resolves({ stdout: 'complete' });
+        sinon.stub(processWorkers, 'workerShellExec').rejects(failure);
+        assert.strictEqual(
+            (await completed.exec(process.execPath, ['-e', ''], { useWorker: true })).stdout,
+            'complete',
+        );
+        await assert.rejects(failed.shellExec('echo unavailable', { useWorker: true }), failure);
+
+        const disposedCompleted = sinon.spy(completed, 'dispose');
+        const disposedFailed = sinon.spy(failed, 'dispose');
+        await disposeAll(registry);
+        assert.ok(disposedCompleted.notCalled);
+        assert.ok(disposedFailed.notCalled);
     });
 
     test('one completed process does not release another active process on the same service', async () => {

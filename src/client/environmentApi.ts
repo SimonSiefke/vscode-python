@@ -124,6 +124,7 @@ export function buildEnvironmentApi(
     discoveryApi: IDiscoveryAPI,
     serviceContainer: IServiceContainer,
     jupyterPythonEnvsApi: JupyterPythonEnvironmentApi,
+    getActiveEnvironmentApi?: () => Promise<PythonExtension['environments'] | undefined>,
 ): PythonExtension['environments'] {
     const interpreterPathService = serviceContainer.get<IInterpreterPathService>(IInterpreterPathService);
     const configService = serviceContainer.get<IConfigurationService>(IConfigurationService);
@@ -286,6 +287,11 @@ export function buildEnvironmentApi(
         resolveEnvironment: async (env: Environment | EnvironmentPath | string) => {
             if (!workspace.isTrusted) {
                 throw new Error('Not allowed to resolve environment in an untrusted workspace');
+            }
+            // VS Code keeps the API returned by the initial activation after a trust restart.
+            const activeApi = await getActiveEnvironmentApi?.();
+            if (activeApi && activeApi !== environmentApi) {
+                return activeApi.resolveEnvironment(env);
             }
             let path = typeof env !== 'string' ? env.path : env;
             if (pathUtils.basename(path) === path) {
