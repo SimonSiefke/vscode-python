@@ -23,6 +23,7 @@ export type LaunchOptions = {
     args: string[];
     testProvider: TestProvider;
     token?: CancellationToken;
+    stopOnCancellation?: boolean;
     outChannel?: OutputChannel;
     pytestPort?: string;
     pytestUUID?: string;

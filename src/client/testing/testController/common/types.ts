@@ -188,6 +188,7 @@ export interface ITestExecutionAdapter {
         debugLauncher?: ITestDebugLauncher,
         interpreter?: PythonEnvironment,
         project?: ProjectAdapter,
+        token?: CancellationToken,
     ): Promise<void>;
 }
 

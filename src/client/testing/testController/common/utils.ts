@@ -115,6 +115,7 @@ export async function startRunResultNamedPipe(
     dataReceivedCallback: (payload: ExecutionTestPayload) => void,
     deferredTillServerClose: Deferred<void>,
     cancellationToken?: CancellationToken,
+    abortToken?: CancellationToken,
 ): Promise<string> {
     traceVerbose('Starting Test Result named pipe');
     const pipeName: string = generateRandomPipeName('python-test-results');
@@ -146,6 +147,11 @@ export async function startRunResultNamedPipe(
             traceError(`Test Results named pipe ${pipeName} error:`, error);
         }),
     );
+    if (abortToken?.isCancellationRequested) {
+        disposable.dispose();
+    } else if (abortToken) {
+        disposables.push(abortToken.onCancellationRequested(() => disposable.dispose()));
+    }
 
     return pipeName;
 }

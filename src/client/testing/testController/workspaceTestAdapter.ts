@@ -46,6 +46,8 @@ export class WorkspaceTestAdapter {
 
     private discoveryCancellation?: CancellationTokenSource;
 
+    private executionCancellation?: CancellationTokenSource;
+
     constructor(
         private testProvider: TestProvider,
         private discoveryAdapter: ITestDiscoveryAdapter,
@@ -58,6 +60,7 @@ export class WorkspaceTestAdapter {
     public dispose(): void {
         this.disposed = true;
         this.discoveryCancellation?.cancel();
+        this.executionCancellation?.cancel();
     }
 
     public async executeTests(
@@ -71,7 +74,7 @@ export class WorkspaceTestAdapter {
         interpreter?: PythonEnvironment,
         project?: ProjectAdapter,
     ): Promise<void> {
-        if (this.disposed) {
+        if (this.disposed || token?.isCancellationRequested || runInstance.token?.isCancellationRequested) {
             return;
         }
         if (this.executing) {
@@ -81,6 +84,9 @@ export class WorkspaceTestAdapter {
 
         const deferred = createDeferred<void>();
         this.executing = deferred;
+        const cancellation = new CancellationTokenSource();
+        this.executionCancellation = cancellation;
+        const parentCancellation = runInstance.token?.onCancellationRequested(() => cancellation.cancel());
 
         const testCaseNodes: TestItem[] = [];
         const testCaseIdsSet = new Set<string>();
@@ -90,15 +96,19 @@ export class WorkspaceTestAdapter {
                 const nodes = getTestCaseNodes(t);
                 testCaseNodes.push(...nodes);
             });
-            // iterate through testItems nodes and fetch their unittest runID to pass in as argument
+            // Only start test items that map to this adapter's discovery results.
             testCaseNodes.forEach((node) => {
-                runInstance.started(node); // do the vscode ui test item start here before runtest
                 const runId = this.resultResolver.vsIdToRunId.get(node.id);
                 if (runId) {
+                    runInstance.started(node);
                     testCaseIdsSet.add(runId);
                 }
             });
             const testCaseIds = Array.from(testCaseIdsSet);
+            if (testCaseIds.length === 0) {
+                deferred.resolve();
+                return;
+            }
             if (executionFactory === undefined) {
                 throw new Error('Execution factory is required for test execution');
             }
@@ -111,6 +121,7 @@ export class WorkspaceTestAdapter {
                 debugLauncher,
                 interpreter,
                 project,
+                cancellation.token,
             );
             deferred.resolve();
         } catch (ex) {
@@ -134,6 +145,9 @@ export class WorkspaceTestAdapter {
             deferred.reject(ex as Error);
         } finally {
             this.executing = undefined;
+            this.executionCancellation = undefined;
+            parentCancellation?.dispose();
+            cancellation.dispose();
         }
 
         return Promise.resolve();

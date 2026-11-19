@@ -7,17 +7,20 @@ import * as sinon from 'sinon';
 import * as TypeMoq from 'typemoq';
 import {
     CancellationToken,
+    CancellationTokenSource,
     Disposable,
     EventEmitter,
     FileCoverage,
     FileSystemWatcher,
+    StatementCoverage,
+    TestItem,
     TestController,
-    TestRun,
     TestRunProfile,
     TestRunProfileKind,
     TestRunRequest,
     TextDocument,
     Uri,
+    Range,
     WorkspaceFolder,
     WorkspaceFoldersChangeEvent,
     tests,
@@ -26,6 +29,7 @@ import { ICommandManager, IWorkspaceService } from '../../../client/common/appli
 import { IPythonExecutionFactory } from '../../../client/common/process/types';
 import { IConfigurationService, IPythonSettings } from '../../../client/common/types';
 import { createDeferred } from '../../../client/common/utils/async';
+import { Architecture } from '../../../client/common/utils/platform';
 import { IEnvironmentVariablesProvider } from '../../../client/common/variables/types';
 import * as workspaceApis from '../../../client/common/vscodeApis/workspaceApis';
 import * as envExtApi from '../../../client/envExt/api.internal';
@@ -37,8 +41,12 @@ import {
     PythonProject,
 } from '../../../client/envExt/types';
 import { IInterpreterService } from '../../../client/interpreter/contracts';
+import { EnvironmentType, PythonEnvironment as Interpreter } from '../../../client/pythonEnvironments/info';
 import { ITestDebugLauncher } from '../../../client/testing/common/types';
 import { ITestingSettings } from '../../../client/testing/configuration/types';
+import { setupCoverageForProjects } from '../../../client/testing/testController/common/projectTestExecution';
+import { ProjectAdapter } from '../../../client/testing/testController/common/projectAdapter';
+import { TestCoverageHandler } from '../../../client/testing/testController/common/testCoverageHandler';
 import * as projectUtils from '../../../client/testing/testController/common/projectUtils';
 import {
     ITestDiscoveryAdapter,
@@ -67,6 +75,7 @@ suite('Test workspace lifetime', () => {
         | ((uri: Uri, resolver: ITestResultResolver, token?: CancellationToken) => Promise<void> | void)
         | undefined;
     let discoveryDisabled: Set<string>;
+    let onExecution: ITestExecutionAdapter['runTests'] | undefined;
 
     setup(() => {
         registry = [];
@@ -78,6 +87,7 @@ suite('Test workspace lifetime', () => {
         clock = undefined;
         onDiscovery = undefined;
         discoveryDisabled = new Set();
+        onExecution = undefined;
         changed = new EventEmitter<WorkspaceFoldersChangeEvent>();
         saved = new EventEmitter<TextDocument>();
         events.push(changed, saved);
@@ -144,7 +154,11 @@ suite('Test workspace lifetime', () => {
             };
             return {
                 discoveryAdapter: discovery,
-                executionAdapter: TypeMoq.Mock.ofType<ITestExecutionAdapter>().object,
+                executionAdapter: {
+                    async runTests(...args) {
+                        await onExecution?.(...args);
+                    },
+                },
             };
         });
         interpreters = TypeMoq.Mock.ofType<IInterpreterService>();
@@ -164,23 +178,33 @@ suite('Test workspace lifetime', () => {
         );
         testController = factory.returnValues[0];
         const roots = new Map<string, import('vscode').TestItem>();
-        sinon.stub(testController.items, 'get').callsFake((id) => roots.get(id));
-        sinon.stub(testController.items, 'add').callsFake((item) => {
+        testController.items.get = (id) => roots.get(id);
+        testController.items.add = (item) => {
             roots.set(item.id, item);
-        });
-        sinon.stub(testController.items, 'delete').callsFake((id) => {
+        };
+        testController.items.delete = (id) => {
             roots.delete(id);
-        });
-        sinon.stub(testController.items, 'forEach').callsFake((callback, thisArg) => {
+        };
+        testController.items.forEach = (callback, thisArg) => {
             roots.forEach((item) => callback.call(thisArg, item, testController.items));
-        });
-        sinon.stub(testController, 'createTestItem').callsFake((id, label, uri) => {
-            const item = TypeMoq.Mock.ofType<import('vscode').TestItem>();
-            item.setup((value) => value.id).returns(() => id);
-            item.setup((value) => value.label).returns(() => label);
-            item.setup((value) => value.uri).returns(() => uri);
-            return item.object;
-        });
+        };
+        testController.createTestItem = (id, label, uri) => {
+            const children = new Map<string, TestItem>();
+            const item = {
+                id,
+                label,
+                uri,
+                children: {
+                    get: (key: string) => children.get(key),
+                    add: (child: TestItem) => {
+                        children.set(child.id, child);
+                        Object.defineProperty(child, 'parent', { value: item, configurable: true });
+                    },
+                    forEach: (callback: (child: TestItem) => void) => children.forEach(callback),
+                },
+            } as TestItem;
+            return item;
+        };
     });
 
     teardown(() => {
@@ -222,9 +246,63 @@ suite('Test workspace lifetime', () => {
         resolver.resolveDiscovery({
             cwd: uri.fsPath,
             status: 'success',
-            tests: { path: uri.fsPath, id_: uri.fsPath, type_: 'folder', name, children: [] },
+            tests: {
+                path: uri.fsPath,
+                id_: uri.fsPath,
+                type_: 'folder',
+                name,
+                children: [
+                    {
+                        path: Uri.joinPath(uri, 'test_current.py').fsPath,
+                        name,
+                        type_: 'test',
+                        id_: 'case',
+                        runID: 'case',
+                        lineno: 1,
+                    },
+                ],
+            },
         });
     }
+
+    function prepareRun() {
+        const source = new CancellationTokenSource();
+        const disposed = new EventEmitter<void>();
+        events.push(source, disposed);
+        const run = {
+            name: 'test run',
+            isPersisted: false,
+            token: source.token,
+            started: sinon.spy(),
+            enqueued: sinon.spy(),
+            skipped: sinon.spy(),
+            failed: sinon.spy(),
+            errored: sinon.spy(),
+            passed: sinon.spy(),
+            appendOutput: sinon.spy(),
+            addCoverage: sinon.spy(),
+            end: sinon.spy(),
+            onDidDispose: disposed.event,
+        };
+        testController.createTestRun = () => run;
+        return run;
+    }
+
+    function runRequest(include?: TestItem[], profile?: TestRunProfile): TestRunRequest {
+        return { include, exclude: undefined, profile, preserveFocus: false };
+    }
+
+    function stubInterpreter(result: () => Promise<Interpreter | undefined>): void {
+        interpreters.reset();
+        interpreters.setup((value) => value.getActiveInterpreter(TypeMoq.It.isAny())).returns(result);
+    }
+
+    const activeInterpreter: Interpreter = {
+        path: '/usr/bin/python3',
+        sysPrefix: '/usr',
+        architecture: Architecture.x64,
+        envType: EnvironmentType.Unknown,
+    };
 
     test('removing a workspace disposes its settings watcher', async () => {
         await controller.activate();
@@ -298,6 +376,43 @@ suite('Test workspace lifetime', () => {
         assert.strictEqual(watchers[1].dispose.callCount, 0);
     });
 
+    for (const removeLatestPublisher of [false, true]) {
+        test(`removing the ${
+            removeLatestPublisher ? 'latest' : 'first'
+        } publisher leaves shared tests runnable`, async () => {
+            await controller.activate();
+            const retained = add('parent');
+            const removed = add('parent/child');
+            onDiscovery = (uri, resolver) =>
+                publishRoot(resolver, removed.uri, uri === retained.uri ? 'parent' : 'child');
+            const publishers = removeLatestPublisher ? [retained, removed] : [removed, retained];
+            for (const publisher of publishers) {
+                // eslint-disable-next-line no-await-in-loop
+                await controller.refreshTestData(publisher.uri, { forceRefresh: true });
+            }
+            const restored = createDeferred<void>();
+            events.push(controller.onRefreshingCompleted(() => restored.resolve()));
+            remove(removed);
+            if (removeLatestPublisher) {
+                await restored.promise;
+            }
+            const root = testController.items.get(removed.uri.fsPath);
+            assert.ok(root);
+            assert.strictEqual(root.label, 'parent');
+            const leaf = root.children.get('case');
+            assert.ok(leaf);
+            const run = prepareRun();
+            stubInterpreter(async () => activeInterpreter);
+            const execute = sinon.spy();
+            onExecution = async (...args) => execute(...args);
+            await controller['runTests'](runRequest([leaf]), run.token);
+            assert.deepStrictEqual(
+                execute.getCalls().map(({ args }) => [args[0], args[1]]),
+                [[retained.uri, ['case']]],
+            );
+        });
+    }
+
     test('saving a test in a remaining workspace still triggers discovery', async () => {
         await controller.activate();
         const removed = add('removed');
@@ -312,6 +427,28 @@ suite('Test workspace lifetime', () => {
         await clock.tickAsync(250);
         assert.deepStrictEqual(discovered, [retained.uri.toString()]);
         assert.strictEqual(watchers[1].dispose.callCount, 0);
+    });
+
+    test('automatic discovery does not transfer a queued save to the parent or a replacement', async () => {
+        await controller.activate();
+        discoveryDisabled.add('parent');
+        add('parent');
+        const child = add('parent/child');
+        clock = sinon.useFakeTimers();
+        save(child);
+        remove(child);
+        await clock.tickAsync(250);
+        assert.deepStrictEqual(discovered, []);
+
+        const old = add('parent/child');
+        save(old);
+        remove(old);
+        const replacement = add('parent/child');
+        await clock.tickAsync(250);
+        assert.deepStrictEqual(discovered, []);
+        save(replacement);
+        await clock.tickAsync(250);
+        assert.deepStrictEqual(discovered, [replacement.uri.toString()]);
     });
 
     test('removing and readding a folder while interpreter lookup is pending skips old discovery', async () => {
@@ -372,6 +509,74 @@ suite('Test workspace lifetime', () => {
         assert.strictEqual(testController.items.get(`DiscoveryError:${old.uri.fsPath}`), undefined);
     });
 
+    test('a run waiting for its interpreter cannot execute on a replacement workspace', async () => {
+        await controller.activate();
+        const folder = add('reused');
+        onDiscovery = (uri, resolver) => publishRoot(resolver, uri, 'old root');
+        await controller.refreshTestData(folder.uri, { forceRefresh: true });
+        const leaf = testController.items.get(folder.uri.fsPath)?.children.get('case');
+        assert.ok(leaf);
+        const lookupStarted = createDeferred<void>();
+        const lookup = createDeferred<Interpreter>();
+        stubInterpreter(() => {
+            lookupStarted.resolve();
+            return lookup.promise;
+        });
+        const run = prepareRun();
+        const execute = sinon.spy();
+        onExecution = async (...args) => execute(...args);
+        const pending = controller['runTests'](runRequest([leaf]), run.token);
+        await lookupStarted.promise;
+        remove(folder);
+        const replacement = add('reused');
+        stubInterpreter(async () => activeInterpreter);
+        await controller.refreshTestData(replacement.uri, { forceRefresh: true });
+        lookup.resolve(activeInterpreter);
+        await pending;
+        sinon.assert.notCalled(execute);
+        sinon.assert.notCalled(run.started);
+        sinon.assert.calledOnce(run.end);
+    });
+
+    test('removal cancels only the retired provider while a surviving execution finishes', async () => {
+        await controller.activate();
+        const retired = add('retired');
+        const retained = add('retained');
+        onDiscovery = (uri, resolver) => publishRoot(resolver, uri, uri.fsPath);
+        await controller.refreshTestData(retired.uri, { forceRefresh: true });
+        await controller.refreshTestData(retained.uri, { forceRefresh: true });
+        stubInterpreter(async () => activeInterpreter);
+        const run = prepareRun();
+        const retiredStarted = createDeferred<CancellationToken>();
+        const retainedStarted = createDeferred<CancellationToken>();
+        const retiredCancelled = createDeferred<void>();
+        const retainedFinished = createDeferred<void>();
+        onExecution = async (uri, ids, _profile, _run, _factory, _debug, _interpreter, _project, token) => {
+            assert.deepStrictEqual(ids, ['case']);
+            assert.ok(token);
+            if (uri === retired.uri) {
+                const subscription = token.onCancellationRequested(() => retiredCancelled.resolve());
+                retiredStarted.resolve(token);
+                await retiredCancelled.promise;
+                subscription.dispose();
+            } else {
+                retainedStarted.resolve(token);
+                await retainedFinished.promise;
+            }
+        };
+        const pending = controller['runTests'](runRequest(), run.token);
+        const [retiredToken, retainedToken] = await Promise.all([retiredStarted.promise, retainedStarted.promise]);
+        remove(retired);
+        assert.strictEqual(retiredToken.isCancellationRequested, true);
+        assert.ok(!retainedToken.isCancellationRequested);
+        assert.ok(!run.token.isCancellationRequested);
+        sinon.assert.notCalled(run.end);
+        retainedFinished.resolve();
+        await pending;
+        sinon.assert.calledTwice(run.started);
+        sinon.assert.calledOnce(run.end);
+    });
+
     test('enabling automatic discovery routes each test or configuration save once', async () => {
         await controller.activate();
         add('enabled');
@@ -389,7 +594,7 @@ suite('Test workspace lifetime', () => {
         assert.deepStrictEqual(discovered, [later.uri.toString()]);
     });
 
-    test('saving in a project workspace added after activation refreshes that workspace', async () => {
+    test('saving discovers a project workspace added before project subscriptions are installed', async () => {
         const projects = new EventEmitter<DidChangePythonProjectsEventArgs>();
         const environments = new EventEmitter<DidChangeEnvironmentEventArgs>();
         events.push(projects, environments);
@@ -415,55 +620,89 @@ suite('Test workspace lifetime', () => {
         (envExtApi.useEnvExtension as sinon.SinonStub).returns(true);
         sinon.stub(envExtApi, 'getEnvExtApi').resolves(api as PythonEnvironmentApi);
         add('startup');
-        await controller.activate();
+        const activationLookup = createDeferred<Interpreter>();
+        const activationLookupStarted = createDeferred<void>();
+        stubInterpreter(() => {
+            activationLookupStarted.resolve();
+            return activationLookup.promise;
+        });
+        const activation = controller.activate();
+        await activationLookupStarted.promise;
         const later = add('later');
-        await controller['handleProjectChanges']({ added: [project], removed: [] });
-        assert.deepStrictEqual(discovered, [later.uri.toString()]);
+        projects.fire({ added: [project], removed: [] });
+        activationLookup.resolve(activeInterpreter);
+        await activation;
+        assert.deepStrictEqual(discovered, []);
         clock = sinon.useFakeTimers();
         save(later);
         await clock.tickAsync(250);
-        assert.deepStrictEqual(discovered, [later.uri.toString(), later.uri.toString()]);
+        assert.deepStrictEqual(discovered, [later.uri.toString()]);
     });
 
-    test('older coverage details remain available after collecting the retired adapter', async () => {
+    test('legacy and project reports for the same file retain their own details after retirement', async () => {
         await controller.activate();
         const before = queryObjects(WorkspaceTestAdapter);
         const folder = add('coverage');
-        let report: FileCoverage | undefined;
-        const run = {
-            addCoverage: (file: FileCoverage) => {
-                report = file;
-            },
-        } as TestRun;
-        const file = Uri.joinPath(folder.uri, 'test_coverage.py');
-        onDiscovery = (_uri, resolver) => {
-            resolver.resolveExecution(
-                {
-                    coverage: true,
-                    cwd: folder.uri.fsPath,
-                    error: '',
-                    result: {
-                        [file.fsPath]: {
-                            lines_covered: [2],
-                            lines_missed: [3],
-                            executed_branches: 0,
-                            total_branches: -1,
-                        },
-                    },
+        const run = prepareRun();
+        const file = Uri.joinPath(folder.uri, 'test_current.py');
+        const coverage = (covered: number, missed: number) => ({
+            coverage: true,
+            cwd: folder.uri.fsPath,
+            error: '',
+            result: {
+                [file.fsPath]: {
+                    lines_covered: [covered],
+                    lines_missed: [missed],
+                    executed_branches: 0,
+                    total_branches: -1,
                 },
-                run,
-            );
+            },
+        });
+        onDiscovery = (uri, resolver) => {
+            publishRoot(resolver, uri, 'coverage');
+            onExecution = async () => resolver.resolveExecution(coverage(2, 3), run);
         };
         const profile = { kind: TestRunProfileKind.Coverage } as TestRunProfile;
-        controller['setupCoverageIfNeeded']({ profile } as TestRunRequest);
+        const request = runRequest(undefined, profile);
+        stubInterpreter(async () => activeInterpreter);
         await controller.refreshTestData(folder.uri, { forceRefresh: true });
-        assert.ok(report);
-        remove(folder);
-        assert.strictEqual(queryObjects(WorkspaceTestAdapter), before);
+        await controller['runTests'](request, run.token);
+        sinon.assert.calledOnce(run.addCoverage);
+        const reports = run.addCoverage.getCalls().map(({ args }) => args[0] as FileCoverage);
+        // Sinon keeps call-site receivers alive for assertions. Keep only the actual report.
+        run.started.resetHistory();
+        run.addCoverage.resetHistory();
         assert.ok(profile.loadDetailedCoverage);
-        const details = await profile.loadDetailedCoverage(run, report, {
-            isCancellationRequested: false,
-        } as CancellationToken);
-        assert.strictEqual(details.length, 2);
+        const legacyLoader = profile.loadDetailedCoverage;
+        onExecution = undefined;
+        remove(folder);
+        await new Promise<void>(setImmediate);
+        assert.strictEqual(queryObjects(WorkspaceTestAdapter), before);
+
+        const detailedCoverageMap = new TestCoverageHandler().processCoverage(coverage(9, 2), run);
+        const project = { resultResolver: { detailedCoverageMap } } as ProjectAdapter;
+        setupCoverageForProjects(request, [project]);
+        assert.ok(profile.loadDetailedCoverage);
+        const detailsFor = async (loader: typeof legacyLoader, report: FileCoverage) => {
+            const details = await loader(run, report, run.token);
+            return details.map((detail) => [
+                ((detail as StatementCoverage).location as Range).start.line,
+                detail.executed,
+            ]);
+        };
+        reports.push(...run.addCoverage.getCalls().map(({ args }) => args[0] as FileCoverage));
+        assert.strictEqual(reports.length, 2);
+        assert.deepStrictEqual(await detailsFor(legacyLoader, reports[0]), [
+            [1, true],
+            [2, false],
+        ]);
+        assert.deepStrictEqual(await detailsFor(profile.loadDetailedCoverage, reports[0]), [
+            [1, true],
+            [2, false],
+        ]);
+        assert.deepStrictEqual(await detailsFor(profile.loadDetailedCoverage, reports[1]), [
+            [8, true],
+            [1, false],
+        ]);
     });
 });

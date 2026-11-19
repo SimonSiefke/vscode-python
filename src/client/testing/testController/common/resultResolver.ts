@@ -90,16 +90,24 @@ export class PythonResultResolver implements ITestResultResolver {
         this.ownedRoots.add(root);
     };
 
-    public dispose(): void {
+    public hasPublishedRoot(id: string): boolean {
+        return this.rootIds.has(id);
+    }
+
+    public dispose(): string[] {
         this.disposed = true;
+        const removedRoots: string[] = [];
         for (const id of this.rootIds) {
             const item = this.testController.items.get(id);
             if (item && this.ownedRoots.has(item)) {
                 this.testController.items.delete(id);
+                removedRoots.push(id);
             }
         }
         this.rootIds.clear();
         this.testItemIndex.clear();
+        this.detailedCoverageMap.clear();
+        return removedRoots;
     }
 
     public resolveDiscovery(payload: DiscoveredTestPayload, token?: CancellationToken): void {

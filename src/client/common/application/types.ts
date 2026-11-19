@@ -1036,6 +1036,8 @@ export interface IDebugService {
         parentSession?: DebugSession | DebugSessionOptions,
     ): Thenable<boolean>;
 
+    stopDebugging(session: DebugSession): Thenable<void>;
+
     /**
      * Add breakpoints.
      * @param breakpoints The breakpoints to add.

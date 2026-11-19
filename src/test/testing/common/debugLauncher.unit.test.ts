@@ -110,6 +110,7 @@ suite('Unit Tests - Debug Launcher', () => {
         _workspaceFolder: WorkspaceFolder,
         expected: DebugConfiguration,
         testProvider: TestProvider,
+        startedSession?: (session: DebugSession) => void,
     ) {
         interpreterService
             .setup((i) => i.getActiveInterpreter(TypeMoq.It.isAny()))
@@ -141,10 +142,12 @@ suite('Unit Tests - Debug Launcher', () => {
             .returns((callback) => {
                 deferred.promise.then(() => {
                     if (capturedConfig) {
-                        callback(({
+                        const session = ({
                             id: 'test-session-id',
                             configuration: capturedConfig,
-                        } as unknown) as DebugSession);
+                        } as unknown) as DebugSession;
+                        callback(session);
+                        startedSession?.(session);
                     }
                 });
                 return { dispose: () => {} };
@@ -211,6 +214,7 @@ suite('Unit Tests - Debug Launcher', () => {
         testProvider: TestProvider,
         expected?: DebugConfiguration,
         debugConfigs?: string | DebugConfiguration[],
+        startedSession?: (session: DebugSession) => void,
     ) {
         const testLaunchScript = getTestLauncherScript(testProvider, false);
 
@@ -279,10 +283,36 @@ suite('Unit Tests - Debug Launcher', () => {
             expected.debugOptions.push(DebugOptions.FixFilePathCase);
         }
 
-        setupDebugManager(workspaceFolders[0], expected, testProvider);
+        setupDebugManager(workspaceFolders[0], expected, testProvider, startedSession);
     }
 
     const testProviders: TestProvider[] = ['pytest', 'unittest'];
+
+    test('workspace cancellation stops the captured debug session', async () => {
+        const cancellation = new CancellationTokenSource();
+        const options: LaunchOptions = {
+            cwd: 'one/two/three',
+            args: ['/one/two/three/testfile.py'],
+            testProvider: 'unittest',
+            runTestIdsPort: 'runTestIdsPort',
+            pytestPort: 'pytestPort',
+            token: cancellation.token,
+            stopOnCancellation: true,
+        };
+        setupSuccess(options, 'unittest', undefined, undefined, (session) => {
+            debugService
+                .setup((service) => service.stopDebugging(TypeMoq.It.isValue(session)))
+                .returns(async () => undefined)
+                .verifiable(TypeMoq.Times.once());
+            cancellation.cancel();
+        });
+        try {
+            await debugLauncher.launchDebugger(options);
+            debugService.verifyAll();
+        } finally {
+            cancellation.dispose();
+        }
+    });
 
     testProviders.forEach((testProvider) => {
         const testTitleSuffix = `(Test Framework '${testProvider}')`;

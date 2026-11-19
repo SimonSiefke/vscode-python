@@ -62,6 +62,9 @@ export class DebugService implements IDebugService {
     ): Thenable<boolean> {
         return debug.startDebugging(folder, nameOrConfiguration, parentSession);
     }
+    public stopDebugging(session: DebugSession): Thenable<void> {
+        return debug.stopDebugging(session);
+    }
     public addBreakpoints(breakpoints: Breakpoint[]): void {
         debug.addBreakpoints(breakpoints);
     }

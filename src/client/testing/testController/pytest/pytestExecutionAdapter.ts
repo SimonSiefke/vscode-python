@@ -1,7 +1,14 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
-import { CancellationTokenSource, DebugSessionOptions, TestRun, TestRunProfileKind, Uri } from 'vscode';
+import {
+    CancellationToken,
+    CancellationTokenSource,
+    DebugSessionOptions,
+    TestRun,
+    TestRunProfileKind,
+    Uri,
+} from 'vscode';
 import * as path from 'path';
 import { ChildProcess } from 'child_process';
 import { IConfigurationService } from '../../../common/types';
@@ -39,30 +46,34 @@ export class PytestTestExecutionAdapter implements ITestExecutionAdapter {
         debugLauncher?: ITestDebugLauncher,
         interpreter?: PythonEnvironment,
         project?: ProjectAdapter,
+        token = runInstance.token,
     ): Promise<void> {
+        if (token.isCancellationRequested) {
+            return;
+        }
         const deferredTillServerClose: Deferred<void> = utils.createTestingDeferred();
 
         // create callback to handle data received on the named pipe
         const dataReceivedCallback = (data: ExecutionTestPayload) => {
-            if (runInstance && !runInstance.token.isCancellationRequested) {
+            if (runInstance && !token.isCancellationRequested) {
                 this.resultResolver?.resolveExecution(data, runInstance);
             } else {
                 traceError(`No run instance found, cannot resolve execution, for workspace ${uri.fsPath}.`);
             }
         };
         const cSource = new CancellationTokenSource();
-        runInstance.token.onCancellationRequested(() => cSource.cancel());
-
-        const name = await utils.startRunResultNamedPipe(
-            dataReceivedCallback, // callback to handle data received
-            deferredTillServerClose, // deferred to resolve when server closes
-            cSource.token, // token to cancel
-        );
-        runInstance.token.onCancellationRequested(() => {
-            traceInfo(`Test run cancelled, resolving 'TillServerClose' deferred for ${uri.fsPath}.`);
-        });
+        const cancellation = token.onCancellationRequested(() => cSource.cancel());
 
         try {
+            const name = await utils.startRunResultNamedPipe(
+                dataReceivedCallback,
+                deferredTillServerClose,
+                cSource.token,
+                token !== runInstance.token ? token : undefined,
+            );
+            if (token.isCancellationRequested) {
+                return;
+            }
             await this.runTestsNew(
                 uri,
                 testIds,
@@ -74,8 +85,11 @@ export class PytestTestExecutionAdapter implements ITestExecutionAdapter {
                 debugLauncher,
                 interpreter,
                 project,
+                token,
             );
         } finally {
+            cancellation?.dispose();
+            cSource.dispose();
             await utils.awaitDeferredWithTimeout(deferredTillServerClose, utils.RESULT_PIPE_DRAIN_TIMEOUT_MS);
         }
     }
@@ -88,10 +102,11 @@ export class PytestTestExecutionAdapter implements ITestExecutionAdapter {
         runInstance: TestRun,
         profileKind: boolean | TestRunProfileKind | undefined,
         executionFactory: IPythonExecutionFactory,
-        debugLauncher?: ITestDebugLauncher,
-        interpreter?: PythonEnvironment,
-        project?: ProjectAdapter,
-    ): Promise<ExecutionTestPayload> {
+        debugLauncher: ITestDebugLauncher | undefined,
+        interpreter: PythonEnvironment | undefined,
+        project: ProjectAdapter | undefined,
+        token: CancellationToken,
+    ): Promise<void> {
         const relativePathToPytest = 'python_files';
         const fullPluginPath = path.join(EXTENSION_ROOT_DIR, relativePathToPytest);
         const settings = this.configSettings.getSettings(uri);
@@ -156,14 +171,18 @@ export class PytestTestExecutionAdapter implements ITestExecutionAdapter {
                 cwd,
                 throwOnStdErr: true,
                 env: mutableEnv,
-                token: runInstance.token,
+                token,
             };
 
+            if (token.isCancellationRequested) {
+                return;
+            }
             if (debugBool) {
                 const launchOptions: LaunchOptions = {
                     cwd,
                     args: testArgs,
-                    token: runInstance.token,
+                    token,
+                    stopOnCancellation: token !== runInstance.token,
                     testProvider: PYTEST_PROVIDER,
                     runTestIdsPort: testIdsFileName,
                     pytestPort: resultNamedPipeName,
@@ -185,6 +204,9 @@ export class PytestTestExecutionAdapter implements ITestExecutionAdapter {
                 // For project-based execution, use the project's Python environment
                 // Otherwise, fall back to getting the environment from the URI
                 const pythonEnv = project?.pythonEnvironment ?? (await getEnvironment(uri));
+                if (token.isCancellationRequested) {
+                    return;
+                }
                 if (pythonEnv) {
                     const deferredTillExecClose: Deferred<void> = utils.createTestingDeferred();
 
@@ -197,7 +219,7 @@ export class PytestTestExecutionAdapter implements ITestExecutionAdapter {
                         args: runArgs,
                         env: (mutableEnv as unknown) as { [key: string]: string },
                     });
-                    runInstance.token.onCancellationRequested(() => {
+                    token.onCancellationRequested(() => {
                         traceInfo(`Test run cancelled, killing pytest subprocess for workspace ${uri.fsPath}`);
                         proc.kill();
                         deferredTillExecClose.resolve();
@@ -234,7 +256,7 @@ export class PytestTestExecutionAdapter implements ITestExecutionAdapter {
 
                 let resultProc: ChildProcess | undefined;
 
-                runInstance.token.onCancellationRequested(() => {
+                token.onCancellationRequested(() => {
                     traceInfo(`Test run cancelled, killing pytest subprocess for workspace ${uri.fsPath}`);
                     // if the resultProc exists just call kill on it which will handle resolving the ExecClose deferred, otherwise resolve the deferred here.
                     if (resultProc) {
@@ -275,7 +297,7 @@ export class PytestTestExecutionAdapter implements ITestExecutionAdapter {
                             `Subprocess closed unsuccessfully with exit code ${code} and signal ${signal} for workspace ${uri.fsPath}. Creating and sending error execution payload \n`,
                         );
 
-                        if (runInstance) {
+                        if (!token.isCancellationRequested) {
                             this.resultResolver?.resolveExecution(
                                 utils.createExecutionErrorPayload(code, signal, testIds, cwd),
                                 runInstance,
@@ -294,12 +316,5 @@ export class PytestTestExecutionAdapter implements ITestExecutionAdapter {
             traceError(`Error while running tests for workspace ${uri}: ${testIds}\r\n${ex}\r\n\r\n`);
             return Promise.reject(ex);
         }
-
-        const executionPayload: ExecutionTestPayload = {
-            cwd,
-            status: 'success',
-            error: '',
-        };
-        return executionPayload;
     }
 }

@@ -15,6 +15,7 @@ import { Message } from 'vscode-jsonrpc';
 import {
     writeTestIdsFile,
     populateTestTree,
+    startDiscoveryNamedPipe,
     startRunResultNamedPipe,
     awaitDeferredWithTimeout,
 } from '../../../client/testing/testController/common/utils';
@@ -770,6 +771,42 @@ suite('populateTestTree tests', () => {
     });
 });
 
+suite('Discovery pipe lifetime', () => {
+    test('cancelling discovery closes a Linux FIFO before a writer connects', async function () {
+        if (process.platform !== 'linux') {
+            this.skip();
+        }
+        const cancellation = new CancellationTokenSource();
+        const pipe = await startDiscoveryNamedPipe(
+            () => assert.fail('No writer should publish data'),
+            cancellation.token,
+        );
+        const target = await fs.promises.realpath(pipe);
+        const openDescriptor = async () => {
+            const descriptors = await fs.promises.readdir('/proc/self/fd');
+            const paths = await Promise.all(
+                descriptors.map((descriptor) => fs.promises.readlink(`/proc/self/fd/${descriptor}`).catch(() => '')),
+            );
+            return paths.includes(target);
+        };
+        try {
+            assert.ok(await openDescriptor(), 'FIFO reader is open before cancellation');
+            cancellation.cancel();
+            const deadline = Date.now() + 2000;
+            while (Date.now() < deadline) {
+                // eslint-disable-next-line no-await-in-loop
+                if (!(await openDescriptor())) {
+                    return;
+                }
+            }
+            assert.fail('FIFO reader is still open after cancellation');
+        } finally {
+            cancellation.dispose();
+            await fs.promises.unlink(pipe);
+        }
+    });
+});
+
 suite('startRunResultNamedPipe drain-on-cancel tests', () => {
     let sandbox: sinon.SinonSandbox;
     let createReaderPipeStub: sinon.SinonStub;
@@ -841,6 +878,25 @@ suite('startRunResultNamedPipe drain-on-cancel tests', () => {
         };
         return ({ jsonrpc: '2.0', params: full } as unknown) as Message;
     }
+
+    test('retiring a workspace closes its result reader even when no writer has connected', async () => {
+        const reader = new FakeMessageReader();
+        sandbox.stub(namedPipes, 'createReaderPipe').resolves(reader);
+        const close = createDeferred<void>();
+        const workspace = new CancellationTokenSource();
+        const receive = sandbox.spy();
+        try {
+            await startRunResultNamedPipe(receive, close, undefined, workspace.token);
+            assert.ok(reader.hasListener());
+            workspace.cancel();
+            assert.ok(reader.disposed);
+            assert.ok(close.completed);
+            reader.emit(makeMessage({ cwd: '/removed' }));
+            sinon.assert.notCalled(receive);
+        } finally {
+            workspace.dispose();
+        }
+    });
 
     test('cancellation alone does NOT resolve deferredTillServerClose and does NOT detach the listener (drain not interrupted)', async () => {
         const reader = new FakeMessageReader();

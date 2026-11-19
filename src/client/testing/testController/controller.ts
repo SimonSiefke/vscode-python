@@ -65,7 +65,7 @@ export class PythonTestController implements ITestController, IExtensionSingleAc
     // Legacy: Single workspace test adapter per workspace (backward compatibility)
     private readonly legacyWorkspaces = new Map<
         string,
-        { adapter: WorkspaceTestAdapter; resolver: PythonResultResolver }
+        { workspace: WorkspaceFolder; adapter: WorkspaceTestAdapter; resolver: PythonResultResolver }
     >();
     private readonly workspaceWatchers = new Map<string, DisposableStore>();
 
@@ -145,7 +145,14 @@ export class PythonTestController implements ITestController, IExtensionSingleAc
         );
 
         const delayTrigger = new DelayedTrigger(
-            (uri: Uri, invalidate: boolean) => {
+            (uri: Uri, invalidate: boolean, origin?: WorkspaceFolder) => {
+                if (
+                    origin &&
+                    (this.workspaceService.getWorkspaceFolder(uri) !== origin ||
+                        !this.configSettings.getSettings(uri).testing.autoTestDiscoverOnSaveEnabled)
+                ) {
+                    return;
+                }
                 this.refreshTestDataInternal(uri);
                 if (invalidate) {
                     this.invalidateTests(uri);
@@ -252,14 +259,26 @@ export class PythonTestController implements ITestController, IExtensionSingleAc
         const projectMode = useEnvExtension();
         this.disposables.push(
             this.workspaceService.onDidChangeWorkspaceFolders((evt) => {
+                const removedRoots: string[] = [];
                 for (const workspace of evt.removed) {
-                    this.disposeLegacyWorkspace(workspace.uri.toString());
+                    removedRoots.push(...this.disposeLegacyWorkspace(workspace.uri.toString()));
                     this.disposeWorkspaceWatchers(workspace);
                 }
                 for (const workspace of evt.added) {
                     this.setupFileWatchers(workspace);
                     if (!projectMode) {
                         this.activateLegacyWorkspace(workspace);
+                    }
+                }
+                if (removedRoots.length > 0) {
+                    // Discovery directories can be shared by multiple legacy workspaces.
+                    // Re-discover surviving publishers when the visible root was retired.
+                    for (const { workspace, resolver } of this.legacyWorkspaces.values()) {
+                        if (removedRoots.some((id) => resolver.hasPublishedRoot(id))) {
+                            this.refreshTestDataInternal(workspace.uri).catch((error) =>
+                                traceError('Failed to refresh tests in the surviving workspace', error),
+                            );
+                        }
                     }
                 }
             }),
@@ -572,17 +591,19 @@ export class PythonTestController implements ITestController, IExtensionSingleAc
         );
 
         this.legacyWorkspaces.set(workspace.uri.toString(), {
+            workspace,
             adapter: workspaceTestAdapter,
             resolver: resultResolver,
         });
         return workspaceTestAdapter;
     }
 
-    private disposeLegacyWorkspace(key: string): void {
+    private disposeLegacyWorkspace(key: string): string[] {
         const state = this.legacyWorkspaces.get(key);
         this.legacyWorkspaces.delete(key);
-        state?.resolver.dispose();
+        const removedRoots = state?.resolver.dispose() ?? [];
         state?.adapter.dispose();
+        return removedRoots;
     }
 
     public refreshTestData(uri?: Resource, options?: TestRefreshOptions): Promise<void> {
@@ -671,7 +692,10 @@ export class PythonTestController implements ITestController, IExtensionSingleAc
         }
 
         // Use project-based discovery if applicable (only reached if testing is enabled)
-        if (this.projectRegistry.hasProjects(workspace.uri)) {
+        if (
+            this.projectRegistry.hasProjects(workspace.uri) ||
+            (useEnvExtension() && !this.legacyWorkspaces.has(workspace.uri.toString()))
+        ) {
             await this.discoverAllProjectsInWorkspace(workspace.uri);
             return;
         }
@@ -966,7 +990,11 @@ export class PythonTestController implements ITestController, IExtensionSingleAc
         token: CancellationToken,
         unconfiguredWorkspaces: WorkspaceFolder[],
     ): Promise<void> {
-        if (!(await this.interpreterService.getActiveInterpreter(workspace.uri))) {
+        const interpreter = await this.interpreterService.getActiveInterpreter(workspace.uri);
+        if (this.workspaceService.getWorkspaceFolder(workspace.uri) !== workspace || token.isCancellationRequested) {
+            return;
+        }
+        if (!interpreter) {
             this.commandManager
                 .executeCommand(constants.Commands.TriggerEnvironmentSelection, workspace.uri)
                 .then(noop, noop);
@@ -1124,24 +1152,20 @@ export class PythonTestController implements ITestController, IExtensionSingleAc
 
         /* Keep both watchers for create and delete since config files can change test behavior without content
         due to their impact on pythonPath. */
-        disposables.add(
-            watcher.onDidCreate((uri) => {
-                traceVerbose(`Testing: Trigger refresh after creating ${uri.fsPath}`);
+        const refreshOnChange = (uri: Uri) => {
+            if (this.workspaceService.getWorkspaceFolder(uri) === workspace) {
+                traceVerbose(`Testing: Trigger refresh after configuration file change ${uri.fsPath}`);
                 this.sendTriggerTelemetry('watching');
-                this.refreshData.trigger(uri, false);
-            }),
-        );
-        disposables.add(
-            watcher.onDidDelete((uri) => {
-                traceVerbose(`Testing: Trigger refresh after deleting in ${uri.fsPath}`);
-                this.sendTriggerTelemetry('watching');
-                this.refreshData.trigger(uri, false);
-            }),
-        );
+                this.refreshData.trigger(uri, false, workspace);
+            }
+        };
+        disposables.add(watcher.onDidCreate(refreshOnChange));
+        disposables.add(watcher.onDidDelete(refreshOnChange));
     }
 
     private refreshOnSave(doc: TextDocument): void {
-        if (!this.workspaceService.getWorkspaceFolder(doc.uri)) {
+        const workspace = this.workspaceService.getWorkspaceFolder(doc.uri);
+        if (!workspace) {
             return;
         }
         const { testing } = this.configSettings.getSettings(doc.uri);
@@ -1158,7 +1182,7 @@ export class PythonTestController implements ITestController, IExtensionSingleAc
         ) {
             traceVerbose(`Testing: Trigger refresh after saving ${doc.uri.fsPath}`);
             this.sendTriggerTelemetry('watching');
-            this.refreshData.trigger(doc.uri, false);
+            this.refreshData.trigger(doc.uri, false, workspace);
         }
     }
 

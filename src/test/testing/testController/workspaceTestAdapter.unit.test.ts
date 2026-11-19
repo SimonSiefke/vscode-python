@@ -5,7 +5,8 @@ import * as assert from 'assert';
 import * as sinon from 'sinon';
 import * as typemoq from 'typemoq';
 
-import { TestController, TestItem, TestItemCollection, TestRun, Uri } from 'vscode';
+import { CancellationTokenSource, TestController, TestItem, TestItemCollection, TestRun, Uri } from 'vscode';
+import { createDeferred } from '../../../client/common/utils/async';
 import { IConfigurationService } from '../../../client/common/types';
 import { UnittestTestDiscoveryAdapter } from '../../../client/testing/testController/unittest/testDiscoveryAdapter';
 import { UnittestTestExecutionAdapter } from '../../../client/testing/testController/unittest/testExecutionAdapter'; // 7/7
@@ -255,6 +256,7 @@ suite('Workspace test adapter', () => {
         let executionTestsStub: sinon.SinonStub;
         let sendTelemetryStub: sinon.SinonStub;
         let runInstance: typemoq.IMock<TestRun>;
+        let runCancellation: CancellationTokenSource;
         let testControllerMock: typemoq.IMock<TestController>;
         let telemetryEvent: { eventName: EventName; properties: Record<string, unknown> }[] = [];
         let resultResolver: ResultResolver.PythonResultResolver;
@@ -333,6 +335,8 @@ suite('Workspace test adapter', () => {
             sendTelemetryStub = sandbox.stub(Telemetry, 'sendTelemetryEvent').callsFake(mockSendTelemetryEvent);
             execFactory = typemoq.Mock.ofType<IPythonExecutionFactory>();
             runInstance = typemoq.Mock.ofType<TestRun>();
+            runCancellation = new CancellationTokenSource();
+            runInstance.setup((run) => run.token).returns(() => runCancellation.token);
 
             const testProvider = 'pytest';
             const workspaceUri = Uri.file('foo');
@@ -343,6 +347,7 @@ suite('Workspace test adapter', () => {
             telemetryEvent = [];
             log = [];
             testController.dispose();
+            runCancellation.dispose();
             sandbox.restore();
         });
         test('When executing tests, the right tests should be sent to be executed', async () => {
@@ -355,9 +360,10 @@ suite('Workspace test adapter', () => {
                 Uri.parse('foo'),
                 resultResolver,
             );
-            resultResolver.runIdToVSid.set('mockTestItem1', 'mockTestItem1');
+            resultResolver.vsIdToRunId.set('mockTestItem1', 'mockRunId1');
+            resultResolver.vsIdToRunId.set('mockTestItem2', 'mockRunId2');
 
-            sinon.stub(testItemUtilities, 'getTestCaseNodes').callsFake((testNode: TestItem) =>
+            sandbox.stub(testItemUtilities, 'getTestCaseNodes').callsFake((testNode: TestItem) =>
                 // Custom implementation logic here based on the provided testNode and collection
 
                 // Example implementation: returning a predefined array of TestItem objects
@@ -396,6 +402,7 @@ suite('Workspace test adapter', () => {
             );
 
             runInstance.verify((r) => r.started(typemoq.It.isAny()), typemoq.Times.exactly(2));
+            sinon.assert.calledWith(executionTestsStub, sinon.match.any, ['mockRunId1', 'mockRunId2']);
         });
 
         test("When executing tests, the workspace test adapter should call the test execute adapter's executionTest method", async () => {
@@ -409,21 +416,19 @@ suite('Workspace test adapter', () => {
                 stubResultResolver,
             );
 
-            await workspaceTestAdapter.executeTests(testController, runInstance.object, [], execFactory.object);
+            await workspaceTestAdapter.executeTests(
+                testController,
+                runInstance.object,
+                [createMockTestItem('test')],
+                execFactory.object,
+            );
 
             sinon.assert.calledOnce(executionTestsStub);
         });
 
         test('If execution is already running, do not call executionAdapter.runTests again', async () => {
-            executionTestsStub.callsFake(
-                async () =>
-                    new Promise<void>((resolve) => {
-                        setTimeout(() => {
-                            // Simulate time taken by discovery.
-                            resolve();
-                        }, 2000);
-                    }),
-            );
+            const finish = createDeferred<void>();
+            executionTestsStub.returns(finish.promise);
 
             const testDiscoveryAdapter = new UnittestTestDiscoveryAdapter(stubConfigSettings);
             const testExecutionAdapter = new UnittestTestExecutionAdapter(stubConfigSettings);
@@ -435,13 +440,40 @@ suite('Workspace test adapter', () => {
                 stubResultResolver,
             );
 
-            // Try running discovery twice
-            const one = workspaceTestAdapter.executeTests(testController, runInstance.object, [], execFactory.object);
-            const two = workspaceTestAdapter.executeTests(testController, runInstance.object, [], execFactory.object);
-
-            Promise.all([one, two]);
-
+            const testsToRun = [createMockTestItem('test')];
+            const one = workspaceTestAdapter.executeTests(
+                testController,
+                runInstance.object,
+                testsToRun,
+                execFactory.object,
+            );
+            const two = workspaceTestAdapter.executeTests(
+                testController,
+                runInstance.object,
+                testsToRun,
+                execFactory.object,
+            );
+            finish.resolve();
+            await Promise.all([one, two]);
             sinon.assert.calledOnce(executionTestsStub);
+        });
+
+        test('an unmapped selection does not launch the provider or start the test item', async () => {
+            const workspaceTestAdapter = new WorkspaceTestAdapter(
+                'unittest',
+                new UnittestTestDiscoveryAdapter(stubConfigSettings),
+                new UnittestTestExecutionAdapter(stubConfigSettings),
+                Uri.parse('foo'),
+                resultResolver,
+            );
+            await workspaceTestAdapter.executeTests(
+                testController,
+                runInstance.object,
+                [createMockTestItem('old')],
+                execFactory.object,
+            );
+            sinon.assert.notCalled(executionTestsStub);
+            runInstance.verify((r) => r.started(typemoq.It.isAny()), typemoq.Times.never());
         });
 
         test('If execution failed correctly create error node', async () => {
@@ -476,7 +508,12 @@ suite('Workspace test adapter', () => {
             const buildErrorNodeOptionsStub = sinon.stub(util, 'buildErrorNodeOptions').returns(errorTestItemOptions);
             const testProvider = 'unittest';
 
-            await workspaceTestAdapter.executeTests(testController, runInstance.object, [], execFactory.object);
+            await workspaceTestAdapter.executeTests(
+                testController,
+                runInstance.object,
+                [createMockTestItem('test')],
+                execFactory.object,
+            );
 
             sinon.assert.calledWithMatch(createErrorTestItemStub, sinon.match.any, sinon.match.any);
             sinon.assert.calledWithMatch(buildErrorNodeOptionsStub, Uri.parse('foo'), sinon.match.any, testProvider);
@@ -496,7 +533,12 @@ suite('Workspace test adapter', () => {
                 stubResultResolver,
             );
 
-            await workspaceTestAdapter.executeTests(testController, runInstance.object, [], execFactory.object);
+            await workspaceTestAdapter.executeTests(
+                testController,
+                runInstance.object,
+                [createMockTestItem('test')],
+                execFactory.object,
+            );
 
             sinon.assert.calledWith(sendTelemetryStub, EventName.UNITTEST_RUN_ALL_FAILED);
             assert.strictEqual(telemetryEvent.length, 1);
@@ -509,9 +551,9 @@ function createMockTestItem(id: string): TestItem {
     const mockTestItem = ({
         id,
         canResolveChildren: false,
-        tags: [],
+        tags: [{ id: 'test' }],
         children: {
-            add: () => {
+            forEach: () => {
                 // empty
             },
         },

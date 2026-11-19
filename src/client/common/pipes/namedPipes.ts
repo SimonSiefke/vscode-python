@@ -12,7 +12,6 @@ import { CancellationError, CancellationToken, Disposable } from 'vscode';
 import { traceVerbose } from '../../logging';
 import { isWindows } from '../utils/platform';
 import { createDeferred } from '../utils/async';
-import { noop } from '../utils/misc';
 
 const { XDG_RUNTIME_DIR } = process.env;
 export function generateRandomPipeName(prefix: string): string {
@@ -83,6 +82,17 @@ export async function createWriterPipe(pipeName: string, token?: CancellationTok
         encoding: 'utf-8',
     });
     return new rpc.StreamMessageWriter(writer, 'utf-8');
+}
+
+class OwnedSocketReader extends rpc.SocketMessageReader {
+    constructor(private readonly socket: net.Socket) {
+        super(socket, 'utf-8');
+    }
+
+    public dispose(): void {
+        super.dispose();
+        this.socket.destroy();
+    }
 }
 
 class CombinedReader implements rpc.MessageReader {
@@ -166,7 +176,7 @@ export async function createReaderPipe(pipeName: string, token?: CancellationTok
                     server.close();
                 }
             });
-            combined.add(new rpc.SocketMessageReader(socket, 'utf-8'));
+            combined.add(new OwnedSocketReader(socket));
         });
         server.on('error', deferred.reject);
         server.listen(pipeName);
@@ -190,11 +200,5 @@ export async function createReaderPipe(pipeName: string, token?: CancellationTok
     }
     const fd = await fs.open(pipeName, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
     const socket = new net.Socket({ fd });
-    const reader = new rpc.SocketMessageReader(socket, 'utf-8');
-    socket.on('close', () => {
-        fs.close(fd).catch(noop);
-        reader.dispose();
-    });
-
-    return reader;
+    return new OwnedSocketReader(socket);
 }
