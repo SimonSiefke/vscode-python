@@ -4,34 +4,53 @@
 import * as assert from 'assert';
 import * as sinon from 'sinon';
 import * as TypeMoq from 'typemoq';
-import { CancellationToken, CancellationTokenSource, Disposable, TestController, tests } from 'vscode';
+import {
+    CancellationToken,
+    CancellationTokenSource,
+    Disposable,
+    EventEmitter,
+    TestController,
+    tests,
+    Uri,
+    WorkspaceFoldersChangeEvent,
+} from 'vscode';
 import { ICommandManager, IWorkspaceService } from '../../../client/common/application/types';
 import { IPythonExecutionFactory } from '../../../client/common/process/types';
-import { IConfigurationService } from '../../../client/common/types';
+import { IConfigurationService, IPythonSettings } from '../../../client/common/types';
 import { createDeferred } from '../../../client/common/utils/async';
+import { Architecture } from '../../../client/common/utils/platform';
 import { IEnvironmentVariablesProvider } from '../../../client/common/variables/types';
+import * as envExtApiInternal from '../../../client/envExt/api.internal';
 import { IInterpreterService } from '../../../client/interpreter/contracts';
+import { EnvironmentType } from '../../../client/pythonEnvironments/info';
 import { ITestDebugLauncher } from '../../../client/testing/common/types';
 import { ITestFrameworkController } from '../../../client/testing/testController/common/types';
 import { PythonTestController } from '../../../client/testing/testController/controller';
+import { WorkspaceTestAdapter } from '../../../client/testing/testController/workspaceTestAdapter';
 
 suite('Test refresh subscription lifetime', () => {
     let controller: PythonTestController;
     let testController: TestController;
     let registry: Disposable[];
     let tokens: CancellationTokenSource[];
+    let workspaceService: TypeMoq.IMock<IWorkspaceService>;
+    let configSettings: TypeMoq.IMock<IConfigurationService>;
+    let interpreterService: TypeMoq.IMock<IInterpreterService>;
 
     setup(() => {
         registry = [];
         tokens = [];
+        workspaceService = TypeMoq.Mock.ofType<IWorkspaceService>();
+        configSettings = TypeMoq.Mock.ofType<IConfigurationService>();
+        interpreterService = TypeMoq.Mock.ofType<IInterpreterService>();
         const factory = sinon.spy(tests, 'createTestController');
         controller = new PythonTestController(
-            TypeMoq.Mock.ofType<IWorkspaceService>().object,
-            TypeMoq.Mock.ofType<IConfigurationService>().object,
+            workspaceService.object,
+            configSettings.object,
             TypeMoq.Mock.ofType<ITestFrameworkController>().object,
             TypeMoq.Mock.ofType<ITestFrameworkController>().object,
             registry,
-            TypeMoq.Mock.ofType<IInterpreterService>().object,
+            interpreterService.object,
             TypeMoq.Mock.ofType<ICommandManager>().object,
             TypeMoq.Mock.ofType<IPythonExecutionFactory>().object,
             TypeMoq.Mock.ofType<ITestDebugLauncher>().object,
@@ -130,5 +149,78 @@ suite('Test refresh subscription lifetime', () => {
             await pending;
         }
         assert.strictEqual(current.dispose.callCount, 1);
+    });
+
+    test('finishing one refresh keeps an overlapping discovery cancellable', async () => {
+        const folder = { uri: Uri.file('/workspace'), name: 'workspace', index: 0 };
+        const foldersChanged = new EventEmitter<WorkspaceFoldersChangeEvent>();
+        registry.push(foldersChanged);
+        workspaceService.setup((service) => service.workspaceFolders).returns(() => [folder]);
+        workspaceService.setup((service) => service.onDidChangeWorkspaceFolders).returns(() => foldersChanged.event);
+        workspaceService.setup((service) => service.getWorkspaceFolder(folder.uri)).returns(() => folder);
+        configSettings
+            .setup((service) => service.getSettings(folder.uri))
+            .returns(
+                () => ({ testing: { unittestEnabled: true, autoTestDiscoverOnSaveEnabled: false } } as IPythonSettings),
+            );
+        interpreterService
+            .setup((service) => service.getActiveInterpreter(folder.uri))
+            .returns(async () => ({
+                path: 'python',
+                sysPrefix: folder.uri.fsPath,
+                architecture: Architecture.Unknown,
+                envType: EnvironmentType.Unknown,
+            }));
+        sinon.stub(envExtApiInternal, 'useEnvExtension').returns(false);
+        await controller.activate();
+
+        const firstStarted = createDeferred<void>();
+        const secondStarted = createDeferred<CancellationToken>();
+        const firstComplete = createDeferred<void>();
+        const secondComplete = createDeferred<void>();
+        const discover = sinon.stub(WorkspaceTestAdapter.prototype, 'discoverTests');
+        discover.onFirstCall().callsFake(() => {
+            firstStarted.resolve();
+            return firstComplete.promise;
+        });
+        discover.onSecondCall().callsFake((_testController, _executionFactory, token) => {
+            assert.ok(token);
+            secondStarted.resolve(token);
+            return secondComplete.promise;
+        });
+        const first = cancellation();
+        const second = cancellation();
+        const firstPending = refresh(first.token);
+        let secondPending: Promise<void> | undefined;
+        try {
+            await Promise.race([
+                firstStarted.promise,
+                firstPending.then(() => assert.fail('The first refresh finished before discovery started')),
+            ]);
+            secondPending = refresh(second.token);
+            const discoveryToken = await Promise.race([
+                secondStarted.promise,
+                secondPending.then(() => assert.fail('The second refresh finished before discovery started')),
+            ]);
+            const onDiscoveryCancellation = sinon.spy();
+            registry.push(discoveryToken.onCancellationRequested(onDiscoveryCancellation));
+
+            firstComplete.resolve();
+            await firstPending;
+            assert.strictEqual(first.dispose.callCount, 1);
+            assert.strictEqual(second.dispose.callCount, 0);
+            assert.strictEqual(onDiscoveryCancellation.callCount, 0);
+
+            second.source.cancel();
+            assert.strictEqual(onDiscoveryCancellation.callCount, 1);
+
+            secondComplete.resolve();
+            await secondPending;
+            assert.strictEqual(second.dispose.callCount, 1);
+        } finally {
+            firstComplete.resolve();
+            secondComplete.resolve();
+            await Promise.allSettled([firstPending, secondPending]);
+        }
     });
 });
