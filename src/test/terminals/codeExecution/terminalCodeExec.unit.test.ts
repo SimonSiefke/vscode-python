@@ -97,10 +97,15 @@ suite('Terminal - REPL lifetime', () => {
         }
     });
 
-    test('Session disposal releases the active REPL close listener', async () => {
+    test('Session disposal releases the close listener of a reopened REPL', async () => {
         const { executor, closeListeners, disposables, dataWritten } = createExecutor();
         const clock = sinon.useFakeTimers();
         try {
+            await executor.initializeRepl(undefined);
+            expect(closeListeners.size).to.equal(1);
+            [...closeListeners].forEach((listener) => listener());
+            expect(closeListeners.size).to.equal(0);
+
             await executor.initializeRepl(undefined);
             expect(closeListeners.size).to.equal(1);
             disposables.forEach((disposable) => disposable.dispose());
