@@ -257,6 +257,7 @@ export function populateTestTree(
     token?: CancellationToken,
     projectId?: string,
     projectName?: string,
+    onRoot?: (root: TestItem) => void,
 ): number {
     // Count leaf tests while walking the tree so telemetry does not need a second traversal.
     let testCount = 0;
@@ -273,6 +274,7 @@ export function populateTestTree(
         testRoot.tags = [RunTestTag, DebugTestTag];
 
         testController.items.add(testRoot);
+        onRoot?.(testRoot);
     }
 
     // Recursively populate the tree with test data.

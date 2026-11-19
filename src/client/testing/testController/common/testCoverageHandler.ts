@@ -9,6 +9,12 @@ import { CoveragePayload, FileCoverageMetrics } from './types';
  * This handler is shared across all workspaces and contains no instance state.
  */
 export class TestCoverageHandler {
+    private static readonly detailsByReport = new WeakMap<FileCoverage, FileCoverageDetail[]>();
+
+    public static getDetailedCoverage(report: FileCoverage): FileCoverageDetail[] | undefined {
+        return this.detailsByReport.get(report);
+    }
+
     /**
      * Process coverage payload
      * Pure function - returns coverage data without storing it
@@ -26,14 +32,14 @@ export class TestCoverageHandler {
 
             // Create FileCoverage object and add to run instance
             const fileCoverage = this.createFileCoverage(Uri.file(fileNameStr), fileCoverageMetrics);
-            runInstance.addCoverage(fileCoverage);
-
             // Create detailed coverage array for this file
             const detailedCoverage = this.createDetailedCoverage(
                 fileCoverageMetrics.lines_covered ?? [],
                 fileCoverageMetrics.lines_missed ?? [],
             );
             detailedCoverageMap.set(Uri.file(fileNameStr).fsPath, detailedCoverage);
+            TestCoverageHandler.detailsByReport.set(fileCoverage, detailedCoverage);
+            runInstance.addCoverage(fileCoverage);
         }
 
         return detailedCoverageMap;

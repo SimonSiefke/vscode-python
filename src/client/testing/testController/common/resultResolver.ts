@@ -29,6 +29,12 @@ export class PythonResultResolver implements ITestResultResolver {
 
     public readonly discoveryTelemetry: DiscoveryTelemetryState;
 
+    private disposed = false;
+
+    private readonly rootIds = new Set<string>();
+
+    private readonly ownedRoots = new WeakSet<TestItem>();
+
     /**
      * Optional project ID for scoping test IDs.
      * When set, all test IDs are prefixed with `{projectId}@@vsc@@` for project-based testing.
@@ -79,7 +85,27 @@ export class PythonResultResolver implements ITestResultResolver {
         return this.projectId;
     }
 
+    public readonly trackRoot = (root: TestItem): void => {
+        this.rootIds.add(root.id);
+        this.ownedRoots.add(root);
+    };
+
+    public dispose(): void {
+        this.disposed = true;
+        for (const id of this.rootIds) {
+            const item = this.testController.items.get(id);
+            if (item && this.ownedRoots.has(item)) {
+                this.testController.items.delete(id);
+            }
+        }
+        this.rootIds.clear();
+        this.testItemIndex.clear();
+    }
+
     public resolveDiscovery(payload: DiscoveredTestPayload, token?: CancellationToken): void {
+        if (this.disposed) {
+            return;
+        }
         const testCount = PythonResultResolver.discoveryHandler.processDiscovery(
             payload,
             this.testController,
@@ -89,6 +115,7 @@ export class PythonResultResolver implements ITestResultResolver {
             token,
             this.projectId,
             this.projectName,
+            this.trackRoot,
         );
         const cycle = this.discoveryTelemetry.complete();
         const mode = cycle?.mode ?? this.discoveryTelemetry.defaultMode;
@@ -116,6 +143,9 @@ export class PythonResultResolver implements ITestResultResolver {
     }
 
     public resolveExecution(payload: ExecutionTestPayload | CoveragePayload, runInstance: TestRun): void {
+        if (this.disposed) {
+            return;
+        }
         if ('coverage' in payload) {
             // coverage data is sent once per connection
             traceInfo('Coverage data received, processing...');
