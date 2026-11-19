@@ -22,7 +22,11 @@ export async function setupDiscoveryPipe(
     resultResolver: ITestResultResolver | undefined,
     token: CancellationToken | undefined,
     uri: Uri,
-): Promise<{ pipeName: string; cancellation: CancellationTokenSource; tokenDisposable: Disposable | undefined }> {
+): Promise<{
+    pipe: Awaited<ReturnType<typeof startDiscoveryNamedPipe>>;
+    cancellation: CancellationTokenSource;
+    tokenDisposable: Disposable | undefined;
+}> {
     const discoveryPipeCancellation = new CancellationTokenSource();
 
     // Wire up cancellation from external token and store the disposable
@@ -32,19 +36,19 @@ export async function setupDiscoveryPipe(
     });
 
     // Start the named pipe with the discovery listener
-    const discoveryPipeName = await startDiscoveryNamedPipe((data: DiscoveredTestPayload) => {
-        if (!token?.isCancellationRequested) {
-            resultResolver?.resolveDiscovery(data);
-        }
-    }, discoveryPipeCancellation.token);
-
-    traceVerbose(`Created discovery pipe: ${discoveryPipeName} for workspace ${uri.fsPath}`);
-
-    return {
-        pipeName: discoveryPipeName,
-        cancellation: discoveryPipeCancellation,
-        tokenDisposable,
-    };
+    try {
+        const pipe = await startDiscoveryNamedPipe((data: DiscoveredTestPayload) => {
+            if (!token?.isCancellationRequested) {
+                resultResolver?.resolveDiscovery(data);
+            }
+        }, discoveryPipeCancellation.token);
+        traceVerbose(`Created discovery pipe: ${pipe.pipeName} for workspace ${uri.fsPath}`);
+        return { pipe, cancellation: discoveryPipeCancellation, tokenDisposable };
+    } catch (error) {
+        tokenDisposable?.dispose();
+        discoveryPipeCancellation.dispose();
+        throw error;
+    }
 }
 
 /**

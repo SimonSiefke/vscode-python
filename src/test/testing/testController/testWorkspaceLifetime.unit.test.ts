@@ -413,6 +413,46 @@ suite('Test workspace lifetime', () => {
         });
     }
 
+    test('shared root is recovered when the surviving discovery published before it finished', async () => {
+        await controller.activate();
+        const survivor = add('parent');
+        const removed = add('parent/child');
+        const published = createDeferred<void>();
+        const finish = createDeferred<void>();
+        const joined = createDeferred<void>();
+        const restored = createDeferred<void>();
+        let first = true;
+        onDiscovery = async (uri, resolver) => {
+            publishRoot(resolver, removed.uri, uri === survivor.uri ? 'survivor' : 'removed');
+            if (uri === survivor.uri) {
+                if (first) {
+                    first = false;
+                    published.resolve();
+                    await finish.promise;
+                } else {
+                    restored.resolve();
+                }
+            }
+        };
+        const existing = controller.refreshTestData(survivor.uri, { forceRefresh: true });
+        await published.promise;
+        await controller.refreshTestData(removed.uri, { forceRefresh: true });
+        const originalDiscovery = WorkspaceTestAdapter.prototype.discoverTests;
+        sinon
+            .stub(WorkspaceTestAdapter.prototype, 'discoverTests')
+            .callsFake(function (this: WorkspaceTestAdapter, ...args) {
+                const result = originalDiscovery.apply(this, args);
+                joined.resolve();
+                return result;
+            });
+        remove(removed);
+        await joined.promise;
+        finish.resolve();
+        await existing;
+        await restored.promise;
+        assert.strictEqual(testController.items.get(removed.uri.fsPath)?.label, 'survivor');
+    });
+
     test('saving a test in a remaining workspace still triggers discovery', async () => {
         await controller.activate();
         const removed = add('removed');
@@ -594,11 +634,12 @@ suite('Test workspace lifetime', () => {
         assert.deepStrictEqual(discovered, [later.uri.toString()]);
     });
 
-    test('saving discovers a project workspace added before project subscriptions are installed', async () => {
+    test('project events during startup register added workspaces before later saves', async () => {
         const projects = new EventEmitter<DidChangePythonProjectsEventArgs>();
         const environments = new EventEmitter<DidChangeEnvironmentEventArgs>();
         events.push(projects, environments);
         const project: PythonProject = { uri: Uri.file('/workspace/later'), name: 'later' };
+        const initiallyReadyProject: PythonProject = { uri: Uri.file('/workspace/ready'), name: 'ready' };
         const environmentRoot = Uri.joinPath(project.uri, '.venv');
         const executable = Uri.joinPath(environmentRoot, 'bin', 'python');
         const environment: PythonEnvironment = {
@@ -612,14 +653,15 @@ suite('Test workspace lifetime', () => {
             envId: { id: 'later-venv', managerId: 'test' },
         };
         const api: Partial<PythonEnvironmentApi> = {
-            getPythonProjects: () => [project],
+            getPythonProjects: () => [project, initiallyReadyProject],
             getEnvironment: async () => environment,
             onDidChangePythonProjects: projects.event,
             onDidChangeEnvironment: environments.event,
         };
         (envExtApi.useEnvExtension as sinon.SinonStub).returns(true);
         sinon.stub(envExtApi, 'getEnvExtApi').resolves(api as PythonEnvironmentApi);
-        add('startup');
+        const startup = add('startup');
+        const ready = add('ready');
         const activationLookup = createDeferred<Interpreter>();
         const activationLookupStarted = createDeferred<void>();
         stubInterpreter(() => {
@@ -628,15 +670,21 @@ suite('Test workspace lifetime', () => {
         });
         const activation = controller.activate();
         await activationLookupStarted.promise;
+        clock = sinon.useFakeTimers();
+        await clock.tickAsync(0);
+        assert.ok(controller['projectRegistry'].hasProjects(ready.uri));
+        save(startup);
+        save(ready);
+        await clock.tickAsync(250);
+        assert.deepStrictEqual(discovered, []);
         const later = add('later');
         projects.fire({ added: [project], removed: [] });
         activationLookup.resolve(activeInterpreter);
         await activation;
-        assert.deepStrictEqual(discovered, []);
-        clock = sinon.useFakeTimers();
+        assert.deepStrictEqual(discovered, [later.uri.toString()]);
         save(later);
         await clock.tickAsync(250);
-        assert.deepStrictEqual(discovered, [later.uri.toString()]);
+        assert.deepStrictEqual(discovered, [later.uri.toString(), later.uri.toString()]);
     });
 
     test('legacy and project reports for the same file retain their own details after retirement', async () => {

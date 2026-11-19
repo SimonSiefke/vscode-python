@@ -2,6 +2,9 @@
 //  Copyright (c) Microsoft Corporation. All rights reserved.
 //  Licensed under the MIT License.
 import { CancellationTokenSource, TestRun, TestRunProfileKind, Uri } from 'vscode';
+import * as assert from 'node:assert/strict';
+import { promises as fs } from 'node:fs';
+import { tmpdir } from 'node:os';
 import * as typeMoq from 'typemoq';
 import * as sinon from 'sinon';
 import * as path from 'path';
@@ -11,7 +14,9 @@ import { IConfigurationService } from '../../../client/common/types';
 import { Deferred, createDeferred } from '../../../client/common/utils/async';
 import { EXTENSION_ROOT_DIR } from '../../../client/constants';
 import { ITestDebugLauncher } from '../../../client/testing/common/types';
+import { PytestTestDiscoveryAdapter } from '../../../client/testing/testController/pytest/pytestDiscoveryAdapter';
 import { PytestTestExecutionAdapter } from '../../../client/testing/testController/pytest/pytestExecutionAdapter';
+import { UnittestTestDiscoveryAdapter } from '../../../client/testing/testController/unittest/testDiscoveryAdapter';
 import { UnittestTestExecutionAdapter } from '../../../client/testing/testController/unittest/testExecutionAdapter';
 import { MockChildProcess } from '../../mocks/mockChildProcess';
 import * as util from '../../../client/testing/testController/common/utils';
@@ -70,6 +75,86 @@ suite('Execution Flow Run Adapters', () => {
         sinon.restore();
     });
     adapters.forEach((adapter) => {
+        test(`Adapter ${adapter}: discovery closes its reader when interpreter activation fails`, async () => {
+            const dispose = sinon.spy();
+            const drain = sinon.stub().resolves();
+            sinon
+                .stub(util, 'startDiscoveryNamedPipe')
+                .resolves({ pipeName: 'discovery', dispose, waitForClose: drain });
+            const failed = new Error('configuration failed before process launch');
+            execFactoryStub
+                .setup((factory) => factory.createActivatedEnvironment(typeMoq.It.isAny()))
+                .returns(async () => {
+                    throw failed;
+                });
+            execFactoryStub.setup((factory) => ((factory as unknown) as any).then).returns(() => undefined);
+            const discovery =
+                adapter === 'pytest'
+                    ? new PytestTestDiscoveryAdapter(configService)
+                    : new UnittestTestDiscoveryAdapter(configService);
+            await assert.rejects(discovery.discoverTests(Uri.file(tmpdir()), execFactoryStub.object), failed);
+            sinon.assert.calledOnce(dispose);
+            sinon.assert.notCalled(drain);
+        });
+
+        test(`Adapter ${adapter}: retiring one workspace kills its process and removes its test IDs`, async () => {
+            const shared = new CancellationTokenSource();
+            const workspace = new CancellationTokenSource();
+            const directory = await fs.mkdtemp(path.join(tmpdir(), 'python-workspace-run-'));
+            const ids = path.join(directory, 'ids.txt');
+            await fs.writeFile(ids, 'a::test_one');
+            const run = { token: shared.token } as TestRun;
+            const child = new MockChildProcess('', []);
+            const started = createDeferred<void>();
+            const kill = sinon.stub(child, 'kill').callsFake(() => {
+                child.emit('exit', null, 'SIGTERM');
+                child.emit('close', null, 'SIGTERM');
+                return true;
+            });
+            const closePipe = sinon.spy();
+            utilsWriteTestIdsFileStub.resolves(ids);
+            utilsStartRunResultNamedPipe.callsFake((_callback, drained, _token, abortToken) => {
+                assert.strictEqual(abortToken, workspace.token);
+                abortToken.onCancellationRequested(() => drained.resolve());
+                return Promise.resolve({ pipeName: 'run-result', dispose: closePipe });
+            });
+            execServiceStub
+                .setup((service) => service.execObservable(typeMoq.It.isAny(), typeMoq.It.isAny()))
+                .returns(() => {
+                    started.resolve();
+                    return { proc: child as any, out: new Observable<Output<string>>(), dispose: noop };
+                });
+            execFactoryStub
+                .setup((factory) => factory.createActivatedEnvironment(typeMoq.It.isAny()))
+                .returns(async () => execServiceStub.object);
+            execFactoryStub.setup((factory) => ((factory as unknown) as any).then).returns(() => undefined);
+            execServiceStub.setup((service) => ((service as unknown) as any).then).returns(() => undefined);
+            try {
+                const running = createAdapter(adapter, configService).runTests(
+                    Uri.file(myTestPath),
+                    ['a::test_one'],
+                    TestRunProfileKind.Run,
+                    run,
+                    execFactoryStub.object,
+                    undefined,
+                    undefined,
+                    undefined,
+                    workspace.token,
+                );
+                await started.promise;
+                workspace.cancel();
+                await running;
+                sinon.assert.calledOnce(kill);
+                sinon.assert.calledOnce(closePipe);
+                assert.ok(!shared.token.isCancellationRequested);
+                await assert.rejects(fs.access(ids), { code: 'ENOENT' });
+            } finally {
+                workspace.dispose();
+                shared.dispose();
+                await fs.rm(directory, { recursive: true, force: true });
+            }
+        });
+
         test(`Adapter ${adapter}: cancelation token called mid-run resolves correctly`, async () => {
             // mock test run and cancelation token
             const testRunMock = typeMoq.Mock.ofType<TestRun>();
@@ -112,7 +197,7 @@ suite('Execution Flow Run Adapters', () => {
                     deferredTillServerCloseTester?.resolve();
                 });
 
-                return Promise.resolve('named-pipes-socket-name');
+                return Promise.resolve({ pipeName: 'named-pipes-socket-name', dispose: sinon.stub() });
             });
             serverDisposeStub.callsFake(() => {
                 console.log('server disposed');
@@ -180,7 +265,7 @@ suite('Execution Flow Run Adapters', () => {
                 token?.onCancellationRequested(() => {
                     deferredTillServerCloseTester?.resolve();
                 });
-                return Promise.resolve('named-pipes-socket-name');
+                return Promise.resolve({ pipeName: 'named-pipes-socket-name', dispose: sinon.stub() });
             });
             serverDisposeStub.callsFake(() => {
                 console.log('server disposed');

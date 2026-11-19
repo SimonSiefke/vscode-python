@@ -257,6 +257,7 @@ export class PythonTestController implements ITestController, IExtensionSingleAc
     public async activate(): Promise<void> {
         const workspaces: readonly WorkspaceFolder[] = this.workspaceService.workspaceFolders || [];
         const projectMode = useEnvExtension();
+        let canRefreshOnFileChange = !projectMode;
         this.disposables.push(
             this.workspaceService.onDidChangeWorkspaceFolders((evt) => {
                 const removedRoots: string[] = [];
@@ -265,7 +266,9 @@ export class PythonTestController implements ITestController, IExtensionSingleAc
                     this.disposeWorkspaceWatchers(workspace);
                 }
                 for (const workspace of evt.added) {
-                    this.setupFileWatchers(workspace);
+                    if (canRefreshOnFileChange) {
+                        this.setupFileWatchers(workspace);
+                    }
                     if (!projectMode) {
                         this.activateLegacyWorkspace(workspace);
                     }
@@ -273,28 +276,54 @@ export class PythonTestController implements ITestController, IExtensionSingleAc
                 if (removedRoots.length > 0) {
                     // Discovery directories can be shared by multiple legacy workspaces.
                     // Re-discover surviving publishers when the visible root was retired.
-                    for (const { workspace, resolver } of this.legacyWorkspaces.values()) {
-                        if (removedRoots.some((id) => resolver.hasPublishedRoot(id))) {
-                            this.refreshTestDataInternal(workspace.uri).catch((error) =>
-                                traceError('Failed to refresh tests in the surviving workspace', error),
-                            );
+                    for (const [key, state] of this.legacyWorkspaces) {
+                        const sharedRoots = removedRoots.filter((id) => state.resolver.hasPublishedRoot(id));
+                        if (sharedRoots.length > 0) {
+                            this.refreshTestDataInternal(state.workspace.uri)
+                                .then(async () => {
+                                    // The first refresh can have joined discovery after its payload was published.
+                                    if (
+                                        this.legacyWorkspaces.get(key) === state &&
+                                        sharedRoots.some((id) => !this.testController.items.get(id))
+                                    ) {
+                                        await this.refreshTestDataInternal(state.workspace.uri);
+                                    }
+                                })
+                                .catch((error) =>
+                                    traceError('Failed to refresh tests in the surviving workspace', error),
+                                );
                         }
                     }
                 }
             }),
-            onDidSaveTextDocument((doc) => this.refreshOnSave(doc)),
+            onDidSaveTextDocument((doc) => {
+                if (canRefreshOnFileChange) {
+                    this.refreshOnSave(doc);
+                }
+            }),
         );
-        workspaces.forEach((workspace) => this.setupFileWatchers(workspace));
 
         // PROJECT-BASED MODE: Uses Python Environments API to discover projects
         // Each project becomes its own test tree root with its own Python environment
         if (projectMode) {
             traceInfo('[test-by-project] Activating project-based testing mode');
+            const startupChanges: DidChangePythonProjectsEventArgs[] = [];
+            let started = false;
+            await this.subscribeToProjectChanges((event) => {
+                if (started) {
+                    this.handleProjectChanges(event).catch((error) =>
+                        traceError('[test-by-project] Error handling project changes:', error),
+                    );
+                } else {
+                    startupChanges.push(event);
+                }
+            });
 
             // Discover projects in parallel across all workspaces
             // Promise.allSettled ensures one workspace failure doesn't block others
+            const projectWorkspaces = this.workspaceService.workspaceFolders ?? [];
             const results = await Promise.allSettled(
-                Array.from(workspaces).map(async (workspace) => {
+                projectWorkspaces.map(async (workspace) => {
                     // Queries Python Environments API and creates ProjectAdapter instances
                     const projects = await this.projectRegistry.discoverAndRegisterProjects(workspace.uri);
                     return { workspace, projectCount: projects.length };
@@ -303,27 +332,41 @@ export class PythonTestController implements ITestController, IExtensionSingleAc
 
             // Workspaces whose project discovery fails fall back to legacy testing.
             results.forEach((result, index) => {
-                const workspace = workspaces[index];
+                const workspace = projectWorkspaces[index];
+                if (this.workspaceService.getWorkspaceFolder(workspace.uri) !== workspace) {
+                    this.projectRegistry.clearWorkspace(workspace.uri);
+                    return;
+                }
                 if (result.status === 'fulfilled') {
                     traceInfo(
                         `[test-by-project] Activated ${result.value.projectCount} project(s) for ${workspace.uri.fsPath}`,
                     );
-                } else if (this.workspaceService.getWorkspaceFolder(workspace.uri) === workspace) {
+                } else {
                     // Graceful degradation: if project discovery fails, use legacy single-adapter mode
                     traceError(`[test-by-project] Failed for ${workspace.uri.fsPath}:`, result.reason);
                     this.activateLegacyWorkspace(workspace);
                 }
             });
-            // Subscribe to project changes to update test tree when projects are added/removed
-            await this.subscribeToProjectChanges();
+            // A project notification received during startup uses the finished registry, then normal routing resumes.
+            for (const change of startupChanges) {
+                // eslint-disable-next-line no-await-in-loop
+                await this.handleProjectChanges(change).catch((error) =>
+                    traceError('[test-by-project] Error handling project changes:', error),
+                );
+            }
+            startupChanges.length = 0;
+            started = true;
             // Subscribe to environment changes so projects that had no resolved environment at
             // activation get discovered once the environments extension assigns one.
             await this.subscribeToEnvironmentChanges();
+            canRefreshOnFileChange = true;
+            this.workspaceService.workspaceFolders?.forEach((workspace) => this.setupFileWatchers(workspace));
             return;
         }
 
         // LEGACY MODE: Single WorkspaceTestAdapter per workspace (backward compatibility)
         workspaces.forEach((workspace) => {
+            this.setupFileWatchers(workspace);
             this.activateLegacyWorkspace(workspace);
         });
     }
@@ -332,16 +375,12 @@ export class PythonTestController implements ITestController, IExtensionSingleAc
      * Subscribes to Python project changes from the Python Environments API.
      * When projects are added or removed, updates the test tree accordingly.
      */
-    private async subscribeToProjectChanges(): Promise<void> {
+    private async subscribeToProjectChanges(
+        listener: (event: DidChangePythonProjectsEventArgs) => void,
+    ): Promise<void> {
         try {
             const envExtApi = await getEnvExtApi();
-            this.disposables.push(
-                envExtApi.onDidChangePythonProjects((event: DidChangePythonProjectsEventArgs) => {
-                    this.handleProjectChanges(event).catch((error) => {
-                        traceError('[test-by-project] Error handling project changes:', error);
-                    });
-                }),
-            );
+            this.disposables.push(envExtApi.onDidChangePythonProjects(listener));
             traceInfo('[test-by-project] Subscribed to Python project changes');
         } catch (error) {
             traceError('[test-by-project] Failed to subscribe to project changes:', error);
@@ -692,10 +731,7 @@ export class PythonTestController implements ITestController, IExtensionSingleAc
         }
 
         // Use project-based discovery if applicable (only reached if testing is enabled)
-        if (
-            this.projectRegistry.hasProjects(workspace.uri) ||
-            (useEnvExtension() && !this.legacyWorkspaces.has(workspace.uri.toString()))
-        ) {
+        if (this.projectRegistry.hasProjects(workspace.uri)) {
             await this.discoverAllProjectsInWorkspace(workspace.uri);
             return;
         }

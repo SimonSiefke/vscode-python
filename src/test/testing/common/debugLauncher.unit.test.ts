@@ -145,6 +145,7 @@ suite('Unit Tests - Debug Launcher', () => {
                         const session = ({
                             id: 'test-session-id',
                             configuration: capturedConfig,
+                            customRequest: sinon.stub().resolves(),
                         } as unknown) as DebugSession;
                         callback(session);
                         startedSession?.(session);
@@ -288,7 +289,7 @@ suite('Unit Tests - Debug Launcher', () => {
 
     const testProviders: TestProvider[] = ['pytest', 'unittest'];
 
-    test('workspace cancellation stops the captured debug session', async () => {
+    test('workspace cancellation disconnects the captured adapter directly', async () => {
         const cancellation = new CancellationTokenSource();
         const options: LaunchOptions = {
             cwd: 'one/two/three',
@@ -299,16 +300,14 @@ suite('Unit Tests - Debug Launcher', () => {
             token: cancellation.token,
             stopOnCancellation: true,
         };
+        let disconnect: sinon.SinonStub | undefined;
         setupSuccess(options, 'unittest', undefined, undefined, (session) => {
-            debugService
-                .setup((service) => service.stopDebugging(TypeMoq.It.isValue(session)))
-                .returns(async () => undefined)
-                .verifiable(TypeMoq.Times.once());
+            disconnect = session.customRequest as sinon.SinonStub;
             cancellation.cancel();
         });
         try {
             await debugLauncher.launchDebugger(options);
-            debugService.verifyAll();
+            sinon.assert.calledOnceWithExactly(disconnect!, 'disconnect', { terminateDebuggee: true });
         } finally {
             cancellation.dispose();
         }

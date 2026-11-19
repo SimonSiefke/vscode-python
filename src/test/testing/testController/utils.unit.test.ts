@@ -21,6 +21,7 @@ import {
 } from '../../../client/testing/testController/common/utils';
 import { createDeferred, Deferred } from '../../../client/common/utils/async';
 import * as namedPipes from '../../../client/common/pipes/namedPipes';
+import * as platform from '../../../client/common/utils/platform';
 import { EXTENSION_ROOT_DIR } from '../../../client/constants';
 import {
     DiscoveredTestNode,
@@ -772,6 +773,25 @@ suite('populateTestTree tests', () => {
 });
 
 suite('Discovery pipe lifetime', () => {
+    test('disposing a server-backed reader stops accepting connections before a writer connects', async function () {
+        if (process.platform === 'win32') {
+            this.skip();
+        }
+        const pipeName = namedPipes.generateRandomPipeName('python-test-server');
+        const isWindows = sinon.stub(platform, 'isWindows').returns(true);
+        try {
+            const reader = await namedPipes.createReaderPipe(pipeName);
+            try {
+                await fs.promises.access(pipeName);
+            } finally {
+                reader.dispose();
+            }
+            await assert.rejects(fs.promises.access(pipeName), { code: 'ENOENT' });
+        } finally {
+            isWindows.restore();
+        }
+    });
+
     test('cancelling discovery closes a Linux FIFO before a writer connects', async function () {
         if (process.platform !== 'linux') {
             this.skip();
@@ -781,7 +801,7 @@ suite('Discovery pipe lifetime', () => {
             () => assert.fail('No writer should publish data'),
             cancellation.token,
         );
-        const target = await fs.promises.realpath(pipe);
+        const target = await fs.promises.realpath(pipe.pipeName);
         const openDescriptor = async () => {
             const descriptors = await fs.promises.readdir('/proc/self/fd');
             const paths = await Promise.all(
@@ -802,7 +822,8 @@ suite('Discovery pipe lifetime', () => {
             assert.fail('FIFO reader is still open after cancellation');
         } finally {
             cancellation.dispose();
-            await fs.promises.unlink(pipe);
+            pipe.dispose();
+            await fs.promises.unlink(pipe.pipeName);
         }
     });
 });

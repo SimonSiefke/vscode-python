@@ -87,7 +87,8 @@ export class DebugLauncher implements ITestDebugLauncher {
 
         let ourSession: DebugSession | undefined;
         const stopSession = (session: DebugSession) => {
-            debugManager.stopDebugging(session).then(undefined, (error) => {
+            // Stopping through VS Code would cancel the TestRun shared by the other folders.
+            session.customRequest('disconnect', { terminateDebuggee: true }).then(undefined, (error) => {
                 traceError('Error stopping test debug session', error);
                 callCallbackOnce();
                 deferred.resolve();

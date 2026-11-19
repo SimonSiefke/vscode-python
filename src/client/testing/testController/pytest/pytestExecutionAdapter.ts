@@ -63,9 +63,10 @@ export class PytestTestExecutionAdapter implements ITestExecutionAdapter {
         };
         const cSource = new CancellationTokenSource();
         const cancellation = token.onCancellationRequested(() => cSource.cancel());
+        let pipe: utils.TestPipe | undefined;
 
         try {
-            const name = await utils.startRunResultNamedPipe(
+            pipe = await utils.startRunResultNamedPipe(
                 dataReceivedCallback,
                 deferredTillServerClose,
                 cSource.token,
@@ -77,7 +78,7 @@ export class PytestTestExecutionAdapter implements ITestExecutionAdapter {
             await this.runTestsNew(
                 uri,
                 testIds,
-                name,
+                pipe.pipeName,
                 cSource,
                 runInstance,
                 profileKind,
@@ -88,9 +89,12 @@ export class PytestTestExecutionAdapter implements ITestExecutionAdapter {
                 token,
             );
         } finally {
+            if (pipe) {
+                await utils.awaitDeferredWithTimeout(deferredTillServerClose, utils.RESULT_PIPE_DRAIN_TIMEOUT_MS);
+                pipe.dispose();
+            }
             cancellation?.dispose();
             cSource.dispose();
-            await utils.awaitDeferredWithTimeout(deferredTillServerClose, utils.RESULT_PIPE_DRAIN_TIMEOUT_MS);
         }
     }
 
@@ -146,6 +150,7 @@ export class PytestTestExecutionAdapter implements ITestExecutionAdapter {
         const execInfo = await execService?.getExecutablePath();
         traceVerbose(`Executable path for pytest execution: ${execInfo}.`);
 
+        let testIdsFileName: string | undefined;
         try {
             // Remove positional test folders and files, we will add as needed per node
             let testArgs = removePositionalFoldersAndFiles(pytestArgs);
@@ -161,7 +166,7 @@ export class PytestTestExecutionAdapter implements ITestExecutionAdapter {
             }
 
             // create a file with the test ids and set the environment variable to the file name
-            const testIdsFileName = await utils.writeTestIdsFile(testIds);
+            testIdsFileName = await utils.writeTestIdsFile(testIds);
             mutableEnv.RUN_TEST_IDS_PIPE = testIdsFileName;
             traceInfo(
                 `Environment variables set for pytest execution: PYTHONPATH=${mutableEnv.PYTHONPATH}, TEST_RUN_PIPE=${mutableEnv.TEST_RUN_PIPE}, RUN_TEST_IDS_PIPE=${mutableEnv.RUN_TEST_IDS_PIPE}`,
@@ -314,7 +319,11 @@ export class PytestTestExecutionAdapter implements ITestExecutionAdapter {
             }
         } catch (ex) {
             traceError(`Error while running tests for workspace ${uri}: ${testIds}\r\n${ex}\r\n\r\n`);
-            return Promise.reject(ex);
+            throw ex;
+        } finally {
+            if (token !== runInstance.token) {
+                await utils.removeTestIdsFile(testIdsFileName);
+            }
         }
     }
 }

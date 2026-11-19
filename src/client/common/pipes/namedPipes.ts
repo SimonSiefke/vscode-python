@@ -109,7 +109,7 @@ class CombinedReader implements rpc.MessageReader {
 
     private _readers: rpc.MessageReader[] = [];
 
-    constructor() {
+    constructor(private readonly closeServer: () => void) {
         this._disposables.push(this._onClose, this._onError, this._onPartialMessage);
     }
 
@@ -152,6 +152,7 @@ class CombinedReader implements rpc.MessageReader {
     }
 
     dispose(): void {
+        this.closeServer();
         this._readers.forEach((r) => r.dispose());
         this._readers = [];
         this._disposables.forEach((disposable) => disposable.dispose());
@@ -163,10 +164,15 @@ export async function createReaderPipe(pipeName: string, token?: CancellationTok
     if (isWindows()) {
         // windows implementation of FIFO using named pipes
         const deferred = createDeferred<rpc.MessageReader>();
-        const combined = new CombinedReader();
+        const server = net.createServer();
+        let cancellation: Disposable | undefined;
+        const combined = new CombinedReader(() => {
+            cancellation?.dispose();
+            server.close();
+        });
 
         let refs = 0;
-        const server = net.createServer((socket) => {
+        server.on('connection', (socket) => {
             traceVerbose(`Pipe connected: ${pipeName}`);
             refs += 1;
 
@@ -181,7 +187,7 @@ export async function createReaderPipe(pipeName: string, token?: CancellationTok
         server.on('error', deferred.reject);
         server.listen(pipeName);
         if (token) {
-            token.onCancellationRequested(() => {
+            cancellation = token.onCancellationRequested(() => {
                 if (server.listening) {
                     server.close();
                 }

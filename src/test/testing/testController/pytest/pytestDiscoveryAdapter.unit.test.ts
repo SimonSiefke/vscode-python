@@ -47,7 +47,13 @@ suite('pytest test discovery adapter', () => {
         mockExtensionRootDir.setup((m) => m.toString()).returns(() => '/mocked/extension/root/dir');
 
         utilsStartDiscoveryNamedPipeStub = sinon.stub(util, 'startDiscoveryNamedPipe');
-        utilsStartDiscoveryNamedPipeStub.callsFake(() => Promise.resolve('discoveryResultPipe-mockName'));
+        utilsStartDiscoveryNamedPipeStub.callsFake(() =>
+            Promise.resolve({
+                pipeName: 'discoveryResultPipe-mockName',
+                dispose: sinon.stub(),
+                waitForClose: async () => undefined,
+            }),
+        );
 
         // constants
         expectedPath = path.join('/', 'my', 'test', 'path');

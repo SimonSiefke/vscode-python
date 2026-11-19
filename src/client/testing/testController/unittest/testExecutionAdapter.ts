@@ -75,9 +75,10 @@ export class UnittestTestExecutionAdapter implements ITestExecutionAdapter {
         };
         const cSource = new CancellationTokenSource();
         const cancellation = token.onCancellationRequested(() => cSource.cancel());
+        let pipe: utils.TestPipe | undefined;
 
         try {
-            const name = await utils.startRunResultNamedPipe(
+            pipe = await utils.startRunResultNamedPipe(
                 dataReceivedCallback,
                 deferredTillServerClose,
                 cSource.token,
@@ -89,7 +90,7 @@ export class UnittestTestExecutionAdapter implements ITestExecutionAdapter {
             await this.runTestsNew(
                 uri,
                 testIds,
-                name,
+                pipe.pipeName,
                 cSource,
                 runInstance,
                 profileKind,
@@ -101,9 +102,12 @@ export class UnittestTestExecutionAdapter implements ITestExecutionAdapter {
         } catch (error) {
             traceError(`Error in running unittest tests: ${error}`);
         } finally {
+            if (pipe) {
+                await utils.awaitDeferredWithTimeout(deferredTillServerClose, utils.RESULT_PIPE_DRAIN_TIMEOUT_MS);
+                pipe.dispose();
+            }
             cancellation?.dispose();
             cSource.dispose();
-            await utils.awaitDeferredWithTimeout(deferredTillServerClose, utils.RESULT_PIPE_DRAIN_TIMEOUT_MS);
         }
     }
 
@@ -175,18 +179,18 @@ export class UnittestTestExecutionAdapter implements ITestExecutionAdapter {
             allowEnvironmentFetchExceptions: false,
             resource: options.workspaceFolder,
         };
-        const execService = await executionFactory.createActivatedEnvironment(creationOptions);
-
-        const execInfo = await execService?.getExecutablePath();
-        traceVerbose(`Executable path for unittest execution: ${execInfo}.`);
-
-        const args = [options.command.script].concat(options.command.args);
-
-        if (options.outChannel) {
-            options.outChannel.appendLine(`python ${args.join(' ')}`);
-        }
-
         try {
+            const execService = await executionFactory.createActivatedEnvironment(creationOptions);
+
+            const execInfo = await execService?.getExecutablePath();
+            traceVerbose(`Executable path for unittest execution: ${execInfo}.`);
+
+            const args = [options.command.script].concat(options.command.args);
+
+            if (options.outChannel) {
+                options.outChannel.appendLine(`python ${args.join(' ')}`);
+            }
+
             if (token.isCancellationRequested) {
                 return;
             }
@@ -314,7 +318,11 @@ export class UnittestTestExecutionAdapter implements ITestExecutionAdapter {
             }
         } catch (ex) {
             traceError(`Error while running tests for workspace ${uri}: ${testIds}\r\n${ex}\r\n\r\n`);
-            return Promise.reject(ex);
+            throw ex;
+        } finally {
+            if (token !== runInstance.token) {
+                await utils.removeTestIdsFile(testIdsFileName);
+            }
         }
     }
 }
