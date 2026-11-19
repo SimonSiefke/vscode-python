@@ -17,6 +17,10 @@ import { EXTENSION_ROOT_DIR, JUPYTER_EXTENSION_ID, TENSORBOARD_EXTENSION_ID } fr
 import { IConfigurationService, IDisposableRegistry, IExtensions } from '../client/common/types';
 import { createDeferred } from '../client/common/utils/async';
 import { IEnvironmentVariablesProvider } from '../client/common/variables/types';
+import { Architecture } from '../client/common/utils/platform';
+import { DeprecatedProposedAPI } from '../client/deprecatedProposedApiTypes';
+import { buildProposedApi } from '../client/proposedApi';
+import { EnvironmentType } from '../client/pythonEnvironments/info';
 import { IInterpreterService } from '../client/interpreter/contracts';
 import { IEnvironmentActivationService } from '../client/interpreter/activation/types';
 import { InterpreterService } from '../client/interpreter/interpreterService';
@@ -117,6 +121,53 @@ suite('Extension API', () => {
         await transition;
         assert.strictEqual(await observed, current);
         assert.strictEqual(await activation.getCurrent(), current);
+    });
+
+    test('trust cannot retire the process owner while initial setup is pending', async () => {
+        const activation = new ApiActivation();
+        const startup = createDeferred();
+        let retired = false;
+        const replacement = activation.restart(async () => {
+            retired = true;
+        }, startup.promise);
+        await Promise.resolve();
+        assert.isFalse(retired);
+        startup.resolve();
+        await replacement;
+        assert.isTrue(retired);
+    });
+
+    test('captured legacy interpreter getters use the current activation', async () => {
+        const activation = new ApiActivation();
+        const extensions = mock<IExtensions>();
+        when(extensions.determineExtensionFromCallStack()).thenResolve({
+            extensionId: 'test.legacy-interpreter',
+            displayName: 'Legacy Interpreter',
+        });
+        when(serviceContainer.get(IExtensions)).thenReturn(instance(extensions));
+        const { environment } = buildProposedApi(
+            instance(discoverAPI),
+            instance(serviceContainer),
+            activation,
+        ) as DeprecatedProposedAPI;
+
+        const currentService = mock(InterpreterService);
+        const interpreter = path.resolve('current', 'python');
+        when(currentService.getActiveInterpreter(undefined)).thenResolve({
+            path: interpreter,
+            architecture: Architecture.Unknown,
+            sysPrefix: path.dirname(interpreter),
+            envType: EnvironmentType.System,
+        });
+        const currentContainer = mock(ServiceContainer);
+        when(currentContainer.get(IInterpreterService)).thenReturn(instance(currentService));
+        activation.current = {
+            environments: instance(mock<PythonExtension['environments']>()),
+            serviceContainer: instance(currentContainer),
+        };
+
+        assert.deepEqual(await environment.getExecutionDetails(), { execCommand: [interpreter] });
+        assert.strictEqual((await environment.getActiveEnvironmentPath())?.path, interpreter);
     });
 
     test('the first Jupyter and TensorBoard callbacks use services from the latest activation', async () => {

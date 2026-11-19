@@ -68,15 +68,16 @@ export async function activate(context: IExtensionContext): Promise<PythonExtens
     try {
         isFirstSession = context.globalState.get(GLOBAL_PERSISTENT_KEYS, []).length === 0;
         const workspaceService = new WorkspaceService();
+        const startup = activateUnsafe(context, stopWatch, durations);
         context.subscriptions.push(
             workspaceService.onDidGrantWorkspaceTrust(() =>
                 apiActivation.restart(async () => {
                     await deactivate();
                     await activate(context);
-                }),
+                }, startup),
             ),
         );
-        [api, ready, serviceContainer] = await activateUnsafe(context, stopWatch, durations);
+        [api, ready, serviceContainer] = await startup;
         apiActivation.current = { environments: api.environments, serviceContainer };
     } catch (ex) {
         // We want to completely handle the error
@@ -176,7 +177,7 @@ async function activateUnsafe(
         components.pythonEnvs,
         apiActivation,
     );
-    const proposedApi = buildProposedApi(components.pythonEnvs, ext.legacyIOC.serviceContainer);
+    const proposedApi = buildProposedApi(components.pythonEnvs, ext.legacyIOC.serviceContainer, apiActivation);
     registerTools(context, components.pythonEnvs, api.environments, ext.legacyIOC.serviceContainer);
     ext.legacyIOC.serviceContainer
         .get<IRecommendedEnvironmentService>(IRecommendedEnvironmentService)

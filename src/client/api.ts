@@ -40,10 +40,10 @@ export class ApiActivation {
         return this.current;
     }
 
-    public restart(activate: () => Promise<void>): Promise<void> {
+    public restart(activate: () => Promise<void>, startup?: Promise<unknown>): Promise<void> {
         if (!this.reactivation) {
-            this.reactivation = Promise.resolve()
-                .then(activate)
+            this.reactivation = Promise.resolve(startup)
+                .then(activate, activate)
                 .finally(() => {
                     this.reactivation = undefined;
                 });

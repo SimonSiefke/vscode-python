@@ -326,7 +326,9 @@ suite('Process service shutdown ownership', () => {
             await service.exec(process.execPath, ['-e', '']);
             const observable: ObservableExecutionResult<string> = service.execObservable(process.execPath, ['-e', '']);
             assert.ok(observable.proc);
+            assert.strictEqual(observable.proc.listenerCount('exit'), 1);
             await once(observable.proc, 'close');
+            assert.strictEqual(observable.proc.listenerCount('exit'), 0);
             assert.strictEqual(observable.proc.listenerCount('error'), 0);
             assert.strictEqual(service['processesToKill'].size, 0);
         }
