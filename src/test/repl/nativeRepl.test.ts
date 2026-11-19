@@ -8,6 +8,7 @@ import * as sinon from 'sinon';
 import * as vscode from 'vscode';
 import { Disposable } from 'vscode';
 import { expect } from 'chai';
+import { createDeferred } from '../../client/common/utils/async';
 
 import { IInterpreterService } from '../../client/interpreter/contracts';
 import { PythonEnvironment } from '../../client/pythonEnvironments/info';
@@ -16,7 +17,8 @@ import * as persistentState from '../../client/common/persistentState';
 import * as PythonServer from '../../client/repl/pythonServer';
 import * as replController from '../../client/repl/replController';
 import * as replCommandHandler from '../../client/repl/replCommandHandler';
-import { executeCommand } from '../../client/common/vscodeApis/commandApis';
+import * as workspaceApis from '../../client/common/vscodeApis/workspaceApis';
+import * as commandApis from '../../client/common/vscodeApis/commandApis';
 
 suite('REPL - Native REPL', () => {
     let interpreterService: TypeMoq.IMock<IInterpreterService>;
@@ -31,8 +33,6 @@ suite('REPL - Native REPL', () => {
     let mockNotebookController: any;
 
     setup(() => {
-        (NativeReplModule as any).nativeRepl = undefined;
-
         mockNotebookController = {
             id: 'mockController',
             dispose: sinon.stub(),
@@ -55,7 +55,7 @@ suite('REPL - Native REPL', () => {
         updateWorkspaceStateValueStub = sinon.stub(persistentState, 'updateWorkspaceStateValue').resolves();
     });
 
-    teardown(async () => {
+    teardown(() => {
         disposableArray.forEach((d) => {
             if (d) {
                 d.dispose();
@@ -63,7 +63,6 @@ suite('REPL - Native REPL', () => {
         });
         disposableArray = [];
         sinon.restore();
-        await executeCommand('workbench.action.closeActiveEditor');
     });
 
     test('getNativeRepl should call create constructor', async () => {
@@ -170,5 +169,59 @@ suite('REPL - Native REPL', () => {
         } finally {
             disposables.forEach((disposable) => disposable.dispose());
         }
+    });
+});
+
+suite('REPL - cell submission', () => {
+    let closed: boolean;
+    let editor: vscode.NotebookEditor;
+    let applyEdit: sinon.SinonStub;
+    let executeCommand: sinon.SinonStub;
+
+    setup(() => {
+        closed = false;
+        const notebook = TypeMoq.Mock.ofType<vscode.NotebookDocument>();
+        notebook.setup((d) => d.uri).returns(() => vscode.Uri.parse('untitled:repl-test.ipynb'));
+        notebook.setup((d) => d.isClosed).returns(() => closed);
+        notebook.setup((d) => d.cellCount).returns(() => 0);
+        const notebookEditor = TypeMoq.Mock.ofType<vscode.NotebookEditor>();
+        notebookEditor.setup((e) => e.notebook).returns(() => notebook.object);
+        editor = notebookEditor.object;
+
+        applyEdit = sinon.stub(workspaceApis, 'applyEdit');
+        executeCommand = sinon.stub(commandApis, 'executeCommand').resolves();
+    });
+
+    teardown(() => sinon.restore());
+
+    test('executes the inserted cell in the live notebook', async () => {
+        applyEdit.resolves(true);
+        await replCommandHandler.executeNotebookCell(editor, 'print(1)');
+
+        sinon.assert.calledOnce(applyEdit);
+        sinon.assert.calledOnceWithExactly(executeCommand, 'notebook.cell.execute', {
+            document: editor.notebook.uri,
+            ranges: [{ start: 0, end: 1 }],
+        });
+    });
+
+    test('does not execute a cell when the workspace edit was rejected', async () => {
+        applyEdit.resolves(false);
+        await replCommandHandler.executeNotebookCell(editor, 'print(1)');
+
+        sinon.assert.calledOnce(applyEdit);
+        sinon.assert.notCalled(executeCommand);
+    });
+
+    test('does not dispatch to a notebook that closed during the workspace edit', async () => {
+        const applied = createDeferred<boolean>();
+        applyEdit.returns(applied.promise);
+        const sending = replCommandHandler.executeNotebookCell(editor, 'print(1)');
+        sinon.assert.calledOnce(applyEdit);
+        closed = true;
+        applied.resolve(true);
+        await sending;
+
+        sinon.assert.notCalled(executeCommand);
     });
 });

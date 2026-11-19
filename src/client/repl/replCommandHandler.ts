@@ -82,7 +82,14 @@ export async function selectNotebookKernel(
 export async function executeNotebookCell(notebookEditor: NotebookEditor, code: string): Promise<void> {
     const { notebook, replOptions } = notebookEditor;
     const cellIndex = replOptions?.appendIndex ?? notebook.cellCount;
-    await addCellToNotebook(notebook, cellIndex, code);
+    if (notebook.isClosed) {
+        return;
+    }
+    const applied = await addCellToNotebook(notebook, cellIndex, code);
+    if (!applied || notebook.isClosed) {
+        return;
+    }
+
     // Execute the cell
     executeCommand('notebook.cell.execute', {
         ranges: [{ start: cellIndex, end: cellIndex + 1 }],
@@ -94,11 +101,11 @@ export async function executeNotebookCell(notebookEditor: NotebookEditor, code: 
  * Function that adds cell to notebook.
  * This function will only get called when notebook document is defined.
  */
-async function addCellToNotebook(notebookDocument: NotebookDocument, index: number, code: string): Promise<void> {
+function addCellToNotebook(notebookDocument: NotebookDocument, index: number, code: string): Thenable<boolean> {
     const notebookCellData = new NotebookCellData(NotebookCellKind.Code, code as string, 'python');
     // Add new cell to interactive window document
     const notebookEdit = NotebookEdit.insertCells(index, [notebookCellData]);
     const workspaceEdit = new WorkspaceEdit();
     workspaceEdit.set(notebookDocument!.uri, [notebookEdit]);
-    await applyEdit(workspaceEdit);
+    return applyEdit(workspaceEdit);
 }

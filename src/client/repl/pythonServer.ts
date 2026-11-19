@@ -6,8 +6,10 @@ import { EXTENSION_ROOT_DIR } from '../constants';
 import { traceError, traceLog } from '../logging';
 import { captureTelemetry } from '../telemetry';
 import { EventName } from '../telemetry/constants';
+import { dispose } from '../common/utils/resourceLifecycle';
 
 const SERVER_PATH = path.join(EXTENSION_ROOT_DIR, 'python_files', 'python_server.py');
+const SERVER_EXIT_TIMEOUT_MS = 1000;
 let serverInstance: PythonServer | undefined;
 export interface ExecutionResult {
     status: boolean;
@@ -55,9 +57,11 @@ class PythonServerImpl implements PythonServer, Disposable {
                 traceLog('Log:', message);
             }),
         );
-        this.pythonServer.on('exit', (code) => {
-            traceError(`Python server exited with code ${code}`);
-            this.markDisposed();
+        this.pythonServer.once('exit', (code) => {
+            if (!this.disposed) {
+                traceError(`Python server exited with code ${code}`);
+                this.markDisposed();
+            }
         });
         this.pythonServer.on('error', (err) => {
             traceError(err);
@@ -131,11 +135,19 @@ class PythonServerImpl implements PythonServer, Disposable {
         if (this.disposed) {
             return;
         }
-        this.disposed = true;
-        this.connection.sendNotification('exit');
-        this.disposables.forEach((d) => d.dispose());
-        this.connection.dispose();
-        serverInstance = undefined;
+        // Python can only handle the exit request after running user code returns.
+        const child = this.pythonServer;
+        const killTimer = setTimeout(() => child.kill('SIGKILL'), SERVER_EXIT_TIMEOUT_MS);
+        killTimer.unref();
+        child.once('exit', () => clearTimeout(killTimer));
+
+        try {
+            this.connection.sendNotification('exit').catch((error) => traceLog('Python REPL shutdown:', error));
+        } catch (error) {
+            traceLog('Python REPL shutdown:', error);
+        } finally {
+            this.markDisposed();
+        }
     }
 
     private markDisposed(): void {
@@ -143,8 +155,10 @@ class PythonServerImpl implements PythonServer, Disposable {
             return;
         }
         this.disposed = true;
-        this.connection.dispose();
-        serverInstance = undefined;
+        if (serverInstance === this) {
+            serverInstance = undefined;
+        }
+        dispose([...this.disposables.splice(0), this.connection, this._onCodeExecuted]);
     }
 }
 
