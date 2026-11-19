@@ -64,7 +64,7 @@ suite('Test workspace lifetime', () => {
     let folders: WorkspaceFolder[];
     let changed: EventEmitter<WorkspaceFoldersChangeEvent>;
     let saved: EventEmitter<TextDocument>;
-    let watchers: Array<{ dispose: sinon.SinonSpy }>;
+    let watchers: Array<{ dispose: sinon.SinonSpy; created: EventEmitter<Uri>; deleted: EventEmitter<Uri> }>;
     let saveSubscriptions: Array<sinon.SinonSpy>;
     let discovered: string[];
     let events: Array<Disposable>;
@@ -133,7 +133,7 @@ suite('Test workspace lifetime', () => {
                 const deleted = new EventEmitter<Uri>();
                 events.push(created, modified, deleted);
                 const dispose = sinon.spy();
-                watchers.push({ dispose });
+                watchers.push({ dispose, created, deleted });
                 const watcher: FileSystemWatcher = {
                     ignoreCreateEvents: false,
                     ignoreChangeEvents: false,
@@ -491,6 +491,33 @@ suite('Test workspace lifetime', () => {
         assert.deepStrictEqual(discovered, [replacement.uri.toString()]);
     });
 
+    test('configuration file watchers refresh their live owner through removal and replacement', async () => {
+        await controller.activate();
+        const retired = add('retired');
+        const survivor = add('survivor');
+        const retiredConfig = Uri.joinPath(retired.uri, 'pytest.ini');
+        const survivorConfig = Uri.joinPath(survivor.uri, 'pytest.ini');
+        clock = sinon.useFakeTimers();
+        watchers[1].created.fire(survivorConfig);
+        await clock.tickAsync(250);
+        watchers[1].deleted.fire(survivorConfig);
+        await clock.tickAsync(250);
+        watchers[0].created.fire(retiredConfig);
+        remove(retired);
+        const replacement = add('retired');
+        await clock.tickAsync(250);
+        watchers[0].deleted.fire(retiredConfig);
+        await clock.tickAsync(250);
+        assert.deepStrictEqual(discovered, [survivor.uri.toString(), survivor.uri.toString()]);
+        watchers[2].deleted.fire(retiredConfig);
+        await clock.tickAsync(250);
+        assert.deepStrictEqual(discovered, [
+            survivor.uri.toString(),
+            survivor.uri.toString(),
+            replacement.uri.toString(),
+        ]);
+    });
+
     test('removing and readding a folder while interpreter lookup is pending skips old discovery', async () => {
         await controller.activate();
         const folder = add('reused');
@@ -513,6 +540,31 @@ suite('Test workspace lifetime', () => {
         await controller.refreshTestData(replacement.uri, { forceRefresh: true });
         assert.deepStrictEqual(discovered, [replacement.uri.toString()]);
     });
+
+    for (const trigger of ['Refresh All', 'initial Test Explorer resolution']) {
+        test(`${trigger} cannot transfer discovery to a replacement workspace`, async () => {
+            await controller.activate();
+            const retired = add('old');
+            const started = createDeferred<void>();
+            const interpreter = createDeferred<Interpreter>();
+            stubInterpreter(() => {
+                started.resolve();
+                return interpreter.promise;
+            });
+            const pending =
+                trigger === 'Refresh All'
+                    ? controller.refreshTestData(undefined, { forceRefresh: true })
+                    : testController.resolveHandler?.(undefined);
+            await started.promise;
+            remove(retired);
+            const replacement = add('old');
+            interpreter.resolve(activeInterpreter);
+            await pending;
+            assert.deepStrictEqual(discovered, []);
+            await controller.refreshTestData(replacement.uri, { forceRefresh: true });
+            assert.deepStrictEqual(discovered, [replacement.uri.toString()]);
+        });
+    }
 
     test('removal cancels in-flight discovery and ignores results and errors from the retired adapter', async () => {
         await controller.activate();
@@ -681,10 +733,11 @@ suite('Test workspace lifetime', () => {
         projects.fire({ added: [project], removed: [] });
         activationLookup.resolve(activeInterpreter);
         await activation;
-        assert.deepStrictEqual(discovered, [later.uri.toString()]);
+        assert.deepStrictEqual(discovered, []);
+        assert.ok(controller['projectRegistry'].hasProjects(later.uri));
         save(later);
         await clock.tickAsync(250);
-        assert.deepStrictEqual(discovered, [later.uri.toString(), later.uri.toString()]);
+        assert.deepStrictEqual(discovered, [later.uri.toString()]);
     });
 
     test('legacy and project reports for the same file retain their own details after retirement', async () => {

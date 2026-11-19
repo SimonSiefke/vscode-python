@@ -87,6 +87,8 @@ export async function createWriterPipe(pipeName: string, token?: CancellationTok
 class OwnedSocketReader extends rpc.SocketMessageReader {
     constructor(private readonly socket: net.Socket) {
         super(socket, 'utf-8');
+        // Test pipes do not use partial-message notifications. A truncated frame must not keep a timer alive.
+        this.partialMessageTimeout = 0;
     }
 
     public dispose(): void {

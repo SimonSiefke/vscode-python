@@ -12,6 +12,7 @@ import {
     DataCallback,
 } from 'vscode-jsonrpc';
 import { Message } from 'vscode-jsonrpc';
+import { SocketMessageReader } from 'vscode-jsonrpc/node';
 import {
     writeTestIdsFile,
     populateTestTree,
@@ -773,6 +774,32 @@ suite('populateTestTree tests', () => {
 });
 
 suite('Discovery pipe lifetime', () => {
+    test('owned readers deliver complete frames without retaining a timeout for partial frames', async function () {
+        if (process.platform !== 'linux') {
+            this.skip();
+        }
+        const pipeName = namedPipes.generateRandomPipeName('python-test-frame');
+        const reader = (await namedPipes.createReaderPipe(pipeName)) as SocketMessageReader;
+        const received = createDeferred<Message>();
+        const subscription = reader.listen((message) => received.resolve(message));
+        const errors = reader.onError((error) => received.reject(error));
+        const sample = { jsonrpc: '2.0', method: 'ready' };
+        const body = JSON.stringify(sample);
+        try {
+            assert.strictEqual(reader.partialMessageTimeout, 0);
+            await fs.promises.writeFile(
+                pipeName,
+                `Content-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}Content-Length: 10\r\n\r\n{`,
+            );
+            assert.deepStrictEqual(await received.promise, sample);
+        } finally {
+            subscription.dispose();
+            errors.dispose();
+            reader.dispose();
+            await fs.promises.unlink(pipeName);
+        }
+    });
+
     test('disposing a server-backed reader stops accepting connections before a writer connects', async function () {
         if (process.platform === 'win32') {
             this.skip();

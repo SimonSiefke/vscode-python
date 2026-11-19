@@ -319,39 +319,20 @@ export class PythonTestController implements ITestController, IExtensionSingleAc
                 }
             });
 
-            // Discover projects in parallel across all workspaces
-            // Promise.allSettled ensures one workspace failure doesn't block others
             const projectWorkspaces = this.workspaceService.workspaceFolders ?? [];
-            const results = await Promise.allSettled(
-                projectWorkspaces.map(async (workspace) => {
-                    // Queries Python Environments API and creates ProjectAdapter instances
-                    const projects = await this.projectRegistry.discoverAndRegisterProjects(workspace.uri);
-                    return { workspace, projectCount: projects.length };
-                }),
-            );
-
-            // Workspaces whose project discovery fails fall back to legacy testing.
-            results.forEach((result, index) => {
-                const workspace = projectWorkspaces[index];
-                if (this.workspaceService.getWorkspaceFolder(workspace.uri) !== workspace) {
-                    this.projectRegistry.clearWorkspace(workspace.uri);
-                    return;
-                }
-                if (result.status === 'fulfilled') {
-                    traceInfo(
-                        `[test-by-project] Activated ${result.value.projectCount} project(s) for ${workspace.uri.fsPath}`,
-                    );
-                } else {
-                    // Graceful degradation: if project discovery fails, use legacy single-adapter mode
-                    traceError(`[test-by-project] Failed for ${workspace.uri.fsPath}:`, result.reason);
-                    this.activateLegacyWorkspace(workspace);
-                }
-            });
-            // A project notification received during startup uses the finished registry, then normal routing resumes.
+            await Promise.all(projectWorkspaces.map((workspace) => this.registerInitialProjects(workspace)));
+            // Reconcile project registration without starting Python test collection during activation.
             for (const change of startupChanges) {
+                const workspacesToRegister = new Set<WorkspaceFolder>();
+                for (const project of [...change.added, ...change.removed]) {
+                    const workspace = this.workspaceService.getWorkspaceFolder(project.uri);
+                    if (workspace) {
+                        workspacesToRegister.add(workspace);
+                    }
+                }
                 // eslint-disable-next-line no-await-in-loop
-                await this.handleProjectChanges(change).catch((error) =>
-                    traceError('[test-by-project] Error handling project changes:', error),
+                await Promise.all(
+                    Array.from(workspacesToRegister, (workspace) => this.registerInitialProjects(workspace)),
                 );
             }
             startupChanges.length = 0;
@@ -369,6 +350,25 @@ export class PythonTestController implements ITestController, IExtensionSingleAc
             this.setupFileWatchers(workspace);
             this.activateLegacyWorkspace(workspace);
         });
+    }
+
+    private async registerInitialProjects(workspace: WorkspaceFolder): Promise<void> {
+        try {
+            const projects = await this.projectRegistry.discoverAndRegisterProjects(workspace.uri);
+            if (this.workspaceService.getWorkspaceFolder(workspace.uri) !== workspace) {
+                this.projectRegistry.clearWorkspace(workspace.uri);
+                return;
+            }
+            traceInfo(`[test-by-project] Activated ${projects.length} project(s) for ${workspace.uri.fsPath}`);
+        } catch (error) {
+            traceError(`[test-by-project] Failed for ${workspace.uri.fsPath}:`, error);
+            if (
+                this.workspaceService.getWorkspaceFolder(workspace.uri) === workspace &&
+                !this.legacyWorkspaces.has(workspace.uri.toString())
+            ) {
+                this.activateLegacyWorkspace(workspace);
+            }
+        }
     }
 
     /**
@@ -857,7 +857,11 @@ export class PythonTestController implements ITestController, IExtensionSingleAc
                 // In project-based mode, each project has its own environment,
                 // so we don't require a global active interpreter
                 if (!useEnvExtension()) {
-                    if (!(await this.interpreterService.getActiveInterpreter(workspace.uri))) {
+                    const interpreter = await this.interpreterService.getActiveInterpreter(workspace.uri);
+                    if (this.workspaceService.getWorkspaceFolder(workspace.uri) !== workspace) {
+                        return;
+                    }
+                    if (!interpreter) {
                         this.commandManager
                             .executeCommand(constants.Commands.TriggerEnvironmentSelection, workspace.uri)
                             .then(noop, noop);
@@ -956,7 +960,11 @@ export class PythonTestController implements ITestController, IExtensionSingleAc
                     // In project-based mode, each project has its own environment,
                     // so we don't require a global active interpreter
                     if (!useEnvExtension()) {
-                        if (!(await this.interpreterService.getActiveInterpreter(workspace.uri))) {
+                        const interpreter = await this.interpreterService.getActiveInterpreter(workspace.uri);
+                        if (this.workspaceService.getWorkspaceFolder(workspace.uri) !== workspace) {
+                            return;
+                        }
+                        if (!interpreter) {
                             traceError('Cannot trigger test discovery as a valid interpreter is not selected');
                             return;
                         }

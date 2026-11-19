@@ -274,6 +274,12 @@ export class PytestTestExecutionAdapter implements ITestExecutionAdapter {
 
                 const result = execService?.execObservable(runArgs, spawnOptions);
                 resultProc = result?.proc;
+                if (!resultProc) {
+                    throw new Error(`Could not start Python test execution in ${cwd}`);
+                }
+                resultProc.once('error', (error) => {
+                    traceError(`Could not start Python test execution in ${cwd}`, error);
+                });
 
                 // Take all output from the subprocess and add it to the test output channel. This will be the pytest output.
                 // Displays output to user and ensure the subprocess doesn't run into buffer overflow.
@@ -293,7 +299,7 @@ export class PytestTestExecutionAdapter implements ITestExecutionAdapter {
                     }
                 });
 
-                result?.proc?.on('close', (code, signal) => {
+                resultProc.once('close', (code, signal) => {
                     traceVerbose('Test run finished, subprocess closed.');
                     // if the child has testIds then this is a run request
                     // if the child process exited with a non-zero exit code, then we need to send the error payload.

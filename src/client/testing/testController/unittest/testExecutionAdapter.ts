@@ -284,6 +284,12 @@ export class UnittestTestExecutionAdapter implements ITestExecutionAdapter {
 
                 const result = execService?.execObservable(args, spawnOptions);
                 resultProc = result?.proc;
+                if (!resultProc) {
+                    throw new Error(`Could not start Python test execution in ${cwd}`);
+                }
+                resultProc.once('error', (error) => {
+                    traceError(`Could not start Python test execution in ${cwd}`, error);
+                });
 
                 // Displays output to user and ensure the subprocess doesn't run into buffer overflow.
 
@@ -296,7 +302,7 @@ export class UnittestTestExecutionAdapter implements ITestExecutionAdapter {
                     runInstance.appendOutput(`${out}`);
                 });
 
-                result?.proc?.on('exit', (code, signal) => {
+                resultProc.once('close', (code, signal) => {
                     // if the child has testIds then this is a run request
                     if (code !== 0 && testIds) {
                         // This occurs when we are running the test and there is an error which occurs.

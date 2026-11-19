@@ -194,7 +194,10 @@ export class UnittestTestDiscoveryAdapter implements ITestDiscoveryAdapter {
             resultProc.stdout?.on('data', handlers.onStdout);
             resultProc.stderr?.on('data', handlers.onStderr);
             resultProc.on('exit', handlers.onExit);
-            resultProc.on('close', handlers.onClose);
+            resultProc.once('error', (error) => {
+                traceError(`Could not start Python test discovery in ${cwd}`, error);
+            });
+            resultProc.once('close', handlers.onClose);
 
             traceVerbose(`Waiting for unittest discovery subprocess to complete for workspace ${uri.fsPath}`);
             await deferredTillExecClose.promise;

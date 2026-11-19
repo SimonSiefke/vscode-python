@@ -97,63 +97,74 @@ suite('Execution Flow Run Adapters', () => {
             sinon.assert.notCalled(drain);
         });
 
-        test(`Adapter ${adapter}: retiring one workspace kills its process and removes its test IDs`, async () => {
-            const shared = new CancellationTokenSource();
-            const workspace = new CancellationTokenSource();
-            const directory = await fs.mkdtemp(path.join(tmpdir(), 'python-workspace-run-'));
-            const ids = path.join(directory, 'ids.txt');
-            await fs.writeFile(ids, 'a::test_one');
-            const run = { token: shared.token } as TestRun;
-            const child = new MockChildProcess('', []);
-            const started = createDeferred<void>();
-            const kill = sinon.stub(child, 'kill').callsFake(() => {
-                child.emit('exit', null, 'SIGTERM');
-                child.emit('close', null, 'SIGTERM');
-                return true;
-            });
-            const closePipe = sinon.spy();
-            utilsWriteTestIdsFileStub.resolves(ids);
-            utilsStartRunResultNamedPipe.callsFake((_callback, drained, _token, abortToken) => {
-                assert.strictEqual(abortToken, workspace.token);
-                abortToken.onCancellationRequested(() => drained.resolve());
-                return Promise.resolve({ pipeName: 'run-result', dispose: closePipe });
-            });
-            execServiceStub
-                .setup((service) => service.execObservable(typeMoq.It.isAny(), typeMoq.It.isAny()))
-                .returns(() => {
-                    started.resolve();
-                    return { proc: child as any, out: new Observable<Output<string>>(), dispose: noop };
+        for (const spawnFailed of [false, true]) {
+            test(`Adapter ${adapter}: ${
+                spawnFailed ? 'spawn failure' : 'workspace retirement'
+            } closes the reader and removes test IDs`, async () => {
+                const shared = new CancellationTokenSource();
+                const workspace = new CancellationTokenSource();
+                const directory = await fs.mkdtemp(path.join(tmpdir(), 'python-workspace-run-'));
+                const ids = path.join(directory, 'ids.txt');
+                await fs.writeFile(ids, 'a::test_one');
+                const run = { token: shared.token } as TestRun;
+                const child = new MockChildProcess('', []);
+                const started = createDeferred<void>();
+                const kill = sinon.stub(child, 'kill').callsFake(() => {
+                    child.emit('exit', null, 'SIGTERM');
+                    child.emit('close', null, 'SIGTERM');
+                    return true;
                 });
-            execFactoryStub
-                .setup((factory) => factory.createActivatedEnvironment(typeMoq.It.isAny()))
-                .returns(async () => execServiceStub.object);
-            execFactoryStub.setup((factory) => ((factory as unknown) as any).then).returns(() => undefined);
-            execServiceStub.setup((service) => ((service as unknown) as any).then).returns(() => undefined);
-            try {
-                const running = createAdapter(adapter, configService).runTests(
-                    Uri.file(myTestPath),
-                    ['a::test_one'],
-                    TestRunProfileKind.Run,
-                    run,
-                    execFactoryStub.object,
-                    undefined,
-                    undefined,
-                    undefined,
-                    workspace.token,
-                );
-                await started.promise;
-                workspace.cancel();
-                await running;
-                sinon.assert.calledOnce(kill);
-                sinon.assert.calledOnce(closePipe);
-                assert.ok(!shared.token.isCancellationRequested);
-                await assert.rejects(fs.access(ids), { code: 'ENOENT' });
-            } finally {
-                workspace.dispose();
-                shared.dispose();
-                await fs.rm(directory, { recursive: true, force: true });
-            }
-        });
+                const closePipe = sinon.spy();
+                utilsWriteTestIdsFileStub.resolves(ids);
+                utilsStartRunResultNamedPipe.callsFake((_callback, drained, pipeToken, abortToken) => {
+                    assert.strictEqual(abortToken, workspace.token);
+                    abortToken.onCancellationRequested(() => drained.resolve());
+                    pipeToken.onCancellationRequested(() => drained.resolve());
+                    return Promise.resolve({ pipeName: 'run-result', dispose: closePipe });
+                });
+                execServiceStub
+                    .setup((service) => service.execObservable(typeMoq.It.isAny(), typeMoq.It.isAny()))
+                    .returns(() => {
+                        started.resolve();
+                        return { proc: child as any, out: new Observable<Output<string>>(), dispose: noop };
+                    });
+                execFactoryStub
+                    .setup((factory) => factory.createActivatedEnvironment(typeMoq.It.isAny()))
+                    .returns(async () => execServiceStub.object);
+                execFactoryStub.setup((factory) => ((factory as unknown) as any).then).returns(() => undefined);
+                execServiceStub.setup((service) => ((service as unknown) as any).then).returns(() => undefined);
+                try {
+                    const running = createAdapter(adapter, configService).runTests(
+                        Uri.file(myTestPath),
+                        ['a::test_one'],
+                        TestRunProfileKind.Run,
+                        run,
+                        execFactoryStub.object,
+                        undefined,
+                        undefined,
+                        undefined,
+                        workspace.token,
+                    );
+                    await started.promise;
+                    if (spawnFailed) {
+                        assert.ok(child.eventMap.has('error'), 'native spawn errors need a listener before close');
+                        child.emit('error', new Error('spawn ENOENT'));
+                        child.emit('close', -2, null);
+                    } else {
+                        workspace.cancel();
+                    }
+                    await running;
+                    assert.equal(kill.callCount, spawnFailed ? 0 : 1);
+                    sinon.assert.calledOnce(closePipe);
+                    assert.ok(!shared.token.isCancellationRequested);
+                    await assert.rejects(fs.access(ids), { code: 'ENOENT' });
+                } finally {
+                    workspace.dispose();
+                    shared.dispose();
+                    await fs.rm(directory, { recursive: true, force: true });
+                }
+            });
+        }
 
         test(`Adapter ${adapter}: cancelation token called mid-run resolves correctly`, async () => {
             // mock test run and cancelation token
