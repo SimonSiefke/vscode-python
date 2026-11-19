@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 //  Copyright (c) Microsoft Corporation. All rights reserved.
 //  Licensed under the MIT License.
-import { CancellationTokenSource, TestRun, TestRunProfileKind, Uri } from 'vscode';
+import { CancellationToken, CancellationTokenSource, TestRun, TestRunProfileKind, Uri } from 'vscode';
 import * as assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -97,10 +97,14 @@ suite('Execution Flow Run Adapters', () => {
             sinon.assert.notCalled(drain);
         });
 
-        for (const spawnFailed of [false, true]) {
-            test(`Adapter ${adapter}: ${
-                spawnFailed ? 'spawn failure' : 'workspace retirement'
-            } closes the reader and removes test IDs`, async () => {
+        const completions = ['spawn failure', 'workspace retirement'];
+        if (adapter === 'unittest') {
+            completions.push('exit with inherited stdio still open');
+        } else {
+            completions.push('workspace retirement after exit with inherited stdio still open');
+        }
+        for (const completion of completions) {
+            test(`Adapter ${adapter}: ${completion} closes the reader and removes test IDs`, async () => {
                 const shared = new CancellationTokenSource();
                 const workspace = new CancellationTokenSource();
                 const directory = await fs.mkdtemp(path.join(tmpdir(), 'python-workspace-run-'));
@@ -111,13 +115,17 @@ suite('Execution Flow Run Adapters', () => {
                 const started = createDeferred<void>();
                 const kill = sinon.stub(child, 'kill').callsFake(() => {
                     child.emit('exit', null, 'SIGTERM');
-                    child.emit('close', null, 'SIGTERM');
+                    if (adapter !== 'pytest') {
+                        child.emit('close', null, 'SIGTERM');
+                    }
                     return true;
                 });
                 const closePipe = sinon.spy();
+                let resultPipeToken: CancellationToken | undefined;
                 utilsWriteTestIdsFileStub.resolves(ids);
                 utilsStartRunResultNamedPipe.callsFake((_callback, drained, pipeToken, abortToken) => {
                     assert.strictEqual(abortToken, workspace.token);
+                    resultPipeToken = pipeToken;
                     abortToken.onCancellationRequested(() => drained.resolve());
                     pipeToken.onCancellationRequested(() => drained.resolve());
                     return Promise.resolve({ pipeName: 'run-result', dispose: closePipe });
@@ -146,15 +154,22 @@ suite('Execution Flow Run Adapters', () => {
                         workspace.token,
                     );
                     await started.promise;
-                    if (spawnFailed) {
+                    if (completion === 'spawn failure') {
                         assert.ok(child.eventMap.has('error'), 'native spawn errors need a listener before close');
                         child.emit('error', new Error('spawn ENOENT'));
                         child.emit('close', -2, null);
+                    } else if (completion === 'exit with inherited stdio still open') {
+                        child.emit('exit', 0, null);
+                    } else if (completion === 'workspace retirement after exit with inherited stdio still open') {
+                        child.emit('exit', 0, null);
+                        assert.ok(resultPipeToken);
+                        assert.ok(!resultPipeToken.isCancellationRequested, 'the live workspace still drains stdio');
+                        workspace.cancel();
                     } else {
                         workspace.cancel();
                     }
                     await running;
-                    assert.equal(kill.callCount, spawnFailed ? 0 : 1);
+                    assert.equal(kill.callCount, completion === 'workspace retirement' ? 1 : 0);
                     sinon.assert.calledOnce(closePipe);
                     assert.ok(!shared.token.isCancellationRequested);
                     await assert.rejects(fs.access(ids), { code: 'ENOENT' });

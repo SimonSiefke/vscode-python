@@ -302,7 +302,12 @@ export class UnittestTestExecutionAdapter implements ITestExecutionAdapter {
                     runInstance.appendOutput(`${out}`);
                 });
 
-                resultProc.once('close', (code, signal) => {
+                const onProcessDone = (code: number | null, signal: NodeJS.Signals | null) => {
+                    if (deferredTillExecClose.completed) {
+                        return;
+                    }
+                    resultProc?.off('exit', onProcessDone);
+                    resultProc?.off('close', onProcessDone);
                     // if the child has testIds then this is a run request
                     if (code !== 0 && testIds) {
                         // This occurs when we are running the test and there is an error which occurs.
@@ -319,7 +324,11 @@ export class UnittestTestExecutionAdapter implements ITestExecutionAdapter {
                     }
                     deferredTillExecClose.resolve();
                     serverCancel.cancel();
-                });
+                };
+                // Successful runners can exit while a descendant still holds stdout or stderr open.
+                // Spawn failures can close without an exit event.
+                resultProc.once('exit', onProcessDone);
+                resultProc.once('close', onProcessDone);
                 await deferredTillExecClose.promise;
             }
         } catch (ex) {

@@ -195,6 +195,9 @@ suite('Test workspace lifetime', () => {
                 label,
                 uri,
                 children: {
+                    get size() {
+                        return children.size;
+                    },
                     get: (key: string) => children.get(key),
                     add: (child: TestItem) => {
                         children.set(child.id, child);
@@ -725,19 +728,40 @@ suite('Test workspace lifetime', () => {
         clock = sinon.useFakeTimers();
         await clock.tickAsync(0);
         assert.ok(controller['projectRegistry'].hasProjects(ready.uri));
+        onDiscovery = (uri, resolver) => publishRoot(resolver, uri, 'project tests');
+        const cancellation = new CancellationTokenSource();
+        events.push(cancellation);
+        const cancelled = testController.refreshHandler?.(cancellation.token);
+        await clock.tickAsync(0);
+        cancellation.cancel();
+        const requested = controller.refreshTestData(ready.uri, { forceRefresh: true });
+        await clock.tickAsync(0);
+        assert.deepStrictEqual(discovered, []);
         save(startup);
         save(ready);
         await clock.tickAsync(250);
         assert.deepStrictEqual(discovered, []);
         const later = add('later');
-        projects.fire({ added: [project], removed: [] });
+        projects.fire({ added: [project, initiallyReadyProject], removed: [] });
         activationLookup.resolve(activeInterpreter);
         await activation;
-        assert.deepStrictEqual(discovered, []);
+        await cancelled;
+        await requested;
+        assert.deepStrictEqual(discovered, [ready.uri.toString()]);
         assert.ok(controller['projectRegistry'].hasProjects(later.uri));
+
+        const prefix = `${projectUtils.getProjectId(ready.uri)}${projectUtils.PROJECT_ID_SEPARATOR}`;
+        const selected = testController.items.get(`${prefix}${ready.uri.fsPath}`)?.children.get(`${prefix}case`);
+        assert.ok(selected);
+        const run = prepareRun();
+        const execute = sinon.spy();
+        onExecution = async (...args) => execute(...args);
+        await controller['runTests'](runRequest([selected]), run.token);
+        sinon.assert.calledOnceWithMatch(execute, sinon.match.has('fsPath', ready.uri.fsPath), ['case']);
+
         save(later);
         await clock.tickAsync(250);
-        assert.deepStrictEqual(discovered, [later.uri.toString()]);
+        assert.deepStrictEqual(discovered, [ready.uri.toString(), later.uri.toString()]);
     });
 
     test('legacy and project reports for the same file retain their own details after retirement', async () => {

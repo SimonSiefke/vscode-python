@@ -72,6 +72,8 @@ export class PythonTestController implements ITestController, IExtensionSingleAc
     // Registry for multi-project testing (one registry instance manages all projects across workspaces)
     private readonly projectRegistry: TestProjectRegistry;
 
+    private projectRegistration?: Promise<void>;
+
     private readonly triggerTypes: DiscoveryTriggerKind[] = [];
 
     /**
@@ -306,40 +308,12 @@ export class PythonTestController implements ITestController, IExtensionSingleAc
         // PROJECT-BASED MODE: Uses Python Environments API to discover projects
         // Each project becomes its own test tree root with its own Python environment
         if (projectMode) {
-            traceInfo('[test-by-project] Activating project-based testing mode');
-            const startupChanges: DidChangePythonProjectsEventArgs[] = [];
-            let started = false;
-            await this.subscribeToProjectChanges((event) => {
-                if (started) {
-                    this.handleProjectChanges(event).catch((error) =>
-                        traceError('[test-by-project] Error handling project changes:', error),
-                    );
-                } else {
-                    startupChanges.push(event);
-                }
-            });
-
-            const projectWorkspaces = this.workspaceService.workspaceFolders ?? [];
-            await Promise.all(projectWorkspaces.map((workspace) => this.registerInitialProjects(workspace)));
-            // Reconcile project registration without starting Python test collection during activation.
-            for (const change of startupChanges) {
-                const workspacesToRegister = new Set<WorkspaceFolder>();
-                for (const project of [...change.added, ...change.removed]) {
-                    const workspace = this.workspaceService.getWorkspaceFolder(project.uri);
-                    if (workspace) {
-                        workspacesToRegister.add(workspace);
-                    }
-                }
-                // eslint-disable-next-line no-await-in-loop
-                await Promise.all(
-                    Array.from(workspacesToRegister, (workspace) => this.registerInitialProjects(workspace)),
-                );
+            this.projectRegistration = this.registerProjectsOnActivation();
+            try {
+                await this.projectRegistration;
+            } finally {
+                this.projectRegistration = undefined;
             }
-            startupChanges.length = 0;
-            started = true;
-            // Subscribe to environment changes so projects that had no resolved environment at
-            // activation get discovered once the environments extension assigns one.
-            await this.subscribeToEnvironmentChanges();
             canRefreshOnFileChange = true;
             this.workspaceService.workspaceFolders?.forEach((workspace) => this.setupFileWatchers(workspace));
             return;
@@ -350,6 +324,41 @@ export class PythonTestController implements ITestController, IExtensionSingleAc
             this.setupFileWatchers(workspace);
             this.activateLegacyWorkspace(workspace);
         });
+    }
+
+    private async registerProjectsOnActivation(): Promise<void> {
+        traceInfo('[test-by-project] Activating project-based testing mode');
+        const startupChanges: DidChangePythonProjectsEventArgs[] = [];
+        let started = false;
+        await this.subscribeToProjectChanges((event) => {
+            if (started) {
+                this.handleProjectChanges(event).catch((error) =>
+                    traceError('[test-by-project] Error handling project changes:', error),
+                );
+            } else {
+                startupChanges.push(event);
+            }
+        });
+
+        const projectWorkspaces = this.workspaceService.workspaceFolders ?? [];
+        await Promise.all(projectWorkspaces.map((workspace) => this.registerInitialProjects(workspace)));
+        // Reconcile project registration without starting Python test collection during activation.
+        for (const change of startupChanges) {
+            const workspacesToRegister = new Set<WorkspaceFolder>();
+            for (const project of [...change.added, ...change.removed]) {
+                const workspace = this.workspaceService.getWorkspaceFolder(project.uri);
+                if (workspace) {
+                    workspacesToRegister.add(workspace);
+                }
+            }
+            // eslint-disable-next-line no-await-in-loop
+            await Promise.all(Array.from(workspacesToRegister, (workspace) => this.registerInitialProjects(workspace)));
+        }
+        startupChanges.length = 0;
+        started = true;
+        // Subscribe to environment changes so projects that had no resolved environment at
+        // activation get discovered once the environments extension assigns one.
+        await this.subscribeToEnvironmentChanges();
     }
 
     private async registerInitialProjects(workspace: WorkspaceFolder): Promise<void> {
@@ -715,6 +724,14 @@ export class PythonTestController implements ITestController, IExtensionSingleAc
         if (!workspace?.uri) {
             traceError('Unable to find workspace for given file');
             return;
+        }
+
+        if (this.projectRegistration) {
+            const token = this.refreshCancellation.token;
+            await this.projectRegistration;
+            if (token.isCancellationRequested || this.workspaceService.getWorkspaceFolder(uri) !== workspace) {
+                return;
+            }
         }
 
         const settings = this.configSettings.getSettings(uri);

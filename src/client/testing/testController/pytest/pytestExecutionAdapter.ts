@@ -260,15 +260,19 @@ export class PytestTestExecutionAdapter implements ITestExecutionAdapter {
                 traceInfo(`Running pytest with arguments: ${runArgs.join(' ')} for workspace ${uri.fsPath} \r\n`);
 
                 let resultProc: ChildProcess | undefined;
+                let exited = false;
+                const workspaceScoped = token !== runInstance.token;
+                const settleProcess = () => {
+                    deferredTillExecClose.resolve();
+                    serverCancel.cancel();
+                };
 
                 token.onCancellationRequested(() => {
                     traceInfo(`Test run cancelled, killing pytest subprocess for workspace ${uri.fsPath}`);
-                    // if the resultProc exists just call kill on it which will handle resolving the ExecClose deferred, otherwise resolve the deferred here.
-                    if (resultProc) {
-                        resultProc?.kill();
+                    if (resultProc && !(workspaceScoped && exited)) {
+                        resultProc.kill();
                     } else {
-                        deferredTillExecClose.resolve();
-                        serverCancel.cancel();
+                        settleProcess();
                     }
                 });
 
@@ -291,7 +295,12 @@ export class PytestTestExecutionAdapter implements ITestExecutionAdapter {
                     const out = utils.fixLogLinesNoTrailing(data.toString());
                     runInstance.appendOutput(out);
                 });
-                result?.proc?.on('exit', (code, signal) => {
+                resultProc.once('exit', (code, signal) => {
+                    exited = true;
+                    // A descendant can keep stdio open after the runner exits.
+                    if (workspaceScoped && token.isCancellationRequested) {
+                        settleProcess();
+                    }
                     if (code !== 0) {
                         traceError(
                             `Subprocess exited unsuccessfully with exit code ${code} and signal ${signal} on workspace ${uri.fsPath}`,
@@ -318,8 +327,7 @@ export class PytestTestExecutionAdapter implements ITestExecutionAdapter {
 
                     // deferredTillEOT is resolved when all data sent on stdout and stderr is received, close event is only called when this occurs
                     // due to the sync reading of the output.
-                    deferredTillExecClose.resolve();
-                    serverCancel.cancel();
+                    settleProcess();
                 });
                 await deferredTillExecClose.promise;
             }
