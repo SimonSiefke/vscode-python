@@ -31,6 +31,8 @@ function trackedEvent<T>(): TrackedEvent<T> {
 
 suite('Python settings workspace lifetime', () => {
     let folders: WorkspaceFolder[];
+    let retainedFolder: WorkspaceFolder;
+    let removedFolder: WorkspaceFolder;
     let changed: TrackedEvent<WorkspaceFoldersChangeEvent>;
     let configuration: TrackedEvent<never>;
     let interpreter: TrackedEvent<never>;
@@ -38,7 +40,7 @@ suite('Python settings workspace lifetime', () => {
     let autoSelectionService: MockAutoSelectionService;
     let workspace: TypeMoq.IMock<IWorkspaceService>;
     let pathService: TypeMoq.IMock<IInterpreterPathService>;
-    const folder = (name: string): WorkspaceFolder => ({ uri: Uri.file(`/work/${name}`), name, index: 0 });
+    const folder = (name: string, index: number): WorkspaceFolder => ({ uri: Uri.file(`/work/${name}`), name, index });
     const create = (resource: Uri) =>
         PythonSettings.getInstance(
             resource,
@@ -55,7 +57,9 @@ suite('Python settings workspace lifetime', () => {
 
     setup(() => {
         PythonSettings.dispose();
-        folders = [folder('removed'), folder('retained')];
+        retainedFolder = folder('retained', 0);
+        removedFolder = folder('removed', 1);
+        folders = [retainedFolder, removedFolder];
         changed = trackedEvent<WorkspaceFoldersChangeEvent>();
         configuration = trackedEvent<never>();
         interpreter = trackedEvent<never>();
@@ -78,45 +82,47 @@ suite('Python settings workspace lifetime', () => {
     });
 
     test('removing a folder disposes its settings once and removes its listeners', () => {
-        const removed = folders[0];
-        const settings = create(removed.uri);
+        const settings = create(removedFolder.uri);
         const disposed = sinon.spy(settings, 'dispose');
         assert.strictEqual(changed.listeners.size, 1);
         assert.strictEqual(configuration.listeners.size, 1);
         assert.strictEqual(interpreter.listeners.size, 1);
         assert.strictEqual(autoSelection.listeners.size, 1);
-        remove(removed);
+        remove(removedFolder);
         assert.strictEqual(disposed.callCount, 1);
         assert.strictEqual(changed.listeners.size, 0);
         assert.strictEqual(configuration.listeners.size, 0);
         assert.strictEqual(interpreter.listeners.size, 0);
         assert.strictEqual(autoSelection.listeners.size, 0);
-        changed.fire({ added: [], removed: [removed] });
+        changed.fire({ added: [], removed: [removedFolder] });
         assert.strictEqual(disposed.callCount, 1);
     });
 
     test('remaining workspace settings stay cached and subscribed', () => {
-        const removed = folders[0];
-        create(removed.uri);
-        const retained = create(folders[1].uri);
-        const disposed = sinon.spy(retained, 'dispose');
-        remove(removed);
-        assert.strictEqual(create(folders[0].uri), retained);
-        assert.strictEqual(disposed.callCount, 0);
+        const retained = create(retainedFolder.uri);
+        const removed = create(removedFolder.uri);
+        const retainedDisposed = sinon.spy(retained, 'dispose');
+        const removedDisposed = sinon.spy(removed, 'dispose');
+        remove(removedFolder);
+        assert.strictEqual(retainedDisposed.callCount, 0);
+        assert.strictEqual(removedDisposed.callCount, 1);
+        assert.strictEqual(create(retainedFolder.uri), retained);
+        assert.strictEqual(changed.listeners.size, 1);
         assert.strictEqual(configuration.listeners.size, 1);
+        assert.strictEqual(interpreter.listeners.size, 1);
         assert.strictEqual(autoSelection.listeners.size, 1);
     });
 
     test('readding a removed folder creates one fresh listener set', () => {
-        const removed = folders[0];
-        const old = create(removed.uri);
-        remove(removed);
-        folders.push(removed);
-        const fresh = create(removed.uri);
+        const old = create(removedFolder.uri);
+        remove(removedFolder);
+        folders.push(removedFolder);
+        const fresh = create(removedFolder.uri);
         assert.notStrictEqual(fresh, old);
-        assert.strictEqual(create(removed.uri), fresh);
+        assert.strictEqual(create(removedFolder.uri), fresh);
         assert.strictEqual(changed.listeners.size, 1);
         assert.strictEqual(configuration.listeners.size, 1);
+        assert.strictEqual(interpreter.listeners.size, 1);
         assert.strictEqual(autoSelection.listeners.size, 1);
     });
 });
