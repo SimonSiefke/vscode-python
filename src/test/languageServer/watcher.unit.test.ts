@@ -4,7 +4,7 @@
 import * as assert from 'assert';
 import * as sinon from 'sinon';
 import * as TypeMoq from 'typemoq';
-import { ConfigurationChangeEvent, Uri, WorkspaceFolder, WorkspaceFoldersChangeEvent } from 'vscode';
+import { CancellationError, ConfigurationChangeEvent, Uri, WorkspaceFolder, WorkspaceFoldersChangeEvent } from 'vscode';
 import { JediLanguageServerManager } from '../../client/activation/jedi/manager';
 import { NodeLanguageServerManager } from '../../client/activation/node/manager';
 import { ILanguageServerOutputChannel, LanguageServerType } from '../../client/activation/types';
@@ -18,6 +18,7 @@ import {
     IExtensions,
     IInterpreterPathService,
 } from '../../client/common/types';
+import { createDeferred } from '../../client/common/utils/async';
 import { LanguageService } from '../../client/common/utils/localize';
 import { Architecture } from '../../client/common/utils/platform';
 import { IEnvironmentVariablesProvider } from '../../client/common/variables/types';
@@ -32,7 +33,11 @@ import * as Logging from '../../client/logging';
 import { EnvironmentType, PythonEnvironment } from '../../client/pythonEnvironments/info';
 
 suite('Language server watcher lifetime', () => {
-    function createWatcher() {
+    const sandbox = sinon.createSandbox();
+
+    teardown(() => sandbox.restore());
+
+    function createWatcher(languageServer = LanguageServerType.None) {
         const disposables: IDisposable[] = [];
         const resource = Uri.file('/project');
         const firstInterpreter: PythonEnvironment = {
@@ -43,17 +48,22 @@ suite('Language server watcher lifetime', () => {
         };
         const secondInterpreter: PythonEnvironment = { ...firstInterpreter, path: '/python/two' };
         let interpreter = firstInterpreter;
+        let lookupInterpreter = async () => interpreter;
         const interpreterService = TypeMoq.Mock.ofType<IInterpreterService>();
-        interpreterService.setup((s) => s.getActiveInterpreter(TypeMoq.It.isAny())).returns(async () => interpreter);
+        interpreterService.setup((s) => s.getActiveInterpreter(TypeMoq.It.isAny())).returns(() => lookupInterpreter());
         const workspace = TypeMoq.Mock.ofType<IWorkspaceService>();
         workspace
             .setup((w) => w.getWorkspaceFolder(TypeMoq.It.isAny()))
             .returns(() => ({ uri: resource, name: 'project', index: 0 }));
         const settings = TypeMoq.Mock.ofType<IPythonSettings>();
-        settings.setup((s) => s.languageServer).returns(() => LanguageServerType.None);
+        settings.setup((s) => s.languageServer).returns(() => languageServer);
         settings.setup((s) => s.languageServerIsDefault).returns(() => false);
         const configuration = TypeMoq.Mock.ofType<IConfigurationService>();
-        configuration.setup((c) => c.getSettings()).returns(() => settings.object);
+        configuration.setup((c) => c.getSettings(TypeMoq.It.isAny())).returns(() => settings.object);
+        const commands = TypeMoq.Mock.ofType<ICommandManager>();
+        commands
+            .setup((c) => c.registerCommand(TypeMoq.It.isAny(), TypeMoq.It.isAny()))
+            .returns(() => ({ dispose: () => {} }));
         const watcher = new LanguageServerWatcher(
             TypeMoq.Mock.ofType<IServiceContainer>().object,
             TypeMoq.Mock.ofType<ILanguageServerOutputChannel>().object,
@@ -64,7 +74,7 @@ suite('Language server watcher lifetime', () => {
             interpreterService.object,
             TypeMoq.Mock.ofType<IEnvironmentVariablesProvider>().object,
             workspace.object,
-            TypeMoq.Mock.ofType<ICommandManager>().object,
+            commands.object,
             TypeMoq.Mock.ofType<IFileSystem>().object,
             TypeMoq.Mock.ofType<IExtensions>().object,
             TypeMoq.Mock.ofType<IApplicationShell>().object,
@@ -77,6 +87,12 @@ suite('Language server watcher lifetime', () => {
             changeInterpreter: () => {
                 interpreter = secondInterpreter;
             },
+            setInterpreterLookup: (lookup: () => Promise<PythonEnvironment>) => {
+                lookupInterpreter = lookup;
+            },
+            setLanguageServer: (type: LanguageServerType) => {
+                languageServer = type;
+            },
         };
     }
 
@@ -84,9 +100,11 @@ suite('Language server watcher lifetime', () => {
         const { watcher, disposables, resource, changeInterpreter } = createWatcher();
         try {
             await watcher.startLanguageServer(LanguageServerType.None, resource);
+            const oldServer = await watcher.get(resource);
             const registeredDisposables = disposables.length;
             changeInterpreter();
             await watcher.startLanguageServer(LanguageServerType.None, resource);
+            assert.notStrictEqual(await watcher.get(resource), oldServer);
             assert.strictEqual(disposables.length, registeredDisposables);
         } finally {
             await Promise.all(disposables.map((disposable) => disposable.dispose()));
@@ -95,24 +113,132 @@ suite('Language server watcher lifetime', () => {
 
     test('Session disposal cleans up the active server without stopping an old server again', async () => {
         const { watcher, disposables, resource, changeInterpreter } = createWatcher();
-        const sandbox = sinon.createSandbox();
         const stop = sandbox.spy(NoneLSExtensionManager.prototype, 'stopLanguageServer');
         const dispose = sandbox.spy(NoneLSExtensionManager.prototype, 'dispose');
         try {
             await watcher.startLanguageServer(LanguageServerType.None, resource);
             const oldServer = await watcher.get(resource);
+
             changeInterpreter();
             await watcher.startLanguageServer(LanguageServerType.None, resource);
             const activeServer = await watcher.get(resource);
+            assert.notStrictEqual(oldServer, activeServer);
+            assert.strictEqual(stop.callCount, 1);
+            assert.strictEqual(stop.firstCall.thisValue, oldServer);
+            assert.strictEqual(dispose.callCount, 1);
+            assert.strictEqual(dispose.firstCall.thisValue, oldServer);
+
             await Promise.all(disposables.map((disposable) => disposable.dispose()));
-            assert.strictEqual(stop.getCalls().filter((call) => call.thisValue === oldServer).length, 1);
-            assert.strictEqual(dispose.getCalls().filter((call) => call.thisValue === oldServer).length, 1);
-            assert.strictEqual(stop.getCalls().filter((call) => call.thisValue === activeServer).length, 1);
-            assert.strictEqual(dispose.getCalls().filter((call) => call.thisValue === activeServer).length, 1);
+            assert.strictEqual(stop.callCount, 2);
+            assert.strictEqual(stop.secondCall.thisValue, activeServer);
+            assert.strictEqual(dispose.callCount, 2);
+            assert.strictEqual(dispose.secondCall.thisValue, activeServer);
         } finally {
             await Promise.all(disposables.map((disposable) => disposable.dispose()));
-            sandbox.restore();
         }
+    });
+
+    test('Shutdown prevents a pending interpreter lookup and later activation from starting a server', async () => {
+        const { watcher, disposables, resource, setInterpreterLookup } = createWatcher();
+        const interpreter = createDeferred<PythonEnvironment>();
+        const lookup = sandbox.stub().returns(interpreter.promise);
+        const start = sandbox.spy(NoneLSExtensionManager.prototype, 'startLanguageServer');
+        setInterpreterLookup(lookup);
+
+        const starting = watcher.startLanguageServer(LanguageServerType.None, resource);
+        assert.ok(lookup.calledOnce);
+        await Promise.all(disposables.map((disposable) => disposable.dispose()));
+        disposables.length = 0;
+        interpreter.resolve({
+            path: '/python/one',
+            architecture: Architecture.x64,
+            sysPrefix: '/python',
+            envType: EnvironmentType.Venv,
+        });
+        await starting;
+        await watcher.activate(resource);
+
+        assert.ok(start.notCalled);
+        assert.ok(lookup.calledOnce);
+        assert.strictEqual(disposables.length, 0);
+    });
+
+    test('Shutdown joins an in-flight replacement without starting another server', async () => {
+        const { watcher, disposables, resource, setLanguageServer } = createWatcher();
+        const enteredStop = createDeferred();
+        const finishStop = createDeferred();
+        const start = sandbox.spy(NoneLSExtensionManager.prototype, 'startLanguageServer');
+        const stop = sandbox.stub(NoneLSExtensionManager.prototype, 'stopLanguageServer').callsFake(async () => {
+            enteredStop.resolve();
+            await finishStop.promise;
+        });
+        const dispose = sandbox.spy(NoneLSExtensionManager.prototype, 'dispose');
+        await watcher.startLanguageServer(LanguageServerType.None, resource);
+        setLanguageServer(LanguageServerType.Node);
+        const refreshing = watcher['refreshLanguageServer'](resource);
+        try {
+            await Promise.race([enteredStop.promise, refreshing]);
+            assert.ok(enteredStop.completed);
+            const firstShutdown = disposables[0].dispose();
+            const secondShutdown = disposables[0].dispose();
+            assert.strictEqual(firstShutdown, secondShutdown);
+            assert.ok(stop.calledOnce);
+            assert.ok(dispose.notCalled);
+            await assert.rejects(watcher.get(resource), CancellationError);
+            finishStop.resolve();
+
+            await Promise.all([refreshing, firstShutdown, secondShutdown]);
+            assert.ok(start.calledOnce);
+            assert.ok(stop.calledOnce);
+            assert.ok(dispose.calledOnce);
+            assert.strictEqual(watcher.languageServerType, LanguageServerType.None);
+        } finally {
+            finishStop.resolve();
+            await refreshing;
+            await Promise.all(disposables.map((disposable) => disposable.dispose()));
+        }
+    });
+
+    test('Replacing Pylance waits for pending startup and retires the old manager once', async () => {
+        const { watcher, disposables, resource, setLanguageServer } = createWatcher(LanguageServerType.Node);
+        const enteredStartup = createDeferred();
+        const finishStartup = createDeferred();
+        let live = false;
+        sandbox.stub(PylanceLSExtensionManager.prototype, 'canStartLanguageServer').returns(true);
+        sandbox.stub(PylanceLSExtensionManager.prototype, 'startLanguageServer').callsFake(async () => {
+            enteredStartup.resolve();
+            await finishStartup.promise;
+            live = true;
+        });
+        const stop = sandbox.stub(PylanceLSExtensionManager.prototype, 'stopLanguageServer').callsFake(async () => {
+            live = false;
+        });
+        const dispose = sandbox.spy(PylanceLSExtensionManager.prototype, 'dispose');
+        const starting = watcher.startLanguageServer(LanguageServerType.Node, resource);
+        try {
+            await Promise.race([enteredStartup.promise, starting]);
+            assert.ok(enteredStartup.completed);
+            setLanguageServer(LanguageServerType.None);
+            const refreshing = watcher['refreshLanguageServer'](resource);
+            const overlappingRefresh = watcher['refreshLanguageServer'](resource);
+            await Promise.resolve();
+            assert.ok(stop.notCalled);
+            finishStartup.resolve();
+
+            await Promise.all([starting, refreshing, overlappingRefresh]);
+            assert.ok(stop.calledOnce);
+            assert.ok(dispose.calledOnce);
+            assert.strictEqual(live, false);
+            assert.strictEqual(watcher.languageServerType, LanguageServerType.None);
+            assert.ok((await watcher.get(resource)) instanceof NoneLSExtensionManager);
+        } finally {
+            finishStartup.resolve();
+            await starting;
+            await Promise.all(disposables.map((disposable) => disposable.dispose()));
+        }
+        assert.ok(stop.calledOnce);
+        assert.ok(dispose.calledOnce);
+        assert.strictEqual(live, false);
     });
 });
 
