@@ -60,14 +60,14 @@ function isEnvSame(path: string, env: PythonEnvInfo) {
 export function buildDeprecatedProposedApi(
     discoveryApi: IDiscoveryAPI,
     serviceContainer: IServiceContainer,
-    activation?: ApiActivation,
+    activation: ApiActivation,
 ): DeprecatedProposedAPI {
     const interpreterPathService = serviceContainer.get<IInterpreterPathService>(IInterpreterPathService);
     const interpreterService = serviceContainer.get<IInterpreterService>(IInterpreterService);
     const extensions = serviceContainer.get<IExtensions>(IExtensions);
     const warningLogged = new Set<string>();
     async function getActiveInterpreter(resource: Resource) {
-        const active = (await activation?.getCurrent())?.serviceContainer.get<IInterpreterService>(IInterpreterService);
+        const active = (await activation.getCurrent())?.serviceContainer.get<IInterpreterService>(IInterpreterService);
         return (active ?? interpreterService).getActiveInterpreter(resource);
     }
     function sendApiTelemetry(apiName: string, warnLog = true) {

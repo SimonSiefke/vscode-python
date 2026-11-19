@@ -12,7 +12,7 @@ import { DeprecatedProposedAPI } from './deprecatedProposedApiTypes';
 export function buildProposedApi(
     discoveryApi: IDiscoveryAPI,
     serviceContainer: IServiceContainer,
-    activation?: ApiActivation,
+    activation: ApiActivation,
 ): ProposedExtensionAPI {
     /**
      * @deprecated Will be removed soon.

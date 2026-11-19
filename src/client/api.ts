@@ -40,13 +40,11 @@ export class ApiActivation {
         return this.current;
     }
 
-    public restart(activate: () => Promise<void>, startup?: Promise<unknown>): Promise<void> {
+    public restart(activate: () => Promise<void>, startup: Promise<unknown>): Promise<void> {
         if (!this.reactivation) {
-            this.reactivation = Promise.resolve(startup)
-                .then(activate, activate)
-                .finally(() => {
-                    this.reactivation = undefined;
-                });
+            this.reactivation = startup.then(activate, activate).finally(() => {
+                this.reactivation = undefined;
+            });
         }
         return this.reactivation;
     }
@@ -57,7 +55,7 @@ export function buildApi(
     serviceManager: IServiceManager,
     serviceContainer: IServiceContainer,
     discoveryApi: IDiscoveryAPI,
-    activation?: ApiActivation,
+    activation: ApiActivation,
 ): PythonExtension {
     const configurationService = serviceContainer.get<IConfigurationService>(IConfigurationService);
     const interpreterService = serviceContainer.get<IInterpreterService>(IInterpreterService);
@@ -72,7 +70,7 @@ export function buildApi(
     );
     const jupyterPythonEnvApi = serviceContainer.get<JupyterPythonEnvironmentApi>(JupyterExtensionPythonEnvironments);
     const environments = buildEnvironmentApi(discoveryApi, serviceContainer, jupyterPythonEnvApi, async () => {
-        return (await activation?.getCurrent())?.environments;
+        return (await activation.getCurrent())?.environments;
     });
     const jupyterIntegration = serviceContainer.get<JupyterExtensionIntegration>(JupyterExtensionIntegration);
     jupyterIntegration.registerEnvApi(environments);
@@ -81,7 +79,7 @@ export function buildApi(
     );
     const outputChannel = serviceContainer.get<ILanguageServerOutputChannel>(ILanguageServerOutputChannel);
     const getActiveService = async <T>(identifier: ClassType<T>, initial: T): Promise<T> =>
-        (await activation?.getCurrent())?.serviceContainer.get(identifier) ?? initial;
+        (await activation.getCurrent())?.serviceContainer.get(identifier) ?? initial;
     const getJupyter = () => getActiveService(JupyterExtensionIntegration, jupyterIntegration);
     const getTensorboard = () => getActiveService(TensorboardExtensionIntegration, tensorboardIntegration);
 

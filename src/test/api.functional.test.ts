@@ -106,7 +106,7 @@ suite('Extension API', () => {
             startDeactivation.resolve();
             await finishDeactivation.promise;
             activation.current = current;
-        });
+        }, Promise.resolve());
 
         let settled = false;
         void observed.then(() => {
@@ -268,7 +268,7 @@ suite('Extension API', () => {
             activation.current = undefined;
             await prepare.promise;
             activation.current = { environments, serviceContainer: instance(newContainer) };
-        });
+        }, Promise.resolve());
 
         const resolving = initial.environments.resolveEnvironment('python3');
         const jupyterEnvironment = jupyter!.getActivatedEnvironmentVariables(undefined, environment, true);
@@ -290,6 +290,7 @@ suite('Extension API', () => {
             instance(serviceManager),
             instance(serviceContainer),
             instance(discoverAPI),
+            new ApiActivation(),
         ).debug.getRemoteLauncherCommand(debuggerHost, debuggerPort, waitForAttach);
         const expectedArgs = [
             debuggerPath.fileToCommandArgumentForPythonExt(),
@@ -308,6 +309,7 @@ suite('Extension API', () => {
             instance(serviceManager),
             instance(serviceContainer),
             instance(discoverAPI),
+            new ApiActivation(),
         ).debug.getRemoteLauncherCommand(debuggerHost, debuggerPort, waitForAttach);
         const expectedArgs = [
             debuggerPath.fileToCommandArgumentForPythonExt(),
@@ -325,6 +327,7 @@ suite('Extension API', () => {
             instance(serviceManager),
             instance(serviceContainer),
             instance(discoverAPI),
+            new ApiActivation(),
         ).debug.getDebuggerPackagePath();
 
         assert.strictEqual(pkgPath, debuggerPath);
