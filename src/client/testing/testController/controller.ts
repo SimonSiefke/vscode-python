@@ -178,18 +178,20 @@ export class PythonTestController implements ITestController, IExtensionSingleAc
         );
 
         this.testController.resolveHandler = this.resolveChildren.bind(this);
-        this.testController.refreshHandler = (token: CancellationToken) => {
-            this.disposables.push(
-                token.onCancellationRequested(() => {
-                    traceVerbose('Testing: Stop refreshing triggered');
-                    sendTelemetryEvent(EventName.UNITTEST_DISCOVERING_STOP);
-                    this.stopRefreshing();
-                }),
-            );
+        this.testController.refreshHandler = async (token: CancellationToken) => {
+            const cancellation = token.onCancellationRequested(() => {
+                traceVerbose('Testing: Stop refreshing triggered');
+                sendTelemetryEvent(EventName.UNITTEST_DISCOVERING_STOP);
+                this.stopRefreshing();
+            });
 
-            traceVerbose('Testing: Manually triggered test refresh');
-            this.sendTriggerTelemetry(constants.CommandSource.commandPalette);
-            return this.refreshTestData(undefined, { forceRefresh: true });
+            try {
+                traceVerbose('Testing: Manually triggered test refresh');
+                this.sendTriggerTelemetry(constants.CommandSource.commandPalette);
+                await this.refreshTestData(undefined, { forceRefresh: true });
+            } finally {
+                cancellation.dispose();
+            }
         };
     }
 
