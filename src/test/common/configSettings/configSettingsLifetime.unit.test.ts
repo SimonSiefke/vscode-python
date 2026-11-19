@@ -34,13 +34,15 @@ suite('Python settings workspace lifetime', () => {
     let changed: TrackedEvent<WorkspaceFoldersChangeEvent>;
     let configuration: TrackedEvent<never>;
     let interpreter: TrackedEvent<never>;
+    let autoSelection: TrackedEvent<void>;
+    let autoSelectionService: MockAutoSelectionService;
     let workspace: TypeMoq.IMock<IWorkspaceService>;
     let pathService: TypeMoq.IMock<IInterpreterPathService>;
     const folder = (name: string): WorkspaceFolder => ({ uri: Uri.file(`/work/${name}`), name, index: 0 });
     const create = (resource: Uri) =>
         PythonSettings.getInstance(
             resource,
-            new MockAutoSelectionService(),
+            autoSelectionService,
             workspace.object,
             pathService.object,
             undefined,
@@ -57,6 +59,9 @@ suite('Python settings workspace lifetime', () => {
         changed = trackedEvent<WorkspaceFoldersChangeEvent>();
         configuration = trackedEvent<never>();
         interpreter = trackedEvent<never>();
+        autoSelection = trackedEvent<void>();
+        autoSelectionService = new MockAutoSelectionService();
+        sinon.stub(autoSelectionService, 'onDidChangeAutoSelectedInterpreter').get(() => autoSelection.event);
         workspace = TypeMoq.Mock.ofType<IWorkspaceService>();
         workspace.setup((value) => value.workspaceFolders).returns(() => folders);
         workspace
@@ -79,11 +84,13 @@ suite('Python settings workspace lifetime', () => {
         assert.strictEqual(changed.listeners.size, 1);
         assert.strictEqual(configuration.listeners.size, 1);
         assert.strictEqual(interpreter.listeners.size, 1);
+        assert.strictEqual(autoSelection.listeners.size, 1);
         remove(removed);
         assert.strictEqual(disposed.callCount, 1);
         assert.strictEqual(changed.listeners.size, 0);
         assert.strictEqual(configuration.listeners.size, 0);
         assert.strictEqual(interpreter.listeners.size, 0);
+        assert.strictEqual(autoSelection.listeners.size, 0);
         changed.fire({ added: [], removed: [removed] });
         assert.strictEqual(disposed.callCount, 1);
     });
@@ -97,6 +104,7 @@ suite('Python settings workspace lifetime', () => {
         assert.strictEqual(create(folders[0].uri), retained);
         assert.strictEqual(disposed.callCount, 0);
         assert.strictEqual(configuration.listeners.size, 1);
+        assert.strictEqual(autoSelection.listeners.size, 1);
     });
 
     test('readding a removed folder creates one fresh listener set', () => {
@@ -109,5 +117,6 @@ suite('Python settings workspace lifetime', () => {
         assert.strictEqual(create(removed.uri), fresh);
         assert.strictEqual(changed.listeners.size, 1);
         assert.strictEqual(configuration.listeners.size, 1);
+        assert.strictEqual(autoSelection.listeners.size, 1);
     });
 });
