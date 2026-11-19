@@ -266,7 +266,7 @@ suite('Process service shutdown ownership', () => {
         assert.ok(service instanceof ProcessService);
         for (let i = 0; i < 3; i += 1) {
             await service.exec(process.execPath, ['-e', '']);
-            const observable = service.execObservable(process.execPath, ['-e', '']);
+            const observable: ObservableExecutionResult<string> = service.execObservable(process.execPath, ['-e', '']);
             assert.ok(observable.proc);
             await once(observable.proc, 'close');
             assert.strictEqual(observable.proc.listenerCount('error'), 0);
@@ -281,11 +281,12 @@ suite('Process service shutdown ownership', () => {
             ['-e', 'process.stdout.write("ready"); setTimeout(() => {}, 10000)'],
             { stdio: ['ignore', 'pipe', 'pipe', 'ipc'] },
         );
-        assert.ok(result.proc?.stdout);
         const proc = result.proc;
+        const stdout = proc?.stdout;
+        assert.ok(proc && stdout);
         const exit = new Promise<number | null>((resolve) => proc.once('exit', resolve));
         try {
-            await once(proc.stdout, 'data');
+            await once(stdout, 'data');
             const disconnected = once(proc, 'disconnect');
             proc.disconnect();
             await disconnected;
