@@ -1,7 +1,8 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
-import { exec, execSync, spawn } from 'child_process';
+import { ChildProcess, exec, execSync, spawn } from 'child_process';
+import { errorMonitor } from 'events';
 import { Readable } from 'stream';
 import { Observable } from 'rxjs/Observable';
 import { IDisposable } from '../types';
@@ -16,6 +17,35 @@ import { WorkspaceService } from '../application/workspace';
 import { ProcessLogger } from './logger';
 
 const PS_ERROR_SCREEN_BOGUS = /your [0-9]+x[0-9]+ screen size is bogus\. expect trouble/;
+
+function trackProcess(proc: ChildProcess, disposable: IDisposable, disposables?: Set<IDisposable>): void {
+    if (!disposables) {
+        return;
+    }
+
+    const releaseIfStopped = () => {
+        if (proc.pid && proc.exitCode === null && proc.signalCode === null) {
+            return;
+        }
+        disposables.delete(disposable);
+        proc.removeListener('exit', releaseIfStopped);
+        proc.removeListener('close', releaseIfStopped);
+        proc.removeListener(errorMonitor, releaseIfStopped);
+    };
+
+    disposables.add(disposable);
+    proc.once('exit', releaseIfStopped);
+    proc.once('close', releaseIfStopped);
+    // Observe spawn failure without consuming errors from callers that use the raw process.
+    proc.on(errorMonitor, releaseIfStopped);
+}
+
+function stopProcess(proc: ChildProcess): void {
+    // A child can stay alive after receiving a signal.
+    if (proc.pid && proc.exitCode === null && proc.signalCode === null) {
+        killPid(proc.pid);
+    }
+}
 
 function getDefaultOptions<T extends ShellOptions | SpawnOptions>(options: T, defaultEnv?: EnvironmentVariables): T {
     const defaultOptions = { ...options };
@@ -75,31 +105,8 @@ export function shellExec(
                 resolve({ stderr: stderr && stderr.length > 0 ? stderr : undefined, stdout });
             }
         };
-        let procExited = false;
         const proc = exec(command, shellOptions, callback); // NOSONAR
-        const disposable: IDisposable = {
-            dispose: () => {
-                disposables?.delete(disposable);
-                // If process has not exited nor killed, force kill it.
-                if (!procExited && !proc.killed) {
-                    if (proc.pid) {
-                        killPid(proc.pid);
-                    } else {
-                        proc.kill();
-                    }
-                }
-            },
-        };
-        disposables?.add(disposable);
-        const release = () => {
-            procExited = true;
-            disposables?.delete(disposable);
-        };
-        proc.once('close', release);
-        proc.once('error', release);
-        proc.once('exit', () => {
-            procExited = true;
-        });
+        trackProcess(proc, { dispose: () => stopProcess(proc) }, disposables);
     });
 }
 
@@ -122,20 +129,8 @@ export function plainExec(
     proc.stdout?.on('error', noop);
     proc.stderr?.on('error', noop);
     const deferred = createDeferred<ExecutionResult<string>>();
-    const disposable: IDisposable = {
-        dispose: () => {
-            disposables?.delete(disposable);
-            // If process has not exited nor killed, force kill it.
-            if (!proc.killed && !deferred.completed) {
-                if (proc.pid) {
-                    killPid(proc.pid);
-                } else {
-                    proc.kill();
-                }
-            }
-        },
-    };
-    disposables?.add(disposable);
+    const stop = () => stopProcess(proc);
+    trackProcess(proc, { dispose: stop }, disposables);
     const internalDisposables: IDisposable[] = [];
 
     // eslint-disable-next-line @typescript-eslint/ban-types
@@ -147,7 +142,7 @@ export function plainExec(
     };
 
     if (options.token) {
-        internalDisposables.push(options.token.onCancellationRequested(disposable.dispose));
+        internalDisposables.push(options.token.onCancellationRequested(stop));
     }
 
     const stdoutBuffers: Buffer[] = [];
@@ -186,12 +181,10 @@ export function plainExec(
             deferred.resolve({ stdout, stderr });
         }
         internalDisposables.forEach((d) => d.dispose());
-        disposable.dispose();
     });
     proc.once('error', (ex) => {
         deferred.reject(ex);
         internalDisposables.forEach((d) => d.dispose());
-        disposable.dispose();
     });
 
     return deferred.promise;
@@ -225,29 +218,11 @@ export function execObservable(
         processLogger.logProcess(file, args, options);
     }
     const proc = spawn(file, args, spawnOptions);
-    let procExited = false;
-    const disposable: IDisposable = {
-        dispose() {
-            disposables?.delete(disposable);
-            if (proc && proc.pid && !proc.killed && !procExited) {
-                killPid(proc.pid);
-            }
-            if (proc) {
-                proc.unref();
-            }
-        },
+    const dispose = () => {
+        stopProcess(proc);
+        proc.unref();
     };
-    disposables?.add(disposable);
-    // Process ownership must end even when callers consume the streams directly.
-    const release = () => {
-        procExited = true;
-        disposables?.delete(disposable);
-    };
-    proc.once('close', release);
-    proc.once('error', release);
-    proc.once('exit', () => {
-        procExited = true;
-    });
+    trackProcess(proc, { dispose }, disposables);
 
     const output = new Observable<Output<string>>((subscriber) => {
         const internalDisposables: IDisposable[] = [];
@@ -261,18 +236,7 @@ export function execObservable(
         };
 
         if (options.token) {
-            internalDisposables.push(
-                options.token.onCancellationRequested(() => {
-                    if (!procExited && !proc.killed) {
-                        if (proc.pid) {
-                            killPid(proc.pid);
-                        } else {
-                            proc.kill();
-                        }
-                        procExited = true;
-                    }
-                }),
-            );
+            internalDisposables.push(options.token.onCancellationRequested(() => stopProcess(proc)));
         }
 
         const sendOutput = (source: 'stdout' | 'stderr', data: Buffer) => {
@@ -292,17 +256,14 @@ export function execObservable(
         on(proc.stderr, 'data', (data: Buffer) => sendOutput('stderr', data));
 
         proc.once('close', () => {
-            procExited = true;
             subscriber.complete();
             internalDisposables.forEach((d) => d.dispose());
         });
         proc.once('exit', () => {
-            procExited = true;
             subscriber.complete();
             internalDisposables.forEach((d) => d.dispose());
         });
         proc.once('error', (ex) => {
-            procExited = true;
             subscriber.error(ex);
             internalDisposables.forEach((d) => d.dispose());
         });
@@ -315,7 +276,7 @@ export function execObservable(
     return {
         proc,
         out: output,
-        dispose: disposable.dispose,
+        dispose,
     };
 }
 
