@@ -2,7 +2,15 @@
 // Licensed under the MIT License.
 
 import { inject, injectable } from 'inversify';
-import { CancellationToken, Disposable, Event, EventEmitter, Terminal, TerminalShellExecution } from 'vscode';
+import {
+    CancellationError,
+    CancellationToken,
+    Disposable,
+    Event,
+    EventEmitter,
+    Terminal,
+    TerminalShellExecution,
+} from 'vscode';
 import '../../common/extensions';
 import { IInterpreterService } from '../../interpreter/contracts';
 import { IServiceContainer } from '../../ioc/types';
@@ -234,16 +242,21 @@ export class TerminalService implements ITerminalService, Disposable {
             return;
         } else {
             this.terminalShellType = this.terminalHelper.identifyTerminalShell(this.terminal);
-            this.terminal = this.terminalManager.createTerminal({
+            const terminal = this.terminalManager.createTerminal({
                 name: this.options?.title || 'Python',
                 hideFromUser: this.options?.hideFromUser,
                 iconPath: this.options?.iconPath,
             });
-            this.terminalAutoActivator.disableAutoActivation(this.terminal);
+            this.terminal = terminal;
+            this.terminalAutoActivator.disableAutoActivation(terminal);
 
             await sleep(100);
 
-            await this.terminalActivator.activateEnvironmentInTerminal(this.terminal, {
+            if (this.terminal !== terminal) {
+                throw new CancellationError();
+            }
+
+            await this.terminalActivator.activateEnvironmentInTerminal(terminal, {
                 resource: this.options?.resource,
                 preserveFocus,
                 interpreter: this.options?.interpreter,
