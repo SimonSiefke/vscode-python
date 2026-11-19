@@ -25,7 +25,7 @@ initializeFileLogging(logDispose);
 // loading starts here
 
 import { ProgressLocation, ProgressOptions, window } from 'vscode';
-import { buildApi } from './api';
+import { ApiActivation, buildApi } from './api';
 import { IApplicationShell, IWorkspaceService } from './common/application/types';
 import { IDisposableRegistry, IExperimentService, IExtensionContext } from './common/types';
 import { createDeferred } from './common/utils/async';
@@ -55,6 +55,7 @@ durations.codeLoadingTime = stopWatch.elapsedTime;
 
 // These persist between activations:
 let activatedServiceContainer: IServiceContainer | undefined;
+const apiActivation = new ApiActivation();
 
 /////////////////////////////
 // public functions
@@ -67,13 +68,17 @@ export async function activate(context: IExtensionContext): Promise<PythonExtens
     try {
         isFirstSession = context.globalState.get(GLOBAL_PERSISTENT_KEYS, []).length === 0;
         const workspaceService = new WorkspaceService();
+        const startup = activateUnsafe(context, stopWatch, durations);
         context.subscriptions.push(
-            workspaceService.onDidGrantWorkspaceTrust(async () => {
-                await deactivate();
-                await activate(context);
-            }),
+            workspaceService.onDidGrantWorkspaceTrust(() =>
+                apiActivation.restart(async () => {
+                    await deactivate();
+                    await activate(context);
+                }, startup),
+            ),
         );
-        [api, ready, serviceContainer] = await activateUnsafe(context, stopWatch, durations);
+        [api, ready, serviceContainer] = await startup;
+        apiActivation.current = { environments: api.environments, serviceContainer };
     } catch (ex) {
         // We want to completely handle the error
         // before notifying VS Code.
@@ -89,6 +94,7 @@ export async function activate(context: IExtensionContext): Promise<PythonExtens
 }
 
 export async function deactivate(): Promise<void> {
+    apiActivation.current = undefined;
     // Make sure to shutdown anybody who needs it.
     if (activatedServiceContainer) {
         const disposables = activatedServiceContainer.get<IDisposableRegistry>(IDisposableRegistry);
@@ -169,8 +175,9 @@ async function activateUnsafe(
         ext.legacyIOC.serviceManager,
         ext.legacyIOC.serviceContainer,
         components.pythonEnvs,
+        apiActivation,
     );
-    const proposedApi = buildProposedApi(components.pythonEnvs, ext.legacyIOC.serviceContainer);
+    const proposedApi = buildProposedApi(components.pythonEnvs, ext.legacyIOC.serviceContainer, apiActivation);
     registerTools(context, components.pythonEnvs, api.environments, ext.legacyIOC.serviceContainer);
     ext.legacyIOC.serviceContainer
         .get<IRecommendedEnvironmentService>(IRecommendedEnvironmentService)

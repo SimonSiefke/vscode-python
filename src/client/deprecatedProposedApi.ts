@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 import { ConfigurationTarget, EventEmitter } from 'vscode';
+import type { ApiActivation } from './api';
 import { arePathsSame } from './common/platform/fs-paths';
 import { IExtensions, IInterpreterPathService, Resource } from './common/types';
 import {
@@ -59,11 +60,16 @@ function isEnvSame(path: string, env: PythonEnvInfo) {
 export function buildDeprecatedProposedApi(
     discoveryApi: IDiscoveryAPI,
     serviceContainer: IServiceContainer,
+    activation: ApiActivation,
 ): DeprecatedProposedAPI {
     const interpreterPathService = serviceContainer.get<IInterpreterPathService>(IInterpreterPathService);
     const interpreterService = serviceContainer.get<IInterpreterService>(IInterpreterService);
     const extensions = serviceContainer.get<IExtensions>(IExtensions);
     const warningLogged = new Set<string>();
+    async function getActiveInterpreter(resource: Resource) {
+        const active = (await activation.getCurrent())?.serviceContainer.get<IInterpreterService>(IInterpreterService);
+        return (active ?? interpreterService).getActiveInterpreter(resource);
+    }
     function sendApiTelemetry(apiName: string, warnLog = true) {
         extensions
             .determineExtensionFromCallStack()
@@ -87,12 +93,12 @@ export function buildDeprecatedProposedApi(
         environment: {
             async getExecutionDetails(resource?: Resource) {
                 sendApiTelemetry('deprecated.getExecutionDetails');
-                const env = await interpreterService.getActiveInterpreter(resource);
+                const env = await getActiveInterpreter(resource);
                 return env ? { execCommand: [env.path] } : { execCommand: undefined };
             },
             async getActiveEnvironmentPath(resource?: Resource) {
                 sendApiTelemetry('deprecated.getActiveEnvironmentPath');
-                const env = await interpreterService.getActiveInterpreter(resource);
+                const env = await getActiveInterpreter(resource);
                 if (!env) {
                     return undefined;
                 }

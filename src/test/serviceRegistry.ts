@@ -13,14 +13,8 @@ import { RegistryImplementation } from '../client/common/platform/registry';
 import { registerTypes as platformRegisterTypes } from '../client/common/platform/serviceRegistry';
 import { IFileSystem, IPlatformService, IRegistry } from '../client/common/platform/types';
 import { ProcessService } from '../client/common/process/proc';
-import { PythonExecutionFactory } from '../client/common/process/pythonExecutionFactory';
-import { PythonToolExecutionService } from '../client/common/process/pythonToolService';
 import { registerTypes as processRegisterTypes } from '../client/common/process/serviceRegistry';
-import {
-    IProcessServiceFactory,
-    IPythonExecutionFactory,
-    IPythonToolExecutionService,
-} from '../client/common/process/types';
+import { IProcessServiceFactory } from '../client/common/process/types';
 import { registerTypes as commonRegisterTypes } from '../client/common/serviceRegistry';
 import {
     GLOBAL_MEMENTO,
@@ -155,14 +149,10 @@ export class IocContainer {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const processService = new MockProcessService(new ProcessService(process.env as any));
         processServiceFactory.setup((f) => f.create(TypeMoq.It.isAny())).returns(() => Promise.resolve(processService));
-        this.serviceManager.addSingletonInstance<IProcessServiceFactory>(
+        processRegisterTypes(this.serviceManager);
+        this.serviceManager.rebindInstance<IProcessServiceFactory>(
             IProcessServiceFactory,
             processServiceFactory.object,
-        );
-        this.serviceManager.addSingleton<IPythonExecutionFactory>(IPythonExecutionFactory, PythonExecutionFactory);
-        this.serviceManager.addSingleton<IPythonToolExecutionService>(
-            IPythonToolExecutionService,
-            PythonToolExecutionService,
         );
         this.serviceManager.addSingleton<IEnvironmentActivationService>(
             IEnvironmentActivationService,

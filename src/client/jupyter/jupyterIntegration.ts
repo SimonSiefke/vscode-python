@@ -113,10 +113,15 @@ export class JupyterExtensionIntegration {
         this.environmentApi = api;
     }
 
-    public registerApi(jupyterExtensionApi: JupyterExtensionApi): JupyterExtensionApi | undefined {
+    public registerApi(
+        jupyterExtensionApi: JupyterExtensionApi,
+        getCurrentIntegration: () => Promise<JupyterExtensionIntegration> = async () => this,
+    ): JupyterExtensionApi | undefined {
         this.contextManager.setContext(ExtensionContextKey.IsJupyterInstalled, true);
         if (!this.workspaceService.isTrusted) {
-            this.workspaceService.onDidGrantWorkspaceTrust(() => this.registerApi(jupyterExtensionApi));
+            this.workspaceService.onDidGrantWorkspaceTrust(() =>
+                this.registerApi(jupyterExtensionApi, getCurrentIntegration),
+            );
             return undefined;
         }
         // Forward python parts
@@ -126,11 +131,16 @@ export class JupyterExtensionIntegration {
                 env: Environment,
                 allowExceptions?: boolean,
             ) => {
-                const interpreter = await this.interpreterService.getInterpreterDetails(env.path);
-                return this.envActivation.getActivatedEnvironmentVariables(resource, interpreter, allowExceptions);
+                const integration = await getCurrentIntegration();
+                const interpreter = await integration.interpreterService.getInterpreterDetails(env.path);
+                return integration.envActivation.getActivatedEnvironmentVariables(
+                    resource,
+                    interpreter,
+                    allowExceptions,
+                );
             },
             getSuggestions: async (resource: Resource): Promise<IInterpreterQuickPickItem[]> =>
-                this.interpreterSelector.getAllSuggestions(resource),
+                (await getCurrentIntegration()).interpreterSelector.getAllSuggestions(resource),
             getKnownSuggestions: (resource: Resource): IInterpreterQuickPickItem[] =>
                 this.interpreterSelector.getSuggestions(resource),
             getDebuggerPath: async () => dirname(await getDebugpyPath()),
@@ -139,24 +149,27 @@ export class JupyterExtensionIntegration {
             registerInterpreterStatusFilter: this.interpreterDisplay.registerVisibilityFilter.bind(
                 this.interpreterDisplay,
             ),
-            getCondaFile: () => this.condaService.getCondaFile(),
-            getCondaVersion: () => this.condaService.getCondaVersion(),
+            getCondaFile: async () => (await getCurrentIntegration()).condaService.getCondaFile(),
+            getCondaVersion: async () => (await getCurrentIntegration()).condaService.getCondaVersion(),
             registerJupyterPythonPathFunction: (func: (uri: Uri) => Promise<string | undefined>) =>
                 this.registerJupyterPythonPathFunction(func),
             getRecommededEnvironment: async (uri) => {
-                if (!this.environmentApi) {
+                const integration = await getCurrentIntegration();
+                if (!integration.environmentApi) {
                     return undefined;
                 }
-                return this.preferredEnvironmentService.getRecommededEnvironment(uri);
+                return integration.preferredEnvironmentService.getRecommededEnvironment(uri);
             },
         });
         return undefined;
     }
 
-    public async integrateWithJupyterExtension(): Promise<void> {
+    public async integrateWithJupyterExtension(
+        getCurrentIntegration?: () => Promise<JupyterExtensionIntegration>,
+    ): Promise<void> {
         const api = await this.getExtensionApi();
         if (api) {
-            this.registerApi(api);
+            this.registerApi(api, getCurrentIntegration);
         }
     }
 

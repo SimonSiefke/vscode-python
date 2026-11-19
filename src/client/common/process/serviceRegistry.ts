@@ -2,12 +2,16 @@
 // Licensed under the MIT License.
 
 import { IServiceManager } from '../../ioc/types';
+import { ProcessServiceShutdown } from './proc';
 import { ProcessServiceFactory } from './processFactory';
 import { PythonExecutionFactory } from './pythonExecutionFactory';
 import { PythonToolExecutionService } from './pythonToolService';
 import { IProcessServiceFactory, IPythonExecutionFactory, IPythonToolExecutionService } from './types';
 
 export function registerTypes(serviceManager: IServiceManager) {
+    serviceManager.addSingleton(ProcessServiceShutdown, ProcessServiceShutdown);
+    // Register shutdown before asynchronous work can ask for either factory.
+    serviceManager.get(ProcessServiceShutdown);
     serviceManager.addSingleton<IProcessServiceFactory>(IProcessServiceFactory, ProcessServiceFactory);
     serviceManager.addSingleton<IPythonExecutionFactory>(IPythonExecutionFactory, PythonExecutionFactory);
     serviceManager.addSingleton<IPythonToolExecutionService>(IPythonToolExecutionService, PythonToolExecutionService);

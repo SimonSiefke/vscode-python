@@ -3,6 +3,7 @@
 
 import { expect, use } from 'chai';
 import * as chaiAsPromised from 'chai-as-promised';
+import { randomUUID } from 'crypto';
 import * as sinon from 'sinon';
 import { SemVer } from 'semver';
 import * as TypeMoq from 'typemoq';
@@ -213,6 +214,31 @@ suite('PythonEnvironment', () => {
         const result = await env.getExecutablePath();
 
         expect(result).to.be.equal(undefined);
+    });
+
+    test('a failed executable lookup can be retried with a live process service', async () => {
+        const command = `python-after-process-service-shutdown-${randomUUID()}`;
+        const newService = TypeMoq.Mock.ofType<IProcessService>(undefined, TypeMoq.MockBehavior.Strict);
+        fileSystem.setup((f) => f.pathExists(command)).returns(() => Promise.resolve(false));
+        processService
+            .setup((p) => p.shellExec(TypeMoq.It.isAny(), TypeMoq.It.isAny()))
+            .returns(() => Promise.reject(new Error('Process service has been disposed')));
+        newService
+            .setup((p) => p.shellExec(TypeMoq.It.isAny(), TypeMoq.It.isAny()))
+            .returns(() => Promise.resolve({ stdout: pythonPath }));
+        const previous = createPythonEnv(command, processService.object, fileSystem.object);
+        const current = createPythonEnv(command, newService.object, fileSystem.object);
+        const testEnv = sinon.stub(process, 'env').value({
+            ...process.env,
+            VSC_PYTHON_CI_TEST: '',
+            VSC_PYTHON_UNIT_TEST: '',
+        });
+        try {
+            expect(await previous.getExecutablePath()).to.equal(undefined);
+            expect(await current.getExecutablePath()).to.equal(pythonPath);
+        } finally {
+            testEnv.restore();
+        }
     });
 
     test('isModuleInstalled should call processService.exec()', async () => {

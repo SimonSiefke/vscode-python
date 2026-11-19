@@ -60,7 +60,12 @@ class PythonEnvironment implements IPythonEnvironment {
             return result;
         }
         const python = this.getExecutionInfo();
-        const promise = getExecutablePath(python, this.deps.shellExec);
+        const promise = getExecutablePath(python, this.deps.shellExec).then((executable) => {
+            if (executable === undefined && cachedExecutablePath.get(this.pythonPath) === promise) {
+                cachedExecutablePath.delete(this.pythonPath);
+            }
+            return executable;
+        });
         cachedExecutablePath.set(this.pythonPath, promise);
         return promise;
     }

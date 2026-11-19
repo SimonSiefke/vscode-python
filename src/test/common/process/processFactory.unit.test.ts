@@ -6,7 +6,7 @@ import { instance, mock, verify, when } from 'ts-mockito';
 import { Disposable, Uri } from 'vscode';
 
 import { ProcessLogger } from '../../../client/common/process/logger';
-import { ProcessService } from '../../../client/common/process/proc';
+import { ProcessService, ProcessServiceShutdown } from '../../../client/common/process/proc';
 import { ProcessServiceFactory } from '../../../client/common/process/processFactory';
 import { IProcessLogger } from '../../../client/common/process/types';
 import { IDisposableRegistry } from '../../../client/common/types';
@@ -34,7 +34,7 @@ suite('Process - ProcessServiceFactory', () => {
         factory = new ProcessServiceFactory(
             instance(envVariablesProvider),
             instance(processLogger),
-            disposableRegistry,
+            new ProcessServiceShutdown(disposableRegistry),
         );
     });
 

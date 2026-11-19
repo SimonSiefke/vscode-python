@@ -47,25 +47,36 @@ export class TensorboardExtensionIntegration {
         @inject(TensorBoardPrompt) private readonly tensorBoardPrompt: TensorBoardPrompt,
     ) {}
 
-    public registerApi(tensorboardExtensionApi: TensorboardExtensionApi): TensorboardExtensionApi | undefined {
+    public registerApi(
+        tensorboardExtensionApi: TensorboardExtensionApi,
+        getCurrentIntegration: () => Promise<TensorboardExtensionIntegration> = async () => this,
+    ): TensorboardExtensionApi | undefined {
         if (!this.workspaceService.isTrusted) {
-            this.workspaceService.onDidGrantWorkspaceTrust(() => this.registerApi(tensorboardExtensionApi));
+            this.workspaceService.onDidGrantWorkspaceTrust(() =>
+                this.registerApi(tensorboardExtensionApi, getCurrentIntegration),
+            );
             return undefined;
         }
         tensorboardExtensionApi.registerPythonApi({
             getActivatedEnvironmentVariables: async (resource: Resource) =>
-                this.envActivation.getActivatedEnvironmentVariables(resource, undefined, true),
+                (await getCurrentIntegration()).envActivation.getActivatedEnvironmentVariables(
+                    resource,
+                    undefined,
+                    true,
+                ),
             ensureDependenciesAreInstalled: async (resource?: Uri): Promise<boolean> =>
-                this.dependencyChcker.ensureDependenciesAreInstalled(resource),
+                (await getCurrentIntegration()).dependencyChcker.ensureDependenciesAreInstalled(resource),
             isPromptEnabled: () => this.tensorBoardPrompt.isPromptEnabled(),
         });
         return undefined;
     }
 
-    public async integrateWithTensorboardExtension(): Promise<void> {
+    public async integrateWithTensorboardExtension(
+        getCurrentIntegration?: () => Promise<TensorboardExtensionIntegration>,
+    ): Promise<void> {
         const api = await this.getExtensionApi();
         if (api) {
-            this.registerApi(api);
+            this.registerApi(api, getCurrentIntegration);
         }
     }
 
