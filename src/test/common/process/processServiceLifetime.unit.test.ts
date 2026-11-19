@@ -364,24 +364,35 @@ suite('Process service shutdown ownership', () => {
 
     test('an unfinished worker keeps a service owned after its other executions complete', async () => {
         const service = await factory.create();
+        const plainOnly = await factory.create();
+        const shellOnly = await factory.create();
         const plainWorker = createDeferred<ExecutionResult<string>>();
+        const plainOnlyWorker = createDeferred<ExecutionResult<string>>();
         const shellWorker = createDeferred<ExecutionResult<string>>();
-        sinon.stub(processWorkers, 'workerPlainExec').returns(plainWorker.promise);
+        const workerExec = sinon.stub(processWorkers, 'workerPlainExec').returns(plainWorker.promise);
+        workerExec.onSecondCall().returns(plainOnlyWorker.promise);
         sinon.stub(processWorkers, 'workerShellExec').returns(shellWorker.promise);
         const plain = service.exec(process.execPath, ['-e', ''], { useWorker: true });
         const shell = service.shellExec('echo ready', { useWorker: true });
+        const standalonePlain = plainOnly.exec(process.execPath, ['-e', ''], { useWorker: true });
+        const standaloneShell = shellOnly.shellExec('echo ready', { useWorker: true });
 
         try {
             await service.exec(process.execPath, ['-e', '']);
             plainWorker.resolve({ stdout: 'worker ready' });
             assert.strictEqual((await plain).stdout, 'worker ready');
             const disposed = sinon.spy(service, 'dispose');
+            const disposedPlain = sinon.spy(plainOnly, 'dispose');
+            const disposedShell = sinon.spy(shellOnly, 'dispose');
             await disposeAll(registry);
             assert.ok(disposed.calledOnce);
+            assert.ok(disposedPlain.calledOnce);
+            assert.ok(disposedShell.calledOnce);
         } finally {
             plainWorker.resolve({ stdout: '' });
+            plainOnlyWorker.resolve({ stdout: '' });
             shellWorker.resolve({ stdout: '' });
-            await Promise.all([plain, shell]);
+            await Promise.all([plain, shell, standalonePlain, standaloneShell]);
         }
     });
 

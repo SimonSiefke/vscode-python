@@ -6,13 +6,19 @@
 import { assert, expect } from 'chai';
 import * as path from 'path';
 import * as sinon from 'sinon';
-import { instance, mock, when } from 'ts-mockito';
-import { buildApi } from '../client/api';
+import { anything, instance, mock, when } from 'ts-mockito';
+import { ApiActivation, buildApi } from '../client/api';
+import { PythonExtension } from '../client/api/types';
+import { convertCompleteEnvInfo } from '../client/environmentApi';
+import { buildEnvInfo } from '../client/pythonEnvironments/base/info/env';
+import { IWorkspaceService } from '../client/common/application/types';
 import { ConfigurationService } from '../client/common/configuration/service';
-import { EXTENSION_ROOT_DIR } from '../client/common/constants';
-import { IConfigurationService, IDisposableRegistry } from '../client/common/types';
+import { EXTENSION_ROOT_DIR, JUPYTER_EXTENSION_ID, TENSORBOARD_EXTENSION_ID } from '../client/common/constants';
+import { IConfigurationService, IDisposableRegistry, IExtensions } from '../client/common/types';
+import { createDeferred } from '../client/common/utils/async';
 import { IEnvironmentVariablesProvider } from '../client/common/variables/types';
 import { IInterpreterService } from '../client/interpreter/contracts';
+import { IEnvironmentActivationService } from '../client/interpreter/activation/types';
 import { InterpreterService } from '../client/interpreter/interpreterService';
 import { ServiceContainer } from '../client/ioc/container';
 import { ServiceManager } from '../client/ioc/serviceManager';
@@ -24,7 +30,9 @@ import {
     JupyterExtensionPythonEnvironments,
     JupyterPythonEnvironmentApi,
 } from '../client/jupyter/jupyterIntegration';
-import { EventEmitter, Uri } from 'vscode';
+import { EventEmitter, Extension, Uri } from 'vscode';
+import { TensorboardExtensionIntegration } from '../client/tensorBoard/tensorboardIntegration';
+import { TensorboardDependencyChecker } from '../client/tensorBoard/tensorboardDependencyChecker';
 
 suite('Extension API', () => {
     const debuggerPath = path.join(EXTENSION_ROOT_DIR, 'python_files', 'lib', 'python', 'debugpy');
@@ -73,6 +81,154 @@ suite('Extension API', () => {
 
     teardown(() => {
         sinon.restore();
+    });
+
+    test('a caller notified before Python uses the new API when the trust transition finishes', async () => {
+        const activation = new ApiActivation();
+        const previous = {
+            environments: instance(mock<PythonExtension['environments']>()),
+            serviceContainer: instance(mock(ServiceContainer)),
+        };
+        const current = {
+            environments: instance(mock<PythonExtension['environments']>()),
+            serviceContainer: instance(mock(ServiceContainer)),
+        };
+        activation.current = previous;
+        const observed = activation.getCurrent();
+        const finishDeactivation = createDeferred();
+        const startDeactivation = createDeferred();
+        const transition = activation.restart(async () => {
+            activation.current = undefined;
+            startDeactivation.resolve();
+            await finishDeactivation.promise;
+            activation.current = current;
+        });
+
+        let settled = false;
+        void observed.then(() => {
+            settled = true;
+        });
+        try {
+            await startDeactivation.promise;
+            assert.isFalse(settled);
+        } finally {
+            finishDeactivation.resolve();
+        }
+        await transition;
+        assert.strictEqual(await observed, current);
+        assert.strictEqual(await activation.getCurrent(), current);
+    });
+
+    test('the first Jupyter and TensorBoard callbacks use services from the latest activation', async () => {
+        type JupyterApi = Parameters<JupyterExtensionIntegration['registerApi']>[0];
+        type TensorboardApi = Parameters<TensorboardExtensionIntegration['registerApi']>[0];
+        let jupyter: Parameters<JupyterApi['registerPythonApi']>[0] | undefined;
+        let tensorboard: Parameters<TensorboardApi['registerPythonApi']>[0] | undefined;
+        const jupyterExtension = mock<Extension<JupyterApi>>();
+        const tensorboardExtension = mock<Extension<TensorboardApi>>();
+        const jupyterApi: JupyterApi = {
+            registerPythonApi: (api) => {
+                jupyter = jupyter ?? api;
+            },
+        };
+        const tensorboardApi: TensorboardApi = {
+            registerPythonApi: (api) => {
+                tensorboard = tensorboard ?? api;
+            },
+        };
+        when(jupyterExtension.isActive).thenReturn(true);
+        when(jupyterExtension.exports).thenReturn(jupyterApi);
+        when(jupyterExtension.activate()).thenReturn(Promise.resolve(jupyterApi));
+        when(tensorboardExtension.isActive).thenReturn(true);
+        when(tensorboardExtension.exports).thenReturn(tensorboardApi);
+        when(tensorboardExtension.activate()).thenReturn(Promise.resolve(tensorboardApi));
+        const extensions = mock<IExtensions>();
+        when(extensions.getExtension(JUPYTER_EXTENSION_ID)).thenReturn(instance(jupyterExtension));
+        when(extensions.getExtension(TENSORBOARD_EXTENSION_ID)).thenReturn(instance(tensorboardExtension));
+        const workspace = mock<IWorkspaceService>();
+        const grantedTrust = new EventEmitter<void>();
+        when(workspace.isTrusted).thenReturn(false);
+        when(workspace.onDidGrantWorkspaceTrust).thenReturn(grantedTrust.event);
+        const createDependency = <T extends object>() => instance(mock<T>());
+
+        function services(marker: string) {
+            const envActivation = mock<IEnvironmentActivationService>();
+            when(envActivation.getActivatedEnvironmentVariables(undefined, anything(), true)).thenResolve({ marker });
+            const checker = mock(TensorboardDependencyChecker);
+            when(checker.ensureDependenciesAreInstalled(undefined)).thenResolve(marker === 'current');
+            const jupyterIntegration = new JupyterExtensionIntegration(
+                instance(extensions),
+                createDependency(),
+                instance(envActivation),
+                createDependency(),
+                createDependency(),
+                instance(workspace),
+                createDependency(),
+                createDependency(),
+                instance(interpreterService),
+                createDependency(),
+            );
+            const tensorboardIntegration = new TensorboardExtensionIntegration(
+                instance(extensions),
+                instance(envActivation),
+                instance(workspace),
+                instance(checker),
+                createDependency(),
+            );
+            return { jupyterIntegration, tensorboardIntegration };
+        }
+
+        const activation = new ApiActivation();
+        const previous = services('previous');
+        when(serviceContainer.get(JupyterExtensionIntegration)).thenReturn(previous.jupyterIntegration);
+        when(serviceContainer.get(TensorboardExtensionIntegration)).thenReturn(previous.tensorboardIntegration);
+        const initial = buildApi(
+            Promise.resolve(),
+            instance(serviceManager),
+            instance(serviceContainer),
+            instance(discoverAPI),
+            activation,
+        ) as PythonExtension & {
+            jupyter: { registerHooks(): Promise<void> };
+            tensorboard: { registerHooks(): Promise<void> };
+        };
+        activation.current = { environments: initial.environments, serviceContainer: instance(serviceContainer) };
+        try {
+            await Promise.all([initial.jupyter.registerHooks(), initial.tensorboard.registerHooks()]);
+            assert.isUndefined(jupyter);
+            assert.isUndefined(tensorboard);
+            when(workspace.isTrusted).thenReturn(true);
+            grantedTrust.fire();
+            assert.isDefined(jupyter);
+            assert.isDefined(tensorboard);
+        } finally {
+            grantedTrust.dispose();
+        }
+
+        const current = services('current');
+        const newContainer = mock(ServiceContainer);
+        when(newContainer.get(JupyterExtensionIntegration)).thenReturn(current.jupyterIntegration);
+        when(newContainer.get(TensorboardExtensionIntegration)).thenReturn(current.tensorboardIntegration);
+        const environment = convertCompleteEnvInfo(buildEnvInfo({ executable: '/current/python' }));
+        const environments: PythonExtension['environments'] = Object.create(initial.environments);
+        environments.resolveEnvironment = sinon.stub().withArgs('python3').resolves(environment);
+        const prepare = createDeferred();
+        const replacement = activation.restart(async () => {
+            activation.current = undefined;
+            await prepare.promise;
+            activation.current = { environments, serviceContainer: instance(newContainer) };
+        });
+
+        const resolving = initial.environments.resolveEnvironment('python3');
+        const jupyterEnvironment = jupyter!.getActivatedEnvironmentVariables(undefined, environment, true);
+        const tensorboardEnvironment = tensorboard!.getActivatedEnvironmentVariables(undefined);
+        const dependencies = tensorboard!.ensureDependenciesAreInstalled();
+        prepare.resolve();
+        await replacement;
+        assert.strictEqual(await resolving, environment);
+        assert.deepEqual(await jupyterEnvironment, { marker: 'current' });
+        assert.deepEqual(await tensorboardEnvironment, { marker: 'current' });
+        assert.isTrue(await dependencies);
     });
 
     test('Test debug launcher args (no-wait)', async () => {

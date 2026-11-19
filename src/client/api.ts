@@ -14,7 +14,7 @@ import { isTestExecution, PYTHON_LANGUAGE } from './common/constants';
 import { IConfigurationService, Resource } from './common/types';
 import { getDebugpyLauncherArgs } from './debugger/extension/adapter/remoteLaunchers';
 import { IInterpreterService } from './interpreter/contracts';
-import { IServiceContainer, IServiceManager } from './ioc/types';
+import { ClassType, IServiceContainer, IServiceManager } from './ioc/types';
 import {
     JupyterExtensionIntegration,
     JupyterExtensionPythonEnvironments,
@@ -28,12 +28,36 @@ import { getTelemetryReporter } from './telemetry';
 import { TensorboardExtensionIntegration } from './tensorBoard/tensorboardIntegration';
 import { getDebugpyPath } from './debugger/pythonDebugger';
 
+export class ApiActivation {
+    public current: { environments: PythonExtension['environments']; serviceContainer: IServiceContainer } | undefined;
+
+    private reactivation: Promise<void> | undefined;
+
+    public async getCurrent(): Promise<ApiActivation['current']> {
+        // Other extensions may receive the same trust event before Python publishes its transition.
+        await Promise.resolve();
+        await this.reactivation;
+        return this.current;
+    }
+
+    public restart(activate: () => Promise<void>): Promise<void> {
+        if (!this.reactivation) {
+            this.reactivation = Promise.resolve()
+                .then(activate)
+                .finally(() => {
+                    this.reactivation = undefined;
+                });
+        }
+        return this.reactivation;
+    }
+}
+
 export function buildApi(
     ready: Promise<void>,
     serviceManager: IServiceManager,
     serviceContainer: IServiceContainer,
     discoveryApi: IDiscoveryAPI,
-    getActiveEnvironmentApi?: () => Promise<PythonExtension['environments'] | undefined>,
+    activation?: ApiActivation,
 ): PythonExtension {
     const configurationService = serviceContainer.get<IConfigurationService>(IConfigurationService);
     const interpreterService = serviceContainer.get<IInterpreterService>(IInterpreterService);
@@ -47,18 +71,19 @@ export function buildApi(
         TensorboardExtensionIntegration,
     );
     const jupyterPythonEnvApi = serviceContainer.get<JupyterPythonEnvironmentApi>(JupyterExtensionPythonEnvironments);
-    const environments = buildEnvironmentApi(
-        discoveryApi,
-        serviceContainer,
-        jupyterPythonEnvApi,
-        getActiveEnvironmentApi,
-    );
+    const environments = buildEnvironmentApi(discoveryApi, serviceContainer, jupyterPythonEnvApi, async () => {
+        return (await activation?.getCurrent())?.environments;
+    });
     const jupyterIntegration = serviceContainer.get<JupyterExtensionIntegration>(JupyterExtensionIntegration);
     jupyterIntegration.registerEnvApi(environments);
     const tensorboardIntegration = serviceContainer.get<TensorboardExtensionIntegration>(
         TensorboardExtensionIntegration,
     );
     const outputChannel = serviceContainer.get<ILanguageServerOutputChannel>(ILanguageServerOutputChannel);
+    const getActiveService = async <T>(identifier: ClassType<T>, initial: T): Promise<T> =>
+        (await activation?.getCurrent())?.serviceContainer.get(identifier) ?? initial;
+    const getJupyter = () => getActiveService(JupyterExtensionIntegration, jupyterIntegration);
+    const getTensorboard = () => getActiveService(TensorboardExtensionIntegration, tensorboardIntegration);
 
     const api: PythonExtension & {
         /**
@@ -121,10 +146,10 @@ export function buildApi(
             return Promise.reject(ex);
         }),
         jupyter: {
-            registerHooks: () => jupyterIntegration.integrateWithJupyterExtension(),
+            registerHooks: async () => (await getJupyter()).integrateWithJupyterExtension(getJupyter),
         },
         tensorboard: {
-            registerHooks: () => tensorboardIntegration.integrateWithTensorboardExtension(),
+            registerHooks: async () => (await getTensorboard()).integrateWithTensorboardExtension(getTensorboard),
         },
         debug: {
             async getRemoteLauncherCommand(

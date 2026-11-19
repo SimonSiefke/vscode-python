@@ -3,6 +3,7 @@
 
 import { expect, use } from 'chai';
 import * as chaiAsPromised from 'chai-as-promised';
+import { randomUUID } from 'crypto';
 import * as sinon from 'sinon';
 import { SemVer } from 'semver';
 import * as TypeMoq from 'typemoq';
@@ -216,7 +217,7 @@ suite('PythonEnvironment', () => {
     });
 
     test('a failed executable lookup can be retried with a live process service', async () => {
-        const command = 'python-after-process-service-shutdown-test';
+        const command = `python-after-process-service-shutdown-${randomUUID()}`;
         const newService = TypeMoq.Mock.ofType<IProcessService>(undefined, TypeMoq.MockBehavior.Strict);
         fileSystem.setup((f) => f.pathExists(command)).returns(() => Promise.resolve(false));
         processService

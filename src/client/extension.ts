@@ -25,7 +25,7 @@ initializeFileLogging(logDispose);
 // loading starts here
 
 import { ProgressLocation, ProgressOptions, window } from 'vscode';
-import { buildApi } from './api';
+import { ApiActivation, buildApi } from './api';
 import { IApplicationShell, IWorkspaceService } from './common/application/types';
 import { IDisposableRegistry, IExperimentService, IExtensionContext } from './common/types';
 import { createDeferred } from './common/utils/async';
@@ -55,13 +55,7 @@ durations.codeLoadingTime = stopWatch.elapsedTime;
 
 // These persist between activations:
 let activatedServiceContainer: IServiceContainer | undefined;
-let activeEnvironmentApi: PythonExtension['environments'] | undefined;
-let trustReactivation: Promise<void> | undefined;
-
-async function getActiveEnvironmentApi(): Promise<PythonExtension['environments'] | undefined> {
-    await trustReactivation;
-    return activeEnvironmentApi;
-}
+const apiActivation = new ApiActivation();
 
 /////////////////////////////
 // public functions
@@ -75,24 +69,15 @@ export async function activate(context: IExtensionContext): Promise<PythonExtens
         isFirstSession = context.globalState.get(GLOBAL_PERSISTENT_KEYS, []).length === 0;
         const workspaceService = new WorkspaceService();
         context.subscriptions.push(
-            workspaceService.onDidGrantWorkspaceTrust(async () => {
-                if (trustReactivation) {
-                    return trustReactivation;
-                }
-                // Publish the transition before deactivation can retire the previous resolver.
-                trustReactivation = Promise.resolve().then(async () => {
+            workspaceService.onDidGrantWorkspaceTrust(() =>
+                apiActivation.restart(async () => {
                     await deactivate();
                     await activate(context);
-                });
-                try {
-                    await trustReactivation;
-                } finally {
-                    trustReactivation = undefined;
-                }
-            }),
+                }),
+            ),
         );
         [api, ready, serviceContainer] = await activateUnsafe(context, stopWatch, durations);
-        activeEnvironmentApi = api.environments;
+        apiActivation.current = { environments: api.environments, serviceContainer };
     } catch (ex) {
         // We want to completely handle the error
         // before notifying VS Code.
@@ -108,7 +93,7 @@ export async function activate(context: IExtensionContext): Promise<PythonExtens
 }
 
 export async function deactivate(): Promise<void> {
-    activeEnvironmentApi = undefined;
+    apiActivation.current = undefined;
     // Make sure to shutdown anybody who needs it.
     if (activatedServiceContainer) {
         const disposables = activatedServiceContainer.get<IDisposableRegistry>(IDisposableRegistry);
@@ -189,7 +174,7 @@ async function activateUnsafe(
         ext.legacyIOC.serviceManager,
         ext.legacyIOC.serviceContainer,
         components.pythonEnvs,
-        getActiveEnvironmentApi,
+        apiActivation,
     );
     const proposedApi = buildProposedApi(components.pythonEnvs, ext.legacyIOC.serviceContainer);
     registerTools(context, components.pythonEnvs, api.environments, ext.legacyIOC.serviceContainer);
