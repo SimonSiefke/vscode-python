@@ -2,7 +2,7 @@
 // Licensed under the MIT License.
 
 import { ChildProcess, exec, execSync, spawn } from 'child_process';
-import { errorMonitor } from 'events';
+import { errorMonitor, EventEmitter } from 'events';
 import { Readable } from 'stream';
 import { Observable } from 'rxjs/Observable';
 import { IDisposable } from '../types';
@@ -23,6 +23,7 @@ function trackProcess(proc: ChildProcess, disposable: IDisposable, disposables?:
         return;
     }
 
+    const processEvents: EventEmitter = proc;
     const releaseIfStopped = () => {
         if (proc.pid && proc.exitCode === null && proc.signalCode === null) {
             return;
@@ -30,14 +31,14 @@ function trackProcess(proc: ChildProcess, disposable: IDisposable, disposables?:
         disposables.delete(disposable);
         proc.removeListener('exit', releaseIfStopped);
         proc.removeListener('close', releaseIfStopped);
-        proc.removeListener(errorMonitor, releaseIfStopped);
+        processEvents.removeListener(errorMonitor, releaseIfStopped);
     };
 
     disposables.add(disposable);
     proc.once('exit', releaseIfStopped);
     proc.once('close', releaseIfStopped);
     // Observe spawn failure without consuming errors from callers that use the raw process.
-    proc.on(errorMonitor, releaseIfStopped);
+    processEvents.on(errorMonitor, releaseIfStopped);
 }
 
 function stopProcess(proc: ChildProcess): void {
