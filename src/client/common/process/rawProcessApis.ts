@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
-import { exec, execSync, spawn } from 'child_process';
+import { ChildProcess, exec, execSync, spawn } from 'child_process';
 import { Readable } from 'stream';
 import { Observable } from 'rxjs/Observable';
 import { IDisposable } from '../types';
@@ -14,6 +14,19 @@ import { decodeBuffer } from './decoder';
 import { traceVerbose } from '../../logging';
 import { WorkspaceService } from '../application/workspace';
 import { ProcessLogger } from './logger';
+
+type ProcessTracker = (proc: ChildProcess, disposable: IDisposable) => void;
+
+function createProcessStopper(proc: ChildProcess): () => void {
+    let stopped = false;
+    return () => {
+        // A child can report an error or receive a signal before it exits.
+        if (!stopped && proc.pid && proc.exitCode === null && proc.signalCode === null) {
+            stopped = true;
+            killPid(proc.pid);
+        }
+    };
+}
 
 const PS_ERROR_SCREEN_BOGUS = /your [0-9]+x[0-9]+ screen size is bogus\. expect trouble/;
 
@@ -53,7 +66,7 @@ export function shellExec(
     command: string,
     options: ShellOptions & { doNotLog?: boolean } = {},
     defaultEnv?: EnvironmentVariables,
-    disposables?: Set<IDisposable>,
+    track?: ProcessTracker,
 ): Promise<ExecutionResult<string>> {
     const shellOptions = getDefaultOptions(options, defaultEnv);
     if (!options.doNotLog) {
@@ -75,32 +88,8 @@ export function shellExec(
                 resolve({ stderr: stderr && stderr.length > 0 ? stderr : undefined, stdout });
             }
         };
-        let procExited = false;
         const proc = exec(command, shellOptions, callback); // NOSONAR
-        proc.once('close', () => {
-            procExited = true;
-        });
-        proc.once('exit', () => {
-            procExited = true;
-        });
-        proc.once('error', () => {
-            procExited = true;
-        });
-        const disposable: IDisposable = {
-            dispose: () => {
-                // If process has not exited nor killed, force kill it.
-                if (!procExited && !proc.killed) {
-                    if (proc.pid) {
-                        killPid(proc.pid);
-                    } else {
-                        proc.kill();
-                    }
-                }
-            },
-        };
-        if (disposables) {
-            disposables.add(disposable);
-        }
+        track?.(proc, { dispose: createProcessStopper(proc) });
     });
 }
 
@@ -109,7 +98,7 @@ export function plainExec(
     args: string[],
     options: SpawnOptions & { doNotLog?: boolean } = {},
     defaultEnv?: EnvironmentVariables,
-    disposables?: Set<IDisposable>,
+    track?: ProcessTracker,
 ): Promise<ExecutionResult<string>> {
     const spawnOptions = getDefaultOptions(options, defaultEnv);
     const encoding = spawnOptions.encoding ? spawnOptions.encoding : 'utf8';
@@ -123,19 +112,8 @@ export function plainExec(
     proc.stdout?.on('error', noop);
     proc.stderr?.on('error', noop);
     const deferred = createDeferred<ExecutionResult<string>>();
-    const disposable: IDisposable = {
-        dispose: () => {
-            // If process has not exited nor killed, force kill it.
-            if (!proc.killed && !deferred.completed) {
-                if (proc.pid) {
-                    killPid(proc.pid);
-                } else {
-                    proc.kill();
-                }
-            }
-        },
-    };
-    disposables?.add(disposable);
+    const disposable = { dispose: createProcessStopper(proc) };
+    track?.(proc, disposable);
     const internalDisposables: IDisposable[] = [];
 
     // eslint-disable-next-line @typescript-eslint/ban-types
@@ -186,12 +164,10 @@ export function plainExec(
             deferred.resolve({ stdout, stderr });
         }
         internalDisposables.forEach((d) => d.dispose());
-        disposable.dispose();
     });
     proc.once('error', (ex) => {
         deferred.reject(ex);
         internalDisposables.forEach((d) => d.dispose());
-        disposable.dispose();
     });
 
     return deferred.promise;
@@ -216,7 +192,7 @@ export function execObservable(
     args: string[],
     options: SpawnOptions & { doNotLog?: boolean } = {},
     defaultEnv?: EnvironmentVariables,
-    disposables?: Set<IDisposable>,
+    track?: ProcessTracker,
 ): ObservableExecutionResult<string> {
     const spawnOptions = getDefaultOptions(options, defaultEnv);
     const encoding = spawnOptions.encoding ? spawnOptions.encoding : 'utf8';
@@ -225,18 +201,14 @@ export function execObservable(
         processLogger.logProcess(file, args, options);
     }
     const proc = spawn(file, args, spawnOptions);
-    let procExited = false;
-    const disposable: IDisposable = {
+    const stop = createProcessStopper(proc);
+    const disposable = {
         dispose() {
-            if (proc && proc.pid && !proc.killed && !procExited) {
-                killPid(proc.pid);
-            }
-            if (proc) {
-                proc.unref();
-            }
+            stop();
+            proc.unref();
         },
     };
-    disposables?.add(disposable);
+    track?.(proc, disposable);
 
     const output = new Observable<Output<string>>((subscriber) => {
         const internalDisposables: IDisposable[] = [];
@@ -250,18 +222,7 @@ export function execObservable(
         };
 
         if (options.token) {
-            internalDisposables.push(
-                options.token.onCancellationRequested(() => {
-                    if (!procExited && !proc.killed) {
-                        if (proc.pid) {
-                            killPid(proc.pid);
-                        } else {
-                            proc.kill();
-                        }
-                        procExited = true;
-                    }
-                }),
-            );
+            internalDisposables.push(options.token.onCancellationRequested(stop));
         }
 
         const sendOutput = (source: 'stdout' | 'stderr', data: Buffer) => {
@@ -281,17 +242,14 @@ export function execObservable(
         on(proc.stderr, 'data', (data: Buffer) => sendOutput('stderr', data));
 
         proc.once('close', () => {
-            procExited = true;
             subscriber.complete();
             internalDisposables.forEach((d) => d.dispose());
         });
         proc.once('exit', () => {
-            procExited = true;
             subscriber.complete();
             internalDisposables.forEach((d) => d.dispose());
         });
         proc.once('error', (ex) => {
-            procExited = true;
             subscriber.error(ex);
             internalDisposables.forEach((d) => d.dispose());
         });

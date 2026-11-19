@@ -14,6 +14,7 @@ import { Uri } from 'vscode';
 import { PythonSettings } from '../../../client/common/configSettings';
 import { ConfigurationService } from '../../../client/common/configuration/service';
 import { ProcessLogger } from '../../../client/common/process/logger';
+import { ProcessServiceShutdown } from '../../../client/common/process/proc';
 import { ProcessServiceFactory } from '../../../client/common/process/processFactory';
 import { PythonExecutionFactory } from '../../../client/common/process/pythonExecutionFactory';
 import {
@@ -22,7 +23,7 @@ import {
     IProcessServiceFactory,
     IPythonExecutionService,
 } from '../../../client/common/process/types';
-import { IConfigurationService, IDisposableRegistry, IInterpreterPathService } from '../../../client/common/types';
+import { IConfigurationService, IInterpreterPathService } from '../../../client/common/types';
 import { Architecture } from '../../../client/common/utils/platform';
 import { EnvironmentActivationService } from '../../../client/interpreter/activation/service';
 import { IEnvironmentActivationService } from '../../../client/interpreter/activation/types';
@@ -132,7 +133,9 @@ suite('Process - PythonExecutionFactory', () => {
                     // eslint-disable-next-line @typescript-eslint/no-explicit-any
                 } as any);
                 const serviceContainer = mock(ServiceContainer);
-                when(serviceContainer.get<IDisposableRegistry>(IDisposableRegistry)).thenReturn([]);
+                when(serviceContainer.get<ProcessServiceShutdown>(ProcessServiceShutdown)).thenReturn(
+                    new ProcessServiceShutdown([]),
+                );
                 when(serviceContainer.get<IProcessLogger>(IProcessLogger)).thenReturn(processLogger);
                 when(serviceContainer.get<IInterpreterService>(IInterpreterService)).thenReturn(
                     instance(interpreterService),

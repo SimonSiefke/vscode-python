@@ -8,8 +8,8 @@ import { IServiceContainer } from '../../ioc/types';
 import { sendTelemetryEvent } from '../../telemetry';
 import { EventName } from '../../telemetry/constants';
 import { IFileSystem } from '../platform/types';
-import { IConfigurationService, IDisposableRegistry, IInterpreterPathService } from '../types';
-import { ProcessService } from './proc';
+import { IConfigurationService, IInterpreterPathService } from '../types';
+import { ProcessService, ProcessServiceShutdown } from './proc';
 import { createCondaEnv, createPythonEnv, createMicrosoftStoreEnv, createPixiEnv } from './pythonEnvironment';
 import { createPythonProcessService } from './pythonProcess';
 import {
@@ -29,7 +29,7 @@ import { getPixi, getPixiEnvironmentFromInterpreter } from '../../pythonEnvironm
 
 @injectable()
 export class PythonExecutionFactory implements IPythonExecutionFactory {
-    private readonly disposables: IDisposableRegistry;
+    private readonly shutdown: ProcessServiceShutdown;
 
     private readonly logger: IProcessLogger;
 
@@ -45,7 +45,7 @@ export class PythonExecutionFactory implements IPythonExecutionFactory {
         @inject(IInterpreterPathService) private readonly interpreterPathExpHelper: IInterpreterPathService,
     ) {
         // Acquire other objects here so that if we are called during dispose they are available.
-        this.disposables = this.serviceContainer.get<IDisposableRegistry>(IDisposableRegistry);
+        this.shutdown = this.serviceContainer.get<ProcessServiceShutdown>(ProcessServiceShutdown);
         this.logger = this.serviceContainer.get<IProcessLogger>(IProcessLogger);
         this.fileSystem = this.serviceContainer.get<IFileSystem>(IFileSystem);
     }
@@ -120,7 +120,7 @@ export class PythonExecutionFactory implements IPythonExecutionFactory {
         const pythonPath = options.interpreter
             ? options.interpreter.path
             : this.configService.getSettings(options.resource).pythonPath;
-        const processService: IProcessService = new ProcessService({ ...envVars }, this.disposables);
+        const processService: IProcessService = new ProcessService({ ...envVars }, this.shutdown);
         processService.on('exec', this.logger.logProcess.bind(this.logger));
 
         if (await getPixi()) {
