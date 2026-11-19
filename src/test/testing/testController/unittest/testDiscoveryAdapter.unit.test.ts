@@ -84,7 +84,13 @@ suite('Unittest test discovery adapter', () => {
         };
 
         utilsStartDiscoveryNamedPipeStub = sinon.stub(util, 'startDiscoveryNamedPipe');
-        utilsStartDiscoveryNamedPipeStub.callsFake(() => Promise.resolve('discoveryResultPipe-mockName'));
+        utilsStartDiscoveryNamedPipeStub.callsFake(() =>
+            Promise.resolve({
+                pipeName: 'discoveryResultPipe-mockName',
+                dispose: sinon.stub(),
+                waitForClose: async () => undefined,
+            }),
+        );
         cancellationTokenSource = new CancellationTokenSource();
     });
     teardown(() => {

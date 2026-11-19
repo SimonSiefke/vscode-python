@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
-import { CancellationToken, TestController, Uri, MarkdownString } from 'vscode';
+import { CancellationToken, TestController, TestItem, Uri, MarkdownString } from 'vscode';
 import * as util from 'util';
 import { DiscoveredTestItem, DiscoveredTestNode, DiscoveredTestPayload } from './types';
 import { TestProvider } from '../../types';
@@ -95,6 +95,7 @@ export class TestDiscoveryHandler {
         token?: CancellationToken,
         projectId?: string,
         projectName?: string,
+        onRoot?: (root: TestItem) => void,
     ): number {
         if (!payload) {
             // No test data is available
@@ -106,7 +107,15 @@ export class TestDiscoveryHandler {
 
         // Check if there were any errors in the discovery process.
         if (rawTestData.status === 'error') {
-            this.createErrorNode(testController, workspaceUri, rawTestData.error, testProvider, projectId, projectName);
+            const error = this.createErrorNode(
+                testController,
+                workspaceUri,
+                rawTestData.error,
+                testProvider,
+                projectId,
+                projectName,
+            );
+            onRoot?.(error);
         } else {
             // remove error node only if no errors exist.
             const errorNodeId = projectId
@@ -141,6 +150,7 @@ export class TestDiscoveryHandler {
                 token,
                 projectId,
                 projectName,
+                onRoot,
             );
         }
 
@@ -157,7 +167,7 @@ export class TestDiscoveryHandler {
         testProvider: TestProvider,
         projectId?: string,
         projectName?: string,
-    ): void {
+    ): TestItem {
         const workspacePath = workspaceUri.fsPath;
         const testingErrorConst =
             testProvider === 'pytest' ? Testing.errorPytestDiscovery : Testing.errorUnittestDiscovery;
@@ -208,5 +218,6 @@ export class TestDiscoveryHandler {
         );
         errorNodeLabel.isTrusted = true;
         errorNode.error = errorNodeLabel;
+        return errorNode;
     }
 }

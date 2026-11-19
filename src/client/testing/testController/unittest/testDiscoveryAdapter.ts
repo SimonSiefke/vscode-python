@@ -55,16 +55,17 @@ export class UnittestTestDiscoveryAdapter implements ITestDiscoveryAdapter {
         project?: ProjectAdapter,
     ): Promise<void> {
         // Setup discovery pipe and cancellation
-        const {
-            pipeName: discoveryPipeName,
-            cancellation: discoveryPipeCancellation,
-            tokenDisposable,
-        } = await setupDiscoveryPipe(this.resultResolver, token, uri);
+        const { pipe, cancellation: discoveryPipeCancellation, tokenDisposable } = await setupDiscoveryPipe(
+            this.resultResolver,
+            token,
+            uri,
+        );
 
         // Setup process handlers deferred (used by both execution paths)
         const deferredTillExecClose = createTestingDeferred();
 
         // Collect all disposables for cleanup in finally block
+        let launched = false;
         const disposables: Disposable[] = [];
         if (tokenDisposable) {
             disposables.push(tokenDisposable);
@@ -78,7 +79,7 @@ export class UnittestTestDiscoveryAdapter implements ITestDiscoveryAdapter {
             traceVerbose(`Running unittest discovery with command: ${execArgs.join(' ')} for workspace ${uri.fsPath}.`);
 
             // Configure subprocess environment
-            const mutableEnv = await configureDiscoveryEnv(this.envVarsService, uri, discoveryPipeName);
+            const mutableEnv = await configureDiscoveryEnv(this.envVarsService, uri, pipe.pipeName);
 
             // Set PROJECT_ROOT_PATH for project-based testing (tells Python where to root the test tree)
             if (project) {
@@ -109,6 +110,7 @@ export class UnittestTestDiscoveryAdapter implements ITestDiscoveryAdapter {
                     args: execArgs,
                     env: (mutableEnv as unknown) as { [key: string]: string },
                 });
+                launched = true;
                 traceInfo(`Started unittest discovery subprocess (environment extension) for workspace ${uri.fsPath}`);
 
                 // Wire up cancellation and process events
@@ -176,6 +178,7 @@ export class UnittestTestDiscoveryAdapter implements ITestDiscoveryAdapter {
             try {
                 const result = execService.execObservable(execArgs, spawnOptions);
                 resultProc = result?.proc;
+                launched = resultProc !== undefined;
 
                 if (!resultProc) {
                     traceError(`Failed to spawn unittest discovery subprocess for workspace ${uri.fsPath}`);
@@ -191,7 +194,10 @@ export class UnittestTestDiscoveryAdapter implements ITestDiscoveryAdapter {
             resultProc.stdout?.on('data', handlers.onStdout);
             resultProc.stderr?.on('data', handlers.onStderr);
             resultProc.on('exit', handlers.onExit);
-            resultProc.on('close', handlers.onClose);
+            resultProc.once('error', (error) => {
+                traceError(`Could not start Python test discovery in ${cwd}`, error);
+            });
+            resultProc.once('close', handlers.onClose);
 
             traceVerbose(`Waiting for unittest discovery subprocess to complete for workspace ${uri.fsPath}`);
             await deferredTillExecClose.promise;
@@ -202,6 +208,10 @@ export class UnittestTestDiscoveryAdapter implements ITestDiscoveryAdapter {
             throw error;
         } finally {
             traceVerbose(`Cleaning up unittest discovery resources for workspace ${uri.fsPath}`);
+            if (launched && !token?.isCancellationRequested) {
+                await pipe.waitForClose();
+            }
+            pipe.dispose();
             // Dispose all cancellation handlers and event subscriptions
             disposables.forEach((d) => d.dispose());
             // Dispose the discovery pipe cancellation token

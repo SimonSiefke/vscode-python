@@ -111,11 +111,22 @@ export async function writeTestIdsFile(testIds: string[]): Promise<string> {
     return tempFileName;
 }
 
+export async function removeTestIdsFile(fileName: string | undefined): Promise<void> {
+    if (fileName) {
+        await fs.promises.rm(fileName, { force: true }).catch((error) => {
+            traceError('Failed to remove test IDs file:', error);
+        });
+    }
+}
+
+export type TestPipe = Disposable & { readonly pipeName: string };
+
 export async function startRunResultNamedPipe(
     dataReceivedCallback: (payload: ExecutionTestPayload) => void,
     deferredTillServerClose: Deferred<void>,
     cancellationToken?: CancellationToken,
-): Promise<string> {
+    abortToken?: CancellationToken,
+): Promise<TestPipe> {
     traceVerbose('Starting Test Result named pipe');
     const pipeName: string = generateRandomPipeName('python-test-results');
 
@@ -146,8 +157,13 @@ export async function startRunResultNamedPipe(
             traceError(`Test Results named pipe ${pipeName} error:`, error);
         }),
     );
+    if (abortToken?.isCancellationRequested) {
+        disposable.dispose();
+    } else if (abortToken) {
+        disposables.push(abortToken.onCancellationRequested(() => disposable.dispose()));
+    }
 
-    return pipeName;
+    return { pipeName, dispose: () => disposable.dispose() };
 }
 
 interface DiscoveryResultMessage extends Message {
@@ -157,7 +173,7 @@ interface DiscoveryResultMessage extends Message {
 export async function startDiscoveryNamedPipe(
     callback: (payload: DiscoveredTestPayload) => void,
     cancellationToken?: CancellationToken,
-): Promise<string> {
+): Promise<TestPipe & { waitForClose: () => Promise<void> }> {
     traceVerbose('Starting Test Discovery named pipe');
     // const pipeName: string = '/Users/eleanorboyd/testingFiles/inc_dec_example/temp33.txt';
     const pipeName: string = generateRandomPipeName('python-test-discovery');
@@ -165,10 +181,12 @@ export async function startDiscoveryNamedPipe(
 
     traceVerbose(`Test Discovery named pipe ${pipeName} connected`);
     let disposables: Disposable[] = [];
+    const closed = createDeferred<void>();
     const disposable = new Disposable(() => {
         traceVerbose(`Test Discovery named pipe ${pipeName} disposed`);
         disposables.forEach((d) => d.dispose());
         disposables = [];
+        closed.resolve();
     });
 
     if (cancellationToken) {
@@ -194,7 +212,11 @@ export async function startDiscoveryNamedPipe(
             traceError(`Test Discovery named pipe ${pipeName} error:`, error);
         }),
     );
-    return pipeName;
+    return {
+        pipeName,
+        dispose: () => disposable.dispose(),
+        waitForClose: () => awaitDeferredWithTimeout(closed, RESULT_PIPE_DRAIN_TIMEOUT_MS),
+    };
 }
 
 /**
@@ -257,6 +279,7 @@ export function populateTestTree(
     token?: CancellationToken,
     projectId?: string,
     projectName?: string,
+    onRoot?: (root: TestItem) => void,
 ): number {
     // Count leaf tests while walking the tree so telemetry does not need a second traversal.
     let testCount = 0;
@@ -273,6 +296,7 @@ export function populateTestTree(
         testRoot.tags = [RunTestTag, DebugTestTag];
 
         testController.items.add(testRoot);
+        onRoot?.(testRoot);
     }
 
     // Recursively populate the tree with test data.

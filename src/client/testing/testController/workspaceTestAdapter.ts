@@ -2,7 +2,15 @@
 // Licensed under the MIT License.
 
 import * as util from 'util';
-import { CancellationToken, TestController, TestItem, TestRun, TestRunProfileKind, Uri } from 'vscode';
+import {
+    CancellationToken,
+    CancellationTokenSource,
+    TestController,
+    TestItem,
+    TestRun,
+    TestRunProfileKind,
+    Uri,
+} from 'vscode';
 import { createDeferred, Deferred } from '../../common/utils/async';
 import { Testing } from '../../common/utils/localize';
 import { StopWatch } from '../../common/utils/stopWatch';
@@ -34,13 +42,26 @@ export class WorkspaceTestAdapter {
 
     private executing: Deferred<void> | undefined;
 
+    private disposed = false;
+
+    private discoveryCancellation?: CancellationTokenSource;
+
+    private executionCancellation?: CancellationTokenSource;
+
     constructor(
         private testProvider: TestProvider,
         private discoveryAdapter: ITestDiscoveryAdapter,
         private executionAdapter: ITestExecutionAdapter,
         private workspaceUri: Uri,
         public resultResolver: ITestResultResolver,
+        private readonly onRoot?: (root: TestItem) => void,
     ) {}
+
+    public dispose(): void {
+        this.disposed = true;
+        this.discoveryCancellation?.cancel();
+        this.executionCancellation?.cancel();
+    }
 
     public async executeTests(
         testController: TestController,
@@ -53,6 +74,9 @@ export class WorkspaceTestAdapter {
         interpreter?: PythonEnvironment,
         project?: ProjectAdapter,
     ): Promise<void> {
+        if (this.disposed || token?.isCancellationRequested || runInstance.token?.isCancellationRequested) {
+            return;
+        }
         if (this.executing) {
             traceError('Test execution already in progress, not starting a new one.');
             return this.executing.promise;
@@ -60,6 +84,9 @@ export class WorkspaceTestAdapter {
 
         const deferred = createDeferred<void>();
         this.executing = deferred;
+        const cancellation = new CancellationTokenSource();
+        this.executionCancellation = cancellation;
+        const parentCancellation = runInstance.token?.onCancellationRequested(() => cancellation.cancel());
 
         const testCaseNodes: TestItem[] = [];
         const testCaseIdsSet = new Set<string>();
@@ -69,15 +96,19 @@ export class WorkspaceTestAdapter {
                 const nodes = getTestCaseNodes(t);
                 testCaseNodes.push(...nodes);
             });
-            // iterate through testItems nodes and fetch their unittest runID to pass in as argument
+            // Only start test items that map to this adapter's discovery results.
             testCaseNodes.forEach((node) => {
-                runInstance.started(node); // do the vscode ui test item start here before runtest
                 const runId = this.resultResolver.vsIdToRunId.get(node.id);
                 if (runId) {
+                    runInstance.started(node);
                     testCaseIdsSet.add(runId);
                 }
             });
             const testCaseIds = Array.from(testCaseIdsSet);
+            if (testCaseIds.length === 0) {
+                deferred.resolve();
+                return;
+            }
             if (executionFactory === undefined) {
                 throw new Error('Execution factory is required for test execution');
             }
@@ -90,9 +121,13 @@ export class WorkspaceTestAdapter {
                 debugLauncher,
                 interpreter,
                 project,
+                cancellation.token,
             );
             deferred.resolve();
         } catch (ex) {
+            if (this.disposed) {
+                return deferred.resolve();
+            }
             // handle token and telemetry here
             sendTelemetryEvent(EventName.UNITTEST_RUN_ALL_FAILED, undefined);
 
@@ -105,14 +140,14 @@ export class WorkspaceTestAdapter {
             traceError(`${cancel}\r\n`, ex);
 
             // Also report on the test view
-            const message = util.format(`${cancel} ${Testing.seePythonOutput}\r\n`, ex);
-            const options = buildErrorNodeOptions(this.workspaceUri, message, this.testProvider);
-            const errorNode = createErrorTestItem(testController, options);
-            testController.items.add(errorNode);
+            this.reportError(testController, cancel, ex);
 
             deferred.reject(ex as Error);
         } finally {
             this.executing = undefined;
+            this.executionCancellation = undefined;
+            parentCancellation?.dispose();
+            cancellation.dispose();
         }
 
         return Promise.resolve();
@@ -125,6 +160,9 @@ export class WorkspaceTestAdapter {
         interpreter?: PythonEnvironment,
         trigger?: DiscoveryTriggerKind,
     ): Promise<void> {
+        if (this.disposed || token?.isCancellationRequested) {
+            return;
+        }
         sendTelemetryEvent(EventName.UNITTEST_DISCOVERING, undefined, { tool: this.testProvider });
 
         // Discovery is expensive. If it is already running, use the existing promise.
@@ -135,6 +173,9 @@ export class WorkspaceTestAdapter {
 
         const deferred = createDeferred<void>();
         this.discovering = deferred;
+        const cancellation = new CancellationTokenSource();
+        this.discoveryCancellation = cancellation;
+        const parentCancellation = token?.onCancellationRequested(() => cancellation.cancel());
         const stopWatch = new StopWatch();
 
         // Hand the resolver per-cycle context so resolveDiscovery can report
@@ -149,9 +190,17 @@ export class WorkspaceTestAdapter {
             if (executionFactory === undefined) {
                 throw new Error('Execution factory is required for test discovery');
             }
-            await this.discoveryAdapter.discoverTests(this.workspaceUri, executionFactory, token, interpreter);
+            await this.discoveryAdapter.discoverTests(
+                this.workspaceUri,
+                executionFactory,
+                cancellation.token,
+                interpreter,
+            );
             deferred.resolve();
         } catch (ex) {
+            if (this.disposed) {
+                return deferred.resolve();
+            }
             const cycle = (this.resultResolver as Partial<PythonResultResolver>).discoveryTelemetry?.complete();
             sendTelemetryEvent(
                 EventName.UNITTEST_DISCOVERY_DONE,
@@ -175,21 +224,32 @@ export class WorkspaceTestAdapter {
             traceError(`${cancel} for workspace: ${this.workspaceUri} \r\n`, ex);
 
             // Report also on the test view.
-            const message = util.format(`${cancel} ${Testing.seePythonOutput}\r\n`, ex);
-            const options = buildErrorNodeOptions(this.workspaceUri, message, this.testProvider);
-            const errorNode = createErrorTestItem(testController, options);
-            testController.items.add(errorNode);
+            this.reportError(testController, cancel, ex);
 
             return deferred.reject(ex as Error);
         } finally {
             // Discovery has finished running, we have the data,
             // we don't need the deferred promise anymore.
             this.discovering = undefined;
+            this.discoveryCancellation = undefined;
+            parentCancellation?.dispose();
+            cancellation.dispose();
         }
 
         // Success path: resolveDiscovery (called by the adapter) already emitted
         // UNITTEST_DISCOVERY_DONE with the per-cycle context. Nothing extra to do here.
         return Promise.resolve();
+    }
+
+    private reportError(testController: TestController, label: string, error: unknown): void {
+        if (this.disposed) {
+            return;
+        }
+        const message = util.format(`${label} ${Testing.seePythonOutput}\r\n`, error);
+        const options = buildErrorNodeOptions(this.workspaceUri, message, this.testProvider);
+        const node = createErrorTestItem(testController, options);
+        testController.items.add(node);
+        this.onRoot?.(node);
     }
 
     /**

@@ -12,14 +12,17 @@ import {
     DataCallback,
 } from 'vscode-jsonrpc';
 import { Message } from 'vscode-jsonrpc';
+import { SocketMessageReader } from 'vscode-jsonrpc/node';
 import {
     writeTestIdsFile,
     populateTestTree,
+    startDiscoveryNamedPipe,
     startRunResultNamedPipe,
     awaitDeferredWithTimeout,
 } from '../../../client/testing/testController/common/utils';
 import { createDeferred, Deferred } from '../../../client/common/utils/async';
 import * as namedPipes from '../../../client/common/pipes/namedPipes';
+import * as platform from '../../../client/common/utils/platform';
 import { EXTENSION_ROOT_DIR } from '../../../client/constants';
 import {
     DiscoveredTestNode,
@@ -770,6 +773,88 @@ suite('populateTestTree tests', () => {
     });
 });
 
+suite('Discovery pipe lifetime', () => {
+    test('owned readers deliver complete frames without retaining a timeout for partial frames', async function () {
+        if (process.platform !== 'linux') {
+            this.skip();
+        }
+        const pipeName = namedPipes.generateRandomPipeName('python-test-frame');
+        const reader = (await namedPipes.createReaderPipe(pipeName)) as SocketMessageReader;
+        const received = createDeferred<Message>();
+        const subscription = reader.listen((message) => received.resolve(message));
+        const errors = reader.onError((error) => received.reject(error));
+        const sample = { jsonrpc: '2.0', method: 'ready' };
+        const body = JSON.stringify(sample);
+        try {
+            assert.strictEqual(reader.partialMessageTimeout, 0);
+            await fs.promises.writeFile(
+                pipeName,
+                `Content-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}Content-Length: 10\r\n\r\n{`,
+            );
+            assert.deepStrictEqual(await received.promise, sample);
+        } finally {
+            subscription.dispose();
+            errors.dispose();
+            reader.dispose();
+            await fs.promises.unlink(pipeName);
+        }
+    });
+
+    test('disposing a server-backed reader stops accepting connections before a writer connects', async function () {
+        if (process.platform === 'win32') {
+            this.skip();
+        }
+        const pipeName = namedPipes.generateRandomPipeName('python-test-server');
+        const isWindows = sinon.stub(platform, 'isWindows').returns(true);
+        try {
+            const reader = await namedPipes.createReaderPipe(pipeName);
+            try {
+                await fs.promises.access(pipeName);
+            } finally {
+                reader.dispose();
+            }
+            await assert.rejects(fs.promises.access(pipeName), { code: 'ENOENT' });
+        } finally {
+            isWindows.restore();
+        }
+    });
+
+    test('cancelling discovery closes a Linux FIFO before a writer connects', async function () {
+        if (process.platform !== 'linux') {
+            this.skip();
+        }
+        const cancellation = new CancellationTokenSource();
+        const pipe = await startDiscoveryNamedPipe(
+            () => assert.fail('No writer should publish data'),
+            cancellation.token,
+        );
+        const target = await fs.promises.realpath(pipe.pipeName);
+        const openDescriptor = async () => {
+            const descriptors = await fs.promises.readdir('/proc/self/fd');
+            const paths = await Promise.all(
+                descriptors.map((descriptor) => fs.promises.readlink(`/proc/self/fd/${descriptor}`).catch(() => '')),
+            );
+            return paths.includes(target);
+        };
+        try {
+            assert.ok(await openDescriptor(), 'FIFO reader is open before cancellation');
+            cancellation.cancel();
+            const deadline = Date.now() + 2000;
+            while (Date.now() < deadline) {
+                // eslint-disable-next-line no-await-in-loop
+                if (!(await openDescriptor())) {
+                    return;
+                }
+            }
+            assert.fail('FIFO reader is still open after cancellation');
+        } finally {
+            cancellation.dispose();
+            pipe.dispose();
+            await fs.promises.unlink(pipe.pipeName);
+        }
+    });
+});
+
 suite('startRunResultNamedPipe drain-on-cancel tests', () => {
     let sandbox: sinon.SinonSandbox;
     let createReaderPipeStub: sinon.SinonStub;
@@ -841,6 +926,25 @@ suite('startRunResultNamedPipe drain-on-cancel tests', () => {
         };
         return ({ jsonrpc: '2.0', params: full } as unknown) as Message;
     }
+
+    test('retiring a workspace closes its result reader even when no writer has connected', async () => {
+        const reader = new FakeMessageReader();
+        sandbox.stub(namedPipes, 'createReaderPipe').resolves(reader);
+        const close = createDeferred<void>();
+        const workspace = new CancellationTokenSource();
+        const receive = sandbox.spy();
+        try {
+            await startRunResultNamedPipe(receive, close, undefined, workspace.token);
+            assert.ok(reader.hasListener());
+            workspace.cancel();
+            assert.ok(reader.disposed);
+            assert.ok(close.completed);
+            reader.emit(makeMessage({ cwd: '/removed' }));
+            sinon.assert.notCalled(receive);
+        } finally {
+            workspace.dispose();
+        }
+    });
 
     test('cancellation alone does NOT resolve deferredTillServerClose and does NOT detach the listener (drain not interrupted)', async () => {
         const reader = new FakeMessageReader();

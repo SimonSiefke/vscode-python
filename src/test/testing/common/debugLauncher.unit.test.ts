@@ -110,6 +110,7 @@ suite('Unit Tests - Debug Launcher', () => {
         _workspaceFolder: WorkspaceFolder,
         expected: DebugConfiguration,
         testProvider: TestProvider,
+        startSession?: (session: DebugSession, notify: (session: DebugSession) => void) => void,
     ) {
         interpreterService
             .setup((i) => i.getActiveInterpreter(TypeMoq.It.isAny()))
@@ -141,10 +142,16 @@ suite('Unit Tests - Debug Launcher', () => {
             .returns((callback) => {
                 deferred.promise.then(() => {
                     if (capturedConfig) {
-                        callback(({
+                        const session = ({
                             id: 'test-session-id',
                             configuration: capturedConfig,
-                        } as unknown) as DebugSession);
+                            customRequest: sinon.stub().resolves(),
+                        } as unknown) as DebugSession;
+                        if (startSession) {
+                            startSession(session, callback);
+                        } else {
+                            callback(session);
+                        }
                     }
                 });
                 return { dispose: () => {} };
@@ -211,6 +218,7 @@ suite('Unit Tests - Debug Launcher', () => {
         testProvider: TestProvider,
         expected?: DebugConfiguration,
         debugConfigs?: string | DebugConfiguration[],
+        startSession?: (session: DebugSession, notify: (session: DebugSession) => void) => void,
     ) {
         const testLaunchScript = getTestLauncherScript(testProvider, false);
 
@@ -279,10 +287,52 @@ suite('Unit Tests - Debug Launcher', () => {
             expected.debugOptions.push(DebugOptions.FixFilePathCase);
         }
 
-        setupDebugManager(workspaceFolders[0], expected, testProvider);
+        setupDebugManager(workspaceFolders[0], expected, testProvider, startSession);
     }
 
     const testProviders: TestProvider[] = ['pytest', 'unittest'];
+
+    for (const cancelBeforeStart of [false, true]) {
+        test(`workspace cancellation ${
+            cancelBeforeStart ? 'before' : 'after'
+        } the start event disconnects only its adapter`, async () => {
+            const cancellation = new CancellationTokenSource();
+            const options: LaunchOptions = {
+                cwd: 'one/two/three',
+                args: ['/one/two/three/testfile.py'],
+                testProvider: 'unittest',
+                runTestIdsPort: 'runTestIdsPort',
+                pytestPort: 'pytestPort',
+                token: cancellation.token,
+                stopOnCancellation: true,
+            };
+            let disconnect: sinon.SinonStub | undefined;
+            const unrelated = sinon.stub().resolves();
+            setupSuccess(options, 'unittest', undefined, undefined, (session, notify) => {
+                disconnect = session.customRequest as sinon.SinonStub;
+                if (cancelBeforeStart) {
+                    cancellation.cancel();
+                    notify({
+                        ...session,
+                        id: 'unrelated',
+                        configuration: { name: 'unrelated', type: 'debugpy', request: 'launch' },
+                        customRequest: unrelated,
+                    });
+                }
+                notify(session);
+                if (!cancelBeforeStart) {
+                    cancellation.cancel();
+                }
+            });
+            try {
+                await debugLauncher.launchDebugger(options);
+                sinon.assert.calledOnceWithExactly(disconnect!, 'disconnect', { terminateDebuggee: true });
+                sinon.assert.notCalled(unrelated);
+            } finally {
+                cancellation.dispose();
+            }
+        });
+    }
 
     testProviders.forEach((testProvider) => {
         const testTitleSuffix = `(Test Framework '${testProvider}')`;

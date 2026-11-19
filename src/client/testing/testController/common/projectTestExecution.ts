@@ -11,6 +11,7 @@ import { IPythonExecutionFactory } from '../../../common/process/types';
 import { ITestDebugLauncher } from '../../common/types';
 import { ProjectAdapter } from './projectAdapter';
 import { TestProjectRegistry } from './testProjectRegistry';
+import { TestCoverageHandler } from './testCoverageHandler';
 import { getProjectId } from './projectUtils';
 import { getEnvExtApi, useEnvExtension } from '../../../envExt/api.internal';
 import { isParentPath } from '../../../pythonEnvironments/common/externalDependencies';
@@ -301,6 +302,10 @@ export function setupCoverageForProjects(request: TestRunRequest, projects: Proj
             fileCoverage,
             _token,
         ): Thenable<FileCoverageDetail[]> => {
+            const reportDetails = TestCoverageHandler.getDetailedCoverage(fileCoverage);
+            if (reportDetails) {
+                return Promise.resolve(reportDetails);
+            }
             const filePath = fileCoverage.uri.fsPath;
             // Find the project that has coverage data for this file
             for (const project of projects) {

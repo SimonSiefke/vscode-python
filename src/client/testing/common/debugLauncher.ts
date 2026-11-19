@@ -69,23 +69,16 @@ export class DebugLauncher implements ITestDebugLauncher {
             return deferred.promise;
         }
 
-        // Listen for cancellation from the test run (e.g., user clicks stop in Test Explorer)
-        // This allows the caller to clean up resources even if the debug session is still running
-        if (options.token) {
-            disposables.push(
-                options.token.onCancellationRequested(() => {
-                    deferred.resolve();
-                    callCallbackOnce();
-                }),
-            );
-        }
-
         const workspaceFolder = DebugLauncher.resolveWorkspaceFolder(options.cwd);
         const launchArgs = await this.getLaunchArgs(
             options,
             workspaceFolder,
             this.configService.getSettings(workspaceFolder.uri),
         );
+        if (options.token?.isCancellationRequested) {
+            callCallbackOnce();
+            return;
+        }
         const debugManager = this.serviceContainer.get<IDebugService>(IDebugService);
 
         // Unique marker to identify this session among concurrent debug sessions
@@ -93,6 +86,29 @@ export class DebugLauncher implements ITestDebugLauncher {
         launchArgs[TEST_SESSION_MARKER_KEY] = sessionMarker;
 
         let ourSession: DebugSession | undefined;
+        const stopSession = (session: DebugSession) => {
+            // Stopping through VS Code would cancel the TestRun shared by the other folders.
+            session.customRequest('disconnect', { terminateDebuggee: true }).then(undefined, (error) => {
+                traceError('Error stopping test debug session', error);
+                callCallbackOnce();
+                deferred.resolve();
+            });
+        };
+
+        if (options.token) {
+            disposables.push(
+                options.token.onCancellationRequested(() => {
+                    if (options.stopOnCancellation) {
+                        if (ourSession) {
+                            stopSession(ourSession);
+                        }
+                    } else {
+                        deferred.resolve();
+                        callCallbackOnce();
+                    }
+                }),
+            );
+        }
 
         // Capture our specific debug session when it starts by matching the marker.
         // This fires for ALL debug sessions, so we filter to only our marker.
@@ -101,6 +117,9 @@ export class DebugLauncher implements ITestDebugLauncher {
                 if (session.configuration[TEST_SESSION_MARKER_KEY] === sessionMarker) {
                     ourSession = session;
                     traceVerbose(`[test-debug] Debug session started: ${session.name} (${session.id})`);
+                    if (options.stopOnCancellation && options.token?.isCancellationRequested) {
+                        stopSession(session);
+                    }
                 }
             }),
         );
