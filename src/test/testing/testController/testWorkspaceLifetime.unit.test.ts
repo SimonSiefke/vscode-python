@@ -32,6 +32,8 @@ import * as envExtApi from '../../../client/envExt/api.internal';
 import {
     DidChangeEnvironmentEventArgs,
     DidChangePythonProjectsEventArgs,
+    PythonEnvironment,
+    PythonEnvironmentApi,
     PythonProject,
 } from '../../../client/envExt/types';
 import { IInterpreterService } from '../../../client/interpreter/contracts';
@@ -391,14 +393,27 @@ suite('Test workspace lifetime', () => {
         const projects = new EventEmitter<DidChangePythonProjectsEventArgs>();
         const environments = new EventEmitter<DidChangeEnvironmentEventArgs>();
         events.push(projects, environments);
-        const project = { uri: Uri.file('/workspace/later'), name: 'later' } as PythonProject;
-        (envExtApi.useEnvExtension as sinon.SinonStub).returns(true);
-        sinon.stub(envExtApi, 'getEnvExtApi').resolves({
+        const project: PythonProject = { uri: Uri.file('/workspace/later'), name: 'later' };
+        const environmentRoot = Uri.joinPath(project.uri, '.venv');
+        const executable = Uri.joinPath(environmentRoot, 'bin', 'python');
+        const environment: PythonEnvironment = {
+            name: '.venv',
+            displayName: 'Python 3.12 (.venv)',
+            displayPath: executable.fsPath,
+            version: '3.12',
+            environmentPath: environmentRoot,
+            sysPrefix: environmentRoot.fsPath,
+            execInfo: { run: { executable: executable.fsPath } },
+            envId: { id: 'later-venv', managerId: 'test' },
+        };
+        const api: Partial<PythonEnvironmentApi> = {
             getPythonProjects: () => [project],
-            getEnvironment: async () => ({ version: '3.12' }),
+            getEnvironment: async () => environment,
             onDidChangePythonProjects: projects.event,
             onDidChangeEnvironment: environments.event,
-        } as Awaited<ReturnType<typeof envExtApi.getEnvExtApi>>);
+        };
+        (envExtApi.useEnvExtension as sinon.SinonStub).returns(true);
+        sinon.stub(envExtApi, 'getEnvExtApi').resolves(api as PythonEnvironmentApi);
         add('startup');
         await controller.activate();
         const later = add('later');
