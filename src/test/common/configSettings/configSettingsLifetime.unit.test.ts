@@ -4,10 +4,11 @@
 import * as assert from 'assert';
 import * as sinon from 'sinon';
 import * as TypeMoq from 'typemoq';
-import { Disposable, Event, Uri, WorkspaceFolder, WorkspaceFoldersChangeEvent } from 'vscode';
+import { Disposable, Event, Uri, WorkspaceConfiguration, WorkspaceFolder, WorkspaceFoldersChangeEvent } from 'vscode';
 import { IWorkspaceService } from '../../../client/common/application/types';
 import { PythonSettings } from '../../../client/common/configSettings';
 import { IInterpreterPathService } from '../../../client/common/types';
+import * as EnvFileTelemetry from '../../../client/telemetry/envFileTelemetry';
 import { MockAutoSelectionService } from '../../mocks/autoSelector';
 import { MockExtensions } from '../../mocks/extensions';
 
@@ -55,7 +56,7 @@ suite('Python settings workspace lifetime', () => {
         changed.fire({ added: [], removed });
     };
     const assertListenerCount = (count: number) => {
-        assert.strictEqual(changed.listeners.size, count);
+        assert.strictEqual(changed.listeners.size, 1);
         assert.strictEqual(configuration.listeners.size, count);
         assert.strictEqual(interpreter.listeners.size, count);
         assert.strictEqual(autoSelection.listeners.size, count);
@@ -85,6 +86,10 @@ suite('Python settings workspace lifetime', () => {
     teardown(() => {
         PythonSettings.dispose();
         sinon.restore();
+        assert.strictEqual(changed.listeners.size, 0);
+        assert.strictEqual(configuration.listeners.size, 0);
+        assert.strictEqual(interpreter.listeners.size, 0);
+        assert.strictEqual(autoSelection.listeners.size, 0);
     });
 
     test('removing a folder disposes its settings once and removes its listeners', () => {
@@ -152,16 +157,84 @@ suite('Python settings workspace lifetime', () => {
         remove(removedFolder);
         restore.dispose();
         assert.deepStrictEqual(folders, [retainedFolder, removedFolder]);
+        assert.strictEqual(disposed.callCount, 1);
+
+        const provisional = create(removedFolder.uri);
+        assert.notStrictEqual(provisional, old);
+        assert.notStrictEqual(provisional, create(removedFolder.uri));
+        assertListenerCount(1);
+
         // VS Code rolls back a rejected provisional update without another workspace event.
         folders = [retainedFolder];
-
-        assert.strictEqual(disposed.callCount, 1);
+        const other = folder('other', 1);
+        folders.push(other);
+        changed.fire({ added: [other], removed: [] });
         assert.strictEqual(create(retainedFolder.uri), retained);
         assertListenerCount(1);
+        remove(other);
+
         folders.push(removedFolder);
         changed.fire({ added: [removedFolder], removed: [] });
-        assert.notStrictEqual(create(removedFolder.uri), old);
+        const confirmed = create(removedFolder.uri);
+        assert.notStrictEqual(confirmed, old);
+        assert.notStrictEqual(confirmed, provisional);
+        assert.strictEqual(create(removedFolder.uri), confirmed);
         assertListenerCount(2);
+    });
+
+    test('reading an optimistic folder before URI normalization leaves no subscriptions behind', () => {
+        const retained = create(retainedFolder.uri);
+        sinon.stub(EnvFileTelemetry, 'sendSettingTelemetry');
+        const optimisticFolder = folder('normalized/', 2);
+        const confirmedFolder = folder('normalized', 2);
+        assert.notStrictEqual(confirmedFolder.uri.toString(), optimisticFolder.uri.toString());
+        const configuration = TypeMoq.Mock.ofType<WorkspaceConfiguration>();
+        configuration.setup((value) => value.get('envFile')).returns(() => 'provisional.env');
+        workspace
+            .setup((value) => value.getConfiguration('python', optimisticFolder.uri))
+            .returns(() => configuration.object);
+        pathService.setup((value) => value.get(optimisticFolder.uri)).returns(() => 'python');
+
+        folders.push(optimisticFolder);
+        const optimistic = create(optimisticFolder.uri);
+        assert.strictEqual(optimistic.envFile, 'provisional.env');
+        assertListenerCount(1);
+
+        folders[2] = confirmedFolder;
+        changed.fire({ added: [confirmedFolder], removed: [] });
+        const confirmed = create(confirmedFolder.uri);
+        assert.notStrictEqual(confirmed, optimistic);
+        assert.strictEqual(create(confirmedFolder.uri), confirmed);
+        assertListenerCount(2);
+
+        remove(confirmedFolder);
+        assert.strictEqual(create(retainedFolder.uri), retained);
+        assertListenerCount(1);
+    });
+
+    test('refreshing settings registration disposes old owners and keeps tracking folder changes', () => {
+        const retained = create(retainedFolder.uri);
+        const removed = create(removedFolder.uri);
+        const retainedDisposed = sinon.spy(retained, 'dispose');
+        const removedDisposed = sinon.spy(removed, 'dispose');
+        assertListenerCount(2);
+
+        retained.register();
+
+        assert.strictEqual(retainedDisposed.callCount, 1);
+        assert.strictEqual(removedDisposed.callCount, 1);
+        assertListenerCount(0);
+        const freshRetained = create(retainedFolder.uri);
+        const freshRemoved = create(removedFolder.uri);
+        assert.notStrictEqual(freshRetained, retained);
+        assert.notStrictEqual(freshRemoved, removed);
+        const freshRemovedDisposed = sinon.spy(freshRemoved, 'dispose');
+        assertListenerCount(2);
+
+        remove(removedFolder);
+        assert.strictEqual(freshRemovedDisposed.callCount, 1);
+        assert.strictEqual(create(retainedFolder.uri), freshRetained);
+        assertListenerCount(1);
     });
 
     test('confirming the first workspace folder disposes the no-folder settings', () => {
@@ -185,6 +258,7 @@ suite('Python settings workspace lifetime', () => {
         const old = create(removedFolder.uri);
         remove(removedFolder);
         folders.push(removedFolder);
+        changed.fire({ added: [removedFolder], removed: [] });
         const fresh = create(removedFolder.uri);
         assert.notStrictEqual(fresh, old);
         assert.strictEqual(create(removedFolder.uri), fresh);
