@@ -630,6 +630,47 @@ suite('Terminal Service', () => {
         });
     }
 
+    test('Closing during activation prevents the old command from running in the replacement', async () => {
+        sinon.stub(asyncUtils, 'sleep').resolves(100);
+        const closed = new EventEmitter<VSCodeTerminal>();
+        disposables.push(closed);
+        terminalManager
+            .setup((manager) => manager.onDidCloseTerminal(TypeMoq.It.isAny(), TypeMoq.It.isAny(), TypeMoq.It.isAny()))
+            .returns((listener) => closed.event((value) => listener.call(service, value)));
+        const replacement = TypeMoq.Mock.ofType<VSCodeTerminal>();
+        replacement.setup((value) => value.shellIntegration).returns(() => terminalShellIntegration.object);
+        let nextTerminal = terminal.object;
+        terminalManager.setup((manager) => manager.createTerminal(TypeMoq.It.isAny())).returns(() => nextTerminal);
+        terminalHelper
+            .setup((helper) =>
+                helper.buildCommandForTerminal(TypeMoq.It.isAny(), TypeMoq.It.isAny(), TypeMoq.It.isAny()),
+            )
+            .returns((_shell, command) => command);
+        const activating = asyncUtils.createDeferred<void>();
+        const activation = asyncUtils.createDeferred<boolean>();
+        terminalActivator
+            .setup((activator) => activator.activateEnvironmentInTerminal(TypeMoq.It.isAny(), TypeMoq.It.isAny()))
+            .returns((current) => {
+                if (current === terminal.object) {
+                    activating.resolve();
+                    return activation.promise;
+                }
+                return Promise.resolve(true);
+            });
+        service = new TerminalService(mockServiceContainer.object);
+
+        const canceled = rejects(service.sendCommand('old command', []), CancellationError);
+        await activating.promise;
+        closed.fire(terminal.object);
+        nextTerminal = replacement.object;
+        await service.sendCommand('replacement command', []);
+        activation.resolve(true);
+        await canceled;
+
+        terminalShellIntegration.verify((shell) => shell.executeCommand('old command'), TypeMoq.Times.never());
+        terminalShellIntegration.verify((shell) => shell.executeCommand('replacement command'), TypeMoq.Times.once());
+    });
+
     test('Ensure close event is not fired when terminal is closed', async () => {
         terminalHelper
             .setup((helper) => helper.getEnvironmentActivationCommands(TypeMoq.It.isAny(), TypeMoq.It.isAny()))

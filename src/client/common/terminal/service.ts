@@ -262,6 +262,9 @@ export class TerminalService implements ITerminalService, Disposable {
                 interpreter: this.options?.interpreter,
                 hideFromUser: this.options?.hideFromUser,
             });
+            if (this.terminal !== terminal) {
+                throw new CancellationError();
+            }
         }
 
         if (!this.options?.hideFromUser) {

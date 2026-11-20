@@ -2,15 +2,17 @@
 // Licensed under the MIT License.
 
 import { assert } from 'chai';
+import { rejects } from 'node:assert/strict';
 import * as path from 'path';
+import * as sinon from 'sinon';
 import { anything, deepEqual, instance, mock, verify, when } from 'ts-mockito';
-import { CancellationTokenSource } from 'vscode';
+import { CancellationTokenSource, Disposable, EventEmitter } from 'vscode';
 import { CancellationError } from '../../../client/common/cancellation';
 import { FileSystem } from '../../../client/common/platform/fileSystem';
 import { IFileSystem } from '../../../client/common/platform/types';
 import { TerminalService } from '../../../client/common/terminal/service';
 import { SynchronousTerminalService } from '../../../client/common/terminal/syncTerminalService';
-import { createDeferredFrom } from '../../../client/common/utils/async';
+import { createDeferred, createDeferredFrom } from '../../../client/common/utils/async';
 import { EXTENSION_ROOT_DIR } from '../../../client/constants';
 import { IInterpreterService } from '../../../client/interpreter/contracts';
 import { InterpreterService } from '../../../client/interpreter/interpreterService';
@@ -21,12 +23,16 @@ suite('Terminal Service (synchronous)', () => {
     let fs: IFileSystem;
     let interpreterService: IInterpreterService;
     let terminalService: TerminalService;
+    let closed: EventEmitter<void>;
     setup(() => {
         fs = mock(FileSystem);
         interpreterService = mock(InterpreterService);
         terminalService = mock(TerminalService);
+        closed = new EventEmitter<void>();
+        when(terminalService.onDidCloseTerminal).thenReturn(closed.event);
         service = new SynchronousTerminalService(instance(fs), instance(interpreterService), instance(terminalService));
     });
+    teardown(() => closed.dispose());
     suite('Show, sendText and dispose should invoke corresponding methods in wrapped TerminalService', () => {
         test('Show should invoke show in terminal', async () => {
             when(terminalService.show(anything())).thenResolve();
@@ -144,6 +150,74 @@ suite('Terminal Service (synchronous)', () => {
                     deepEqual([shellExecFile, 'cmd', '1', '2', tmpFile.filePath.fileToCommandArgumentForPythonExt()]),
                 ),
             ).once();
+        }).timeout(2_000);
+
+        test('Closing the terminal cancels completion and lets a later command finish', async () => {
+            const clock = sinon.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+            const token = new CancellationTokenSource();
+            const firstFile = { filePath: 'first lock file', dispose: sinon.spy() };
+            const secondFile = { filePath: 'second lock file', dispose: sinon.spy() };
+            const read = createDeferred<string>();
+            const dispatched = [createDeferred<void>(), createDeferred<void>()];
+            let sends = 0;
+            const disposedCloseListener = sinon.spy();
+            const disposedCancelListener = sinon.spy();
+            const cancellation = {
+                get isCancellationRequested() {
+                    return token.token.isCancellationRequested;
+                },
+                onCancellationRequested: ((listener) => {
+                    const subscription = token.token.onCancellationRequested(listener);
+                    return new Disposable(() => {
+                        subscription.dispose();
+                        disposedCancelListener();
+                    });
+                }) as typeof token.token.onCancellationRequested,
+            };
+            when(terminalService.onDidCloseTerminal).thenReturn((listener) => {
+                const subscription = closed.event(listener);
+                return new Disposable(() => {
+                    subscription.dispose();
+                    disposedCloseListener();
+                });
+            });
+            when(terminalService.sendCommand(anything(), anything())).thenCall(async () => {
+                dispatched[sends++].resolve();
+            });
+            when(interpreterService.getActiveInterpreter(undefined)).thenResolve(undefined);
+            when(fs.createTemporaryFile('.log')).thenResolve(firstFile, secondFile);
+            when(fs.readFile(firstFile.filePath)).thenReturn(read.promise);
+            when(fs.readFile(secondFile.filePath)).thenResolve('END');
+            try {
+                const canceled = rejects(service.sendCommand('first', [], cancellation), CancellationError);
+                await dispatched[0].promise;
+                await clock.tickAsync(100);
+                verify(fs.readFile(firstFile.filePath)).once();
+
+                closed.fire();
+                await canceled;
+                sinon.assert.calledOnce(firstFile.dispose);
+                sinon.assert.calledOnce(disposedCloseListener);
+                sinon.assert.calledOnce(disposedCancelListener);
+                assert.isFalse(Boolean(token.token.isCancellationRequested));
+
+                read.reject(new Error('Lock file was removed'));
+                await clock.tickAsync(400);
+                verify(fs.readFile(firstFile.filePath)).once();
+
+                const replacement = service.sendCommand('second', [], cancellation);
+                await dispatched[1].promise;
+                await clock.tickAsync(100);
+                await replacement;
+                verify(fs.readFile(secondFile.filePath)).once();
+                sinon.assert.calledOnce(secondFile.dispose);
+                sinon.assert.calledTwice(disposedCloseListener);
+                sinon.assert.calledTwice(disposedCancelListener);
+            } finally {
+                token.cancel();
+                token.dispose();
+                clock.restore();
+            }
         }).timeout(2_000);
     });
 });

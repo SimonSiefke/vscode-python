@@ -4,7 +4,7 @@
 'use strict';
 
 import { inject } from 'inversify';
-import { CancellationToken, Disposable, Event, TerminalShellExecution } from 'vscode';
+import { CancellationToken, CancellationTokenSource, Disposable, Event, TerminalShellExecution } from 'vscode';
 import { IInterpreterService } from '../../interpreter/contracts';
 import { traceVerbose } from '../../logging';
 import { PythonEnvironment } from '../../pythonEnvironments/info';
@@ -45,29 +45,39 @@ class ExecutionState implements Disposable {
         }
     }
     private registerStateUpdate() {
-        const timeout = setInterval(async () => {
-            const state = await this.getLockFileState(this.lockFile);
-            if (state !== this.state) {
-                traceVerbose(`Command state changed to ${state}. ${this.command.join(' ')}`);
-            }
-            this.state = state;
-            if (state & State.errored) {
-                const errorContents = await this.fs.readFile(`${this.lockFile}.error`).catch(() => '');
-                this._completed.reject(
-                    new Error(
-                        `Command failed with errors, check the terminal for details. Command: ${this.command.join(
-                            ' ',
-                        )}\n${errorContents}`,
-                    ),
-                );
-            } else if (state & State.completed) {
-                this._completed.resolve();
-            }
+        const timeout = setInterval(() => {
+            this.updateState().catch((error) => {
+                if (this.disposable) {
+                    this._completed.reject(error);
+                }
+            });
         }, 100);
 
         this.disposable = {
             dispose: () => clearInterval(timeout as any),
         };
+    }
+    private async updateState(): Promise<void> {
+        const state = await this.getLockFileState(this.lockFile);
+        if (!this.disposable) {
+            return;
+        }
+        if (state !== this.state) {
+            traceVerbose(`Command state changed to ${state}. ${this.command.join(' ')}`);
+        }
+        this.state = state;
+        if (state & State.errored) {
+            const errorContents = await this.fs.readFile(`${this.lockFile}.error`).catch(() => '');
+            this._completed.reject(
+                new Error(
+                    `Command failed with errors, check the terminal for details. Command: ${this.command.join(
+                        ' ',
+                    )}\n${errorContents}`,
+                ),
+            );
+        } else if (state & State.completed) {
+            this._completed.resolve();
+        }
     }
     private async getLockFileState(file: string): Promise<State> {
         const source = await this.fs.readFile(file);
@@ -130,13 +140,27 @@ export class SynchronousTerminalService implements ITerminalService, Disposable 
         }
         const lockFile = await this.createLockFile();
         const state = new ExecutionState(lockFile.filePath, this.fs, [command, ...args]);
+        const completionCancellation = new CancellationTokenSource();
+        let closeListener: Disposable | undefined;
+        let cancelListener: Disposable | undefined;
         try {
             const pythonExec = this.pythonInterpreter || (await this.interpreter.getActiveInterpreter(undefined));
             const sendArgs = internalScripts.shell_exec(command, lockFile.filePath, args);
-            await this.terminalService.sendCommand(pythonExec?.path || 'python', sendArgs);
+            closeListener = this.terminalService.onDidCloseTerminal(() => completionCancellation.cancel());
+            await Cancellation.race(
+                () => this.terminalService.sendCommand(pythonExec?.path || 'python', sendArgs),
+                completionCancellation.token,
+            );
+            cancelListener = cancel.onCancellationRequested(() => completionCancellation.cancel());
+            if (cancel.isCancellationRequested) {
+                completionCancellation.cancel();
+            }
             const promise = swallowExceptions ? state.completed : state.completed.catch(noop);
-            await Cancellation.race(() => promise, cancel);
+            await Cancellation.race(() => promise, completionCancellation.token);
         } finally {
+            closeListener?.dispose();
+            cancelListener?.dispose();
+            completionCancellation.dispose();
             state.dispose();
             lockFile.dispose();
         }

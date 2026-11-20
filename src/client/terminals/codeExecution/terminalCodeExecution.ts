@@ -5,7 +5,7 @@
 
 import { inject, injectable } from 'inversify';
 import * as path from 'path';
-import { Disposable, TerminalOptions, Uri } from 'vscode';
+import { CancellationError, Disposable, TerminalOptions, Uri } from 'vscode';
 import { IApplicationShell, ICommandManager, IWorkspaceService } from '../../common/application/types';
 import '../../common/extensions';
 import { IPlatformService } from '../../common/platform/types';
@@ -26,8 +26,7 @@ export class TerminalCodeExecutionProvider implements ICodeExecutionService {
     private hasRanOutsideCurrentDrive = false;
     protected terminalTitle!: string;
     protected terminalIcon?: TerminalOptions['iconPath'];
-    private replActive?: Promise<void>;
-    private terminalCloseListener?: Disposable;
+    private replActive?: { startup: Promise<void>; dispose(): void };
 
     constructor(
         @inject(ITerminalServiceFactory) protected readonly terminalServiceFactory: ITerminalServiceFactory,
@@ -39,7 +38,7 @@ export class TerminalCodeExecutionProvider implements ICodeExecutionService {
         @inject(ICommandManager) protected readonly commandManager: ICommandManager,
         @inject(IApplicationShell) protected readonly applicationShell: IApplicationShell,
     ) {
-        this.disposables.push(new Disposable(() => this.resetRepl()));
+        this.disposables.push(new Disposable(() => this.replActive?.dispose()));
     }
 
     public async executeFile(file: Uri, options?: { newTerminalPerFile: boolean }) {
@@ -70,36 +69,44 @@ export class TerminalCodeExecutionProvider implements ICodeExecutionService {
 
     public async initializeRepl(resource: Resource) {
         const terminalService = this.getTerminalService(resource);
-        if (this.replActive) {
-            await this.replActive;
+        const current = this.replActive;
+        if (current) {
+            await current.startup;
+            if (this.replActive !== current) {
+                throw new CancellationError();
+            }
             await terminalService.show();
             return;
         }
         sendTelemetryEvent(EventName.REPL, undefined, { replType: 'Terminal' });
-        const startup = this.startRepl(terminalService, resource);
-        this.replActive = startup;
-        const resetStartup = () => {
-            if (this.replActive === startup) {
-                this.resetRepl();
-            }
+        const canceled = createDeferred<never>();
+        let terminalCloseListener: Disposable | undefined;
+        const currentStartup = {
+            startup: this.startRepl(terminalService, resource, canceled.promise),
+            dispose: () => {
+                if (this.replActive === currentStartup) {
+                    this.replActive = undefined;
+                    terminalCloseListener?.dispose();
+                    canceled.reject(new CancellationError());
+                }
+            },
         };
-        this.terminalCloseListener = terminalService.onDidCloseTerminal(resetStartup);
+        this.replActive = currentStartup;
+        terminalCloseListener = terminalService.onDidCloseTerminal(currentStartup.dispose);
         try {
-            await startup;
+            await currentStartup.startup;
         } catch (error) {
-            resetStartup();
+            currentStartup.dispose();
             throw error;
         }
     }
 
-    private resetRepl() {
-        this.replActive = undefined;
-        this.terminalCloseListener?.dispose();
-        this.terminalCloseListener = undefined;
-    }
-
-    private async startRepl(terminalService: ITerminalService, resource: Resource): Promise<void> {
-        const { command, args } = await this.getExecutableInfo(resource);
+    private async startRepl(
+        terminalService: ITerminalService,
+        resource: Resource,
+        canceled: Promise<never>,
+    ): Promise<void> {
+        const { command, args } = await Promise.race([this.getExecutableInfo(resource), canceled]);
         const prompt = createDeferred<void>();
         let listener: Disposable | undefined;
         let timeout: NodeJS.Timeout | undefined;
@@ -122,7 +129,7 @@ export class TerminalCodeExecutionProvider implements ICodeExecutionService {
                 }
             });
             timeout = setTimeout(stopWaitingForPrompt, 3000);
-            await Promise.all([terminalService.sendCommand(command, args), prompt.promise]);
+            await Promise.race([Promise.all([terminalService.sendCommand(command, args), prompt.promise]), canceled]);
         } finally {
             stopWaitingForPrompt();
         }
