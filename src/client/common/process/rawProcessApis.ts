@@ -225,6 +225,7 @@ export function execObservable(
     };
     trackProcess(proc, { dispose }, disposables);
 
+    let cancellationRequested = false;
     const output = new Observable<Output<string>>((subscriber) => {
         const internalDisposables: IDisposable[] = [];
 
@@ -237,7 +238,15 @@ export function execObservable(
         };
 
         if (options.token) {
-            internalDisposables.push(options.token.onCancellationRequested(() => stopProcess(proc)));
+            internalDisposables.push(
+                options.token.onCancellationRequested(() => {
+                    // All subscriptions share one cancellation request for this child.
+                    if (!cancellationRequested) {
+                        cancellationRequested = true;
+                        stopProcess(proc);
+                    }
+                }),
+            );
         }
 
         const sendOutput = (source: 'stdout' | 'stderr', data: Buffer) => {

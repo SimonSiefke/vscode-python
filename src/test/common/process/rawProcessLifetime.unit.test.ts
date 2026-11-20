@@ -2,11 +2,15 @@
 // Licensed under the MIT License.
 
 import * as assert from 'assert';
+import { ChildProcess } from 'child_process';
 import { randomUUID } from 'crypto';
 import { errorMonitor, once } from 'events';
 import { tmpdir } from 'os';
 import { join } from 'path';
+import { Readable } from 'stream';
+import { spy } from 'sinon';
 import { CancellationTokenSource, OutputChannel } from 'vscode';
+import { CancellationTokenSource as ReplayingCancellationTokenSource } from 'vscode-jsonrpc/node';
 import { execObservable, plainExec, shellExec } from '../../../client/common/process/rawProcessApis';
 import { IDisposable } from '../../../client/common/types';
 import { createDeferred } from '../../../client/common/utils/async';
@@ -14,6 +18,21 @@ import { createDeferred } from '../../../client/common/utils/async';
 const fallbackExitCode = 29;
 const exitIfNotStopped = `setTimeout(() => { process.stdout.write("fallback"); process.exit(${fallbackExitCode}); }, 5000)`;
 const ignoreFirstSignal = 'process.once("SIGTERM", () => process.stdout.write("survived"));';
+// The remaining close listener belongs to the test's completion probe.
+const detachedOwnership = { handles: 0, exitListeners: 0, closeListeners: 1, errorMonitors: 0 };
+
+function processOwnership(proc: ChildProcess, handles: Set<IDisposable>) {
+    return {
+        handles: handles.size,
+        exitListeners: proc.listenerCount('exit'),
+        closeListeners: proc.listenerCount('close'),
+        errorMonitors: proc.listenerCount(errorMonitor),
+    };
+}
+
+function nextOutput(stdout: Readable, closed: Promise<unknown>): Promise<string | undefined> {
+    return Promise.race([once(stdout, 'data').then(([data]) => data.toString()), closed.then(() => undefined)]);
+}
 
 suite('Completed process handle lifetime', () => {
     test('plain execution releases its shutdown handle after completion', async () => {
@@ -38,8 +57,9 @@ suite('Completed process handle lifetime', () => {
 
     test('shell execution releases its shutdown handle after completion', async () => {
         const handles = new Set<IDisposable>();
-        const result = await shellExec('echo complete', { doNotLog: true }, undefined, handles);
-        assert.strictEqual(result.stdout.trim(), 'complete');
+        const result = shellExec('echo complete', { doNotLog: true }, undefined, handles);
+        assert.strictEqual(handles.size, 1);
+        assert.strictEqual((await result).stdout.trim(), 'complete');
         assert.strictEqual(handles.size, 0);
     });
 
@@ -81,14 +101,19 @@ suite('Completed process handle lifetime', () => {
             undefined,
             handles,
         );
-        assert.ok(result.proc);
-        const closed = once(result.proc, 'close');
-        result.proc.stdout?.resume();
-        result.proc.stderr?.resume();
+        const { proc } = result;
+        assert.ok(proc);
+        const closed = once(proc, 'close');
+        let ownershipAtExit: ReturnType<typeof processOwnership> | undefined;
+        proc.once('exit', () => {
+            ownershipAtExit = processOwnership(proc, handles);
+        });
+        proc.stdout?.resume();
+        proc.stderr?.resume();
         await closed;
+        assert.deepStrictEqual(ownershipAtExit, detachedOwnership);
         assert.strictEqual(handles.size, 0);
-        assert.strictEqual(result.proc.listenerCount('error'), 0);
-        assert.strictEqual(result.proc.listenerCount(errorMonitor), 0);
+        assert.strictEqual(proc.listenerCount('error'), 0);
     });
 
     test('a raw spawn failure releases the handle and reaches the consumer', async () => {
@@ -98,19 +123,21 @@ suite('Completed process handle lifetime', () => {
         assert.ok(proc);
         const closed = new Promise<void>((resolve) => proc.once('close', () => resolve()));
         const existingErrorListeners = proc.listenerCount('error');
-        const failed = new Promise<{ error: NodeJS.ErrnoException; remainingHandles: number }>((resolve) => {
-            proc.once('error', (error) => resolve({ error, remainingHandles: handles.size }));
+        const failed = new Promise<{
+            error: NodeJS.ErrnoException;
+            ownershipAtError: ReturnType<typeof processOwnership>;
+        }>((resolve) => {
+            proc.once('error', (error) => resolve({ error, ownershipAtError: processOwnership(proc, handles) }));
         });
 
-        const { error, remainingHandles } = await failed;
+        const { error, ownershipAtError } = await failed;
         await closed;
         assert.strictEqual(existingErrorListeners, 0);
         assert.strictEqual(error.code, 'ENOENT');
-        assert.strictEqual(remainingHandles, 0);
-        assert.strictEqual(proc.listenerCount(errorMonitor), 0);
+        assert.deepStrictEqual(ownershipAtError, detachedOwnership);
     });
 
-    test('disposing an active observable stops it after a sibling completes', async () => {
+    test('shutdown still stops the live observable after a sibling completes', async () => {
         const handles = new Set<IDisposable>();
         const result = execObservable(
             process.execPath,
@@ -123,7 +150,7 @@ suite('Completed process handle lifetime', () => {
         assert.ok(proc?.stdout);
         const closed = once(proc, 'close');
         try {
-            await once(proc.stdout, 'data');
+            assert.strictEqual(await nextOutput(proc.stdout, closed), 'ready');
             const finished = plainExec(
                 process.execPath,
                 ['-e', 'process.stdout.write("complete")'],
@@ -134,7 +161,7 @@ suite('Completed process handle lifetime', () => {
             assert.strictEqual(handles.size, 2);
             assert.strictEqual((await finished).stdout, 'complete');
             assert.strictEqual(handles.size, 1);
-            result.dispose();
+            handles.forEach((handle) => handle.dispose());
             const [code] = await closed;
             assert.notStrictEqual(code, fallbackExitCode);
             assert.strictEqual(handles.size, 0);
@@ -171,29 +198,74 @@ suite('Completed process handle lifetime', () => {
     });
 
     if (process.platform !== 'win32') {
-        test('shutdown retries after a child handles the first observable disposal signal', async () => {
+        for (const stop of ['observable disposal', 'raw child kill']) {
+            test(`shutdown retries after a child handles the first ${stop} signal`, async () => {
+                const handles = new Set<IDisposable>();
+                const result = execObservable(
+                    process.execPath,
+                    ['-e', `${ignoreFirstSignal} process.stdout.write("ready"); ${exitIfNotStopped}`],
+                    { doNotLog: true },
+                    undefined,
+                    handles,
+                );
+                const { proc } = result;
+                assert.ok(proc?.stdout);
+                const closed = once(proc, 'close');
+                try {
+                    assert.strictEqual(await nextOutput(proc.stdout, closed), 'ready');
+                    const survived = nextOutput(proc.stdout, closed);
+                    if (stop === 'raw child kill') {
+                        assert.strictEqual(proc.kill(), true);
+                        assert.strictEqual(proc.killed, true);
+                    } else {
+                        result.dispose();
+                    }
+                    assert.strictEqual(await survived, 'survived');
+                    assert.strictEqual(handles.size, 1);
+                    handles.forEach((handle) => handle.dispose());
+                    const [, signal] = await closed;
+                    assert.strictEqual(signal, 'SIGTERM');
+                    assert.strictEqual(handles.size, 0);
+                } finally {
+                    if (proc.exitCode === null && proc.signalCode === null) proc.kill('SIGKILL');
+                    await closed;
+                }
+            });
+        }
+
+        test('subscribing after observable cancellation does not send a second stop signal', async () => {
             const handles = new Set<IDisposable>();
+            const cancellation = new ReplayingCancellationTokenSource();
             const result = execObservable(
                 process.execPath,
                 ['-e', `${ignoreFirstSignal} process.stdout.write("ready"); ${exitIfNotStopped}`],
-                { doNotLog: true },
+                { doNotLog: true, token: cancellation.token },
                 undefined,
                 handles,
             );
             const { proc } = result;
             assert.ok(proc?.stdout);
             const closed = once(proc, 'close');
+            const kill = spy(process, 'kill');
             try {
-                assert.strictEqual((await once(proc.stdout, 'data'))[0].toString(), 'ready');
-                const nextOutput = once(proc.stdout, 'data');
-                result.dispose();
-                assert.strictEqual((await nextOutput)[0].toString(), 'survived');
+                const ready = nextOutput(proc.stdout, closed);
+                result.out.subscribe();
+                assert.strictEqual(await ready, 'ready');
+                const survived = nextOutput(proc.stdout, closed);
+                cancellation.cancel();
+                assert.strictEqual(await survived, 'survived');
+
+                result.out.subscribe();
+                await new Promise<void>((resolve) => cancellation.token.onCancellationRequested(resolve));
+                assert.strictEqual(kill.withArgs(proc.pid).callCount, 1);
                 assert.strictEqual(handles.size, 1);
                 handles.forEach((handle) => handle.dispose());
                 const [, signal] = await closed;
                 assert.strictEqual(signal, 'SIGTERM');
                 assert.strictEqual(handles.size, 0);
             } finally {
+                kill.restore();
+                cancellation.dispose();
                 if (proc.exitCode === null && proc.signalCode === null) proc.kill('SIGKILL');
                 await closed;
             }
