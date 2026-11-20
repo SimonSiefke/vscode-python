@@ -4,7 +4,7 @@
 'use strict';
 
 import { inject, injectable, multiInject } from 'inversify';
-import { Terminal } from 'vscode';
+import { CancellationError, Terminal } from 'vscode';
 import { IConfigurationService, IExperimentService } from '../../types';
 import { ITerminalActivationHandler, ITerminalActivator, ITerminalHelper, TerminalActivationOptions } from '../types';
 import { BaseTerminalActivator } from './base';
@@ -29,6 +29,9 @@ export class TerminalActivator implements ITerminalActivator {
         terminal: Terminal,
         options?: TerminalActivationOptions,
     ): Promise<boolean> {
+        if (!terminal) {
+            throw new CancellationError();
+        }
         let promise = this.pendingActivations.get(terminal);
         if (promise) {
             return promise;

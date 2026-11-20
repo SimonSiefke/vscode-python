@@ -5,21 +5,15 @@
 
 import { Terminal } from 'vscode';
 import { traceVerbose } from '../../../logging';
-import { createDeferred, sleep } from '../../utils/async';
+import { sleep } from '../../utils/async';
 import { ITerminalActivator, ITerminalHelper, TerminalActivationOptions, TerminalShellType } from '../types';
 
 export class BaseTerminalActivator implements ITerminalActivator {
-    private readonly activatedTerminals: Map<Terminal, Promise<boolean>> = new Map<Terminal, Promise<boolean>>();
     constructor(private readonly helper: ITerminalHelper) {}
     public async activateEnvironmentInTerminal(
         terminal: Terminal,
         options?: TerminalActivationOptions,
     ): Promise<boolean> {
-        if (this.activatedTerminals.has(terminal)) {
-            return this.activatedTerminals.get(terminal)!;
-        }
-        const deferred = createDeferred<boolean>();
-        this.activatedTerminals.set(terminal, deferred.promise);
         const terminalShellType = this.helper.identifyTerminalShell(terminal);
 
         const activationCommands = await this.helper.getEnvironmentActivationCommands(
@@ -37,7 +31,6 @@ export class BaseTerminalActivator implements ITerminalActivator {
                 activated = true;
             }
         }
-        deferred.resolve(activated);
         return activated;
     }
     protected async waitForCommandToProcess(_shell: TerminalShellType) {

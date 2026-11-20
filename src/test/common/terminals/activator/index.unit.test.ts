@@ -4,14 +4,16 @@
 'use strict';
 
 import { assert } from 'chai';
+import { queryObjects } from 'node:v8';
 import * as sinon from 'sinon';
 import * as TypeMoq from 'typemoq';
-import { Terminal, Uri } from 'vscode';
+import { CancellationError, Terminal, Uri } from 'vscode';
 import { TerminalActivator } from '../../../../client/common/terminal/activator';
 import {
     ITerminalActivationHandler,
     ITerminalActivator,
     ITerminalHelper,
+    TerminalShellType,
 } from '../../../../client/common/terminal/types';
 import {
     IConfigurationService,
@@ -22,6 +24,7 @@ import {
 import * as extapi from '../../../../client/envExt/api.internal';
 import * as workspaceApis from '../../../../client/common/vscodeApis/workspaceApis';
 import * as extensionsApi from '../../../../client/common/vscodeApis/extensionsApi';
+import { createDeferred } from '../../../../client/common/utils/async';
 
 suite('Terminal Activator', () => {
     let activator: TerminalActivator;
@@ -29,6 +32,7 @@ suite('Terminal Activator', () => {
     let handler1: TypeMoq.IMock<ITerminalActivationHandler>;
     let handler2: TypeMoq.IMock<ITerminalActivationHandler>;
     let terminalSettings: TypeMoq.IMock<ITerminalSettings>;
+    let configService: TypeMoq.IMock<IConfigurationService>;
     let experimentService: TypeMoq.IMock<IExperimentService>;
     let useEnvExtensionStub: sinon.SinonStub;
     let shouldEnvExtHandleActivationStub: sinon.SinonStub;
@@ -44,7 +48,7 @@ suite('Terminal Activator', () => {
         experimentService.setup((e) => e.inExperimentSync(TypeMoq.It.isAny())).returns(() => false);
         handler1 = TypeMoq.Mock.ofType<ITerminalActivationHandler>();
         handler2 = TypeMoq.Mock.ofType<ITerminalActivationHandler>();
-        const configService = TypeMoq.Mock.ofType<IConfigurationService>();
+        configService = TypeMoq.Mock.ofType<IConfigurationService>();
         configService
             .setup((c) => c.getSettings(TypeMoq.It.isAny()))
             .returns(() => {
@@ -65,6 +69,72 @@ suite('Terminal Activator', () => {
     });
     teardown(() => {
         sinon.restore();
+    });
+
+    function createLegacyActivator(getCommands: ITerminalHelper['getEnvironmentActivationCommands']) {
+        terminalSettings.setup((setting) => setting.activateEnvironment).returns(() => true);
+        const unexpectedCall = (): never => {
+            throw new Error('Unexpected terminal helper call');
+        };
+        const helper: ITerminalHelper = {
+            createTerminal: unexpectedCall,
+            identifyTerminalShell: () => TerminalShellType.bash,
+            buildCommandForTerminal: unexpectedCall,
+            getEnvironmentActivationCommands: getCommands,
+            getEnvironmentActivationShellCommands: unexpectedCall,
+        };
+        return new TerminalActivator(helper, [], configService.object, experimentService.object);
+    }
+
+    test('Shares in-flight and completed activation per terminal', async () => {
+        const commands = createDeferred<undefined>();
+        const getCommands = sinon.stub().returns(commands.promise);
+        activator = createLegacyActivator(getCommands);
+        const terminal = TypeMoq.Mock.ofType<Terminal>().object;
+        const otherTerminal = TypeMoq.Mock.ofType<Terminal>().object;
+
+        const first = activator.activateEnvironmentInTerminal(terminal);
+        const repeated = activator.activateEnvironmentInTerminal(terminal);
+        sinon.assert.calledOnce(getCommands);
+
+        const other = activator.activateEnvironmentInTerminal(otherTerminal);
+        sinon.assert.calledTwice(getCommands);
+
+        commands.resolve();
+        assert.deepEqual(await Promise.all([first, repeated, other]), [false, false, false]);
+        assert.isFalse(await activator.activateEnvironmentInTerminal(terminal));
+        sinon.assert.calledTwice(getCommands);
+    });
+
+    test('The activation cache does not keep an unused terminal alive', async () => {
+        class TestTerminal {
+            public readonly name = 'Python';
+        }
+        const getCommands = sinon.stub().resolves(undefined);
+        activator = createLegacyActivator(getCommands);
+        const activateTerminal = async () => {
+            await activator.activateEnvironmentInTerminal(new TestTerminal() as Terminal);
+        };
+
+        await activateTerminal();
+
+        sinon.assert.calledOnce(getCommands);
+        assert.strictEqual(queryObjects(TestTerminal), 0);
+    });
+
+    test('Rejects startup for a missing terminal before starting activation', async () => {
+        const getCommands = sinon.stub().resolves(undefined);
+        activator = createLegacyActivator(getCommands);
+
+        await assert.isRejected(
+            activator.activateEnvironmentInTerminal((undefined as unknown) as Terminal),
+            CancellationError,
+        );
+        sinon.assert.notCalled(getCommands);
+
+        const replacement = TypeMoq.Mock.ofType<Terminal>().object;
+        assert.isFalse(await activator.activateEnvironmentInTerminal(replacement));
+        sinon.assert.calledOnce(getCommands);
     });
 
     async function testActivationAndHandlers(
