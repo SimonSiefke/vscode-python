@@ -4,7 +4,15 @@
 import * as assert from 'assert';
 import * as sinon from 'sinon';
 import * as TypeMoq from 'typemoq';
-import { Disposable, Event, Uri, WorkspaceConfiguration, WorkspaceFolder, WorkspaceFoldersChangeEvent } from 'vscode';
+import {
+    ConfigurationChangeEvent,
+    Disposable,
+    Event,
+    Uri,
+    WorkspaceConfiguration,
+    WorkspaceFolder,
+    WorkspaceFoldersChangeEvent,
+} from 'vscode';
 import { IWorkspaceService } from '../../../client/common/application/types';
 import { PythonSettings } from '../../../client/common/configSettings';
 import { IInterpreterPathService } from '../../../client/common/types';
@@ -35,7 +43,8 @@ suite('Python settings workspace lifetime', () => {
     let retainedFolder: WorkspaceFolder;
     let removedFolder: WorkspaceFolder;
     let changed: TrackedEvent<WorkspaceFoldersChangeEvent>;
-    let configuration: TrackedEvent<never>;
+    let configuration: TrackedEvent<ConfigurationChangeEvent>;
+    let folderConfigurations: Map<string, WorkspaceConfiguration>;
     let interpreter: TrackedEvent<never>;
     let autoSelection: TrackedEvent<void>;
     let autoSelectionService: MockAutoSelectionService;
@@ -56,7 +65,7 @@ suite('Python settings workspace lifetime', () => {
         changed.fire({ added: [], removed });
     };
     const assertListenerCount = (count: number) => {
-        assert.strictEqual(changed.listeners.size, 1);
+        assert.strictEqual(changed.listeners.size, count);
         assert.strictEqual(configuration.listeners.size, count);
         assert.strictEqual(interpreter.listeners.size, count);
         assert.strictEqual(autoSelection.listeners.size, count);
@@ -68,7 +77,8 @@ suite('Python settings workspace lifetime', () => {
         removedFolder = folder('removed', 1);
         folders = [retainedFolder, removedFolder];
         changed = trackedEvent<WorkspaceFoldersChangeEvent>();
-        configuration = trackedEvent<never>();
+        configuration = trackedEvent<ConfigurationChangeEvent>();
+        folderConfigurations = new Map();
         interpreter = trackedEvent<never>();
         autoSelection = trackedEvent<void>();
         autoSelectionService = new MockAutoSelectionService();
@@ -80,7 +90,13 @@ suite('Python settings workspace lifetime', () => {
             .returns((resource: Uri) => folders.find((item) => item.uri.toString() === resource.toString()));
         workspace.setup((value) => value.onDidChangeWorkspaceFolders).returns(() => changed.event);
         workspace.setup((value) => value.onDidChangeConfiguration).returns(() => configuration.event);
+        workspace
+            .setup((value) => value.getConfiguration(TypeMoq.It.isAny(), TypeMoq.It.isAny()))
+            .returns((section: string, resource?: Uri) =>
+                section === 'python' && resource ? folderConfigurations.get(resource.toString())! : undefined!,
+            );
         pathService = TypeMoq.Mock.ofType<IInterpreterPathService>();
+        pathService.setup((value) => value.get(TypeMoq.It.isAny())).returns(() => 'python');
         pathService.setup((value) => value.onDidChange).returns(() => interpreter.event);
     });
     teardown(() => {
@@ -92,18 +108,18 @@ suite('Python settings workspace lifetime', () => {
         assert.strictEqual(autoSelection.listeners.size, 0);
     });
 
-    test('removing a folder disposes its settings once and removes its listeners', () => {
+    test('removing a folder disposes its settings once without changing the shared listeners', () => {
         const settings = create(removedFolder.uri);
         const disposed = sinon.spy(settings, 'dispose');
         assertListenerCount(1);
         remove(removedFolder);
         assert.strictEqual(disposed.callCount, 1);
-        assertListenerCount(0);
+        assertListenerCount(1);
         changed.fire({ added: [], removed: [removedFolder] });
         assert.strictEqual(disposed.callCount, 1);
     });
 
-    test('remaining workspace settings stay cached and subscribed', () => {
+    test('remaining workspace settings stay cached after another folder is removed', () => {
         const retained = create(retainedFolder.uri);
         const removed = create(removedFolder.uri);
         const retainedDisposed = sinon.spy(retained, 'dispose');
@@ -126,7 +142,7 @@ suite('Python settings workspace lifetime', () => {
         const secondRetainedDisposed = sinon.spy(secondRetained, 'dispose');
         const firstRemovedDisposed = sinon.spy(create(firstRemovedFolder.uri), 'dispose');
         const secondRemovedDisposed = sinon.spy(create(secondRemovedFolder.uri), 'dispose');
-        assertListenerCount(4);
+        assertListenerCount(1);
 
         remove(firstRemovedFolder, secondRemovedFolder);
 
@@ -136,18 +152,19 @@ suite('Python settings workspace lifetime', () => {
         assert.strictEqual(secondRemovedDisposed.callCount, 1);
         assert.strictEqual(create(retainedFolder.uri), retained);
         assert.strictEqual(create(secondRetainedFolder.uri), secondRetained);
-        assertListenerCount(2);
+        assertListenerCount(1);
 
         changed.fire({ added: [], removed: [firstRemovedFolder, secondRemovedFolder] });
         assert.strictEqual(firstRemovedDisposed.callCount, 1);
         assert.strictEqual(secondRemovedDisposed.callCount, 1);
-        assertListenerCount(2);
+        assertListenerCount(1);
     });
 
-    test('a provisional re-add cannot keep the removed folder settings subscribed', () => {
+    test('a provisional re-add cannot keep the removed folder settings alive', () => {
+        const provisionalFolder = { ...removedFolder };
         const restore = changed.event(({ removed }) => {
             if (removed.includes(removedFolder)) {
-                folders.push(removedFolder);
+                folders.push(provisionalFolder);
             }
         });
         const retained = create(retainedFolder.uri);
@@ -156,12 +173,12 @@ suite('Python settings workspace lifetime', () => {
 
         remove(removedFolder);
         restore.dispose();
-        assert.deepStrictEqual(folders, [retainedFolder, removedFolder]);
+        assert.deepStrictEqual(folders, [retainedFolder, provisionalFolder]);
         assert.strictEqual(disposed.callCount, 1);
 
         const provisional = create(removedFolder.uri);
         assert.notStrictEqual(provisional, old);
-        assert.notStrictEqual(provisional, create(removedFolder.uri));
+        assert.strictEqual(provisional, create(removedFolder.uri));
         assertListenerCount(1);
 
         // VS Code rolls back a rejected provisional update without another workspace event.
@@ -173,13 +190,14 @@ suite('Python settings workspace lifetime', () => {
         assertListenerCount(1);
         remove(other);
 
-        folders.push(removedFolder);
-        changed.fire({ added: [removedFolder], removed: [] });
+        const confirmedFolder = { ...removedFolder };
+        folders.push(confirmedFolder);
+        changed.fire({ added: [confirmedFolder], removed: [] });
         const confirmed = create(removedFolder.uri);
         assert.notStrictEqual(confirmed, old);
         assert.notStrictEqual(confirmed, provisional);
         assert.strictEqual(create(removedFolder.uri), confirmed);
-        assertListenerCount(2);
+        assertListenerCount(1);
     });
 
     test('reading an optimistic folder before URI normalization leaves no subscriptions behind', () => {
@@ -190,10 +208,7 @@ suite('Python settings workspace lifetime', () => {
         assert.notStrictEqual(confirmedFolder.uri.toString(), optimisticFolder.uri.toString());
         const configuration = TypeMoq.Mock.ofType<WorkspaceConfiguration>();
         configuration.setup((value) => value.get('envFile')).returns(() => 'provisional.env');
-        workspace
-            .setup((value) => value.getConfiguration('python', optimisticFolder.uri))
-            .returns(() => configuration.object);
-        pathService.setup((value) => value.get(optimisticFolder.uri)).returns(() => 'python');
+        folderConfigurations.set(optimisticFolder.uri.toString(), configuration.object);
 
         folders.push(optimisticFolder);
         const optimistic = create(optimisticFolder.uri);
@@ -205,19 +220,19 @@ suite('Python settings workspace lifetime', () => {
         const confirmed = create(confirmedFolder.uri);
         assert.notStrictEqual(confirmed, optimistic);
         assert.strictEqual(create(confirmedFolder.uri), confirmed);
-        assertListenerCount(2);
+        assertListenerCount(1);
 
         remove(confirmedFolder);
         assert.strictEqual(create(retainedFolder.uri), retained);
         assertListenerCount(1);
     });
 
-    test('refreshing settings registration disposes old owners and keeps tracking folder changes', () => {
+    test('resetting settings registration releases owners and subscriptions before the next lookup', () => {
         const retained = create(retainedFolder.uri);
         const removed = create(removedFolder.uri);
         const retainedDisposed = sinon.spy(retained, 'dispose');
         const removedDisposed = sinon.spy(removed, 'dispose');
-        assertListenerCount(2);
+        assertListenerCount(1);
 
         retained.register();
 
@@ -229,11 +244,93 @@ suite('Python settings workspace lifetime', () => {
         assert.notStrictEqual(freshRetained, retained);
         assert.notStrictEqual(freshRemoved, removed);
         const freshRemovedDisposed = sinon.spy(freshRemoved, 'dispose');
-        assertListenerCount(2);
+        assertListenerCount(1);
 
         remove(removedFolder);
         assert.strictEqual(freshRemovedDisposed.callCount, 1);
         assert.strictEqual(create(retainedFolder.uri), freshRetained);
+        assertListenerCount(1);
+    });
+
+    test('a folder restored after a silent startup rollback can be cached', () => {
+        // A pre-existing root is temporarily absent when Python first reads settings.
+        folders = [retainedFolder];
+        const retained = create(retainedFolder.uri);
+
+        folders = [retainedFolder, removedFolder];
+        const restored = create(removedFolder.uri);
+
+        assert.strictEqual(create(removedFolder.uri), restored);
+        assert.strictEqual(create(retainedFolder.uri), retained);
+        assertListenerCount(1);
+    });
+
+    test('a retained root keeps its owner when the host replaces the folder object without a delta', () => {
+        const retained = create(retainedFolder.uri);
+        const replacement = { ...retainedFolder };
+        folders = [replacement, removedFolder];
+        changed.fire({ added: [], removed: [] });
+
+        assert.strictEqual(create(replacement.uri), retained);
+        const disposed = sinon.spy(retained, 'dispose');
+        remove(replacement);
+        assert.strictEqual(disposed.callCount, 1);
+        assertListenerCount(1);
+    });
+
+    test('folders with the same filesystem path have independent settings ownership', () => {
+        const otherScheme = { ...retainedFolder, uri: retainedFolder.uri.with({ scheme: 'memfs' }) };
+        assert.strictEqual(otherScheme.uri.fsPath, retainedFolder.uri.fsPath);
+        assert.notStrictEqual(otherScheme.uri.toString(), retainedFolder.uri.toString());
+        folders = [retainedFolder, otherScheme];
+        const retained = create(retainedFolder.uri);
+        const remote = create(otherScheme.uri);
+        assert.notStrictEqual(retained, remote);
+        const remoteDisposed = sinon.spy(remote, 'dispose');
+        const retainedDisposed = sinon.spy(retained, 'dispose');
+
+        remove(otherScheme);
+
+        assert.strictEqual(remoteDisposed.callCount, 1);
+        assert.strictEqual(retainedDisposed.callCount, 0);
+        assert.strictEqual(create(retainedFolder.uri), retained);
+        assertListenerCount(1);
+    });
+
+    test('a provisional settings reference receives configuration changes before confirmation', () => {
+        sinon.stub(EnvFileTelemetry, 'sendSettingTelemetry');
+        create(retainedFolder.uri);
+        const provisionalFolder = folder('launch', 2);
+        const config = TypeMoq.Mock.ofType<WorkspaceConfiguration>();
+        let launchArgs: string[] = [];
+        config.setup((value) => value.get('terminal')).returns(() => ({ launchArgs }));
+        folderConfigurations.set(provisionalFolder.uri.toString(), config.object);
+        folders.push(provisionalFolder);
+
+        const executionSettings = create(provisionalFolder.uri);
+        assert.deepStrictEqual(executionSettings.terminal.launchArgs, []);
+
+        launchArgs = ['-u'];
+        configuration.fire({ affectsConfiguration: (section) => section === 'python' });
+        changed.fire({ added: [provisionalFolder], removed: [] });
+
+        assert.deepStrictEqual(executionSettings.terminal.launchArgs, ['-u']);
+        assert.strictEqual(create(provisionalFolder.uri), executionSettings);
+        assertListenerCount(1);
+    });
+
+    test('a settings load that throws does not add an owner or start watching', () => {
+        sinon.stub(EnvFileTelemetry, 'sendSettingTelemetry');
+        const config = TypeMoq.Mock.ofType<WorkspaceConfiguration>();
+        config.setup((value) => value.get('testing')).returns(() => ({ pytestArgs: '-q', unittestArgs: [] }));
+        folderConfigurations.set(removedFolder.uri.toString(), config.object);
+
+        assert.throws(() => create(removedFolder.uri), TypeError);
+        assert.throws(() => create(removedFolder.uri), TypeError);
+        assertListenerCount(0);
+        const retained = create(retainedFolder.uri);
+        remove(removedFolder);
+        assert.strictEqual(create(retainedFolder.uri), retained);
         assertListenerCount(1);
     });
 
@@ -247,14 +344,14 @@ suite('Python settings workspace lifetime', () => {
         changed.fire({ added: [retainedFolder], removed: [] });
 
         assert.strictEqual(disposed.callCount, 1);
-        assertListenerCount(0);
+        assertListenerCount(1);
         const retained = create(retainedFolder.uri);
         assert.notStrictEqual(retained, globalSettings);
         assert.strictEqual(create(), retained);
         assertListenerCount(1);
     });
 
-    test('readding a removed folder creates one fresh listener set', () => {
+    test('readding a removed folder creates a fresh settings owner', () => {
         const old = create(removedFolder.uri);
         remove(removedFolder);
         folders.push(removedFolder);

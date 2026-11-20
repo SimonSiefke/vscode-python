@@ -27,6 +27,7 @@ initializeFileLogging(logDispose);
 import { ProgressLocation, ProgressOptions, window } from 'vscode';
 import { buildApi } from './api';
 import { IApplicationShell, IWorkspaceService } from './common/application/types';
+import { PythonSettings } from './common/configSettings';
 import { IDisposableRegistry, IExperimentService, IExtensionContext } from './common/types';
 import { createDeferred } from './common/utils/async';
 import { Common } from './common/utils/localize';
@@ -92,9 +93,13 @@ export async function deactivate(): Promise<void> {
     // Make sure to shutdown anybody who needs it.
     if (activatedServiceContainer) {
         const disposables = activatedServiceContainer.get<IDisposableRegistry>(IDisposableRegistry);
-        await disposeAll(disposables);
-        // Remove everything that is already disposed.
-        while (disposables.pop());
+        try {
+            await disposeAll(disposables);
+            // Remove everything that is already disposed.
+            while (disposables.pop());
+        } finally {
+            PythonSettings.reset();
+        }
     }
 }
 
