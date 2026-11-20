@@ -1,4 +1,4 @@
-import { commands, Uri } from 'vscode';
+import { commands, TextEditor, Uri } from 'vscode';
 import { Disposable } from 'vscode-jsonrpc';
 import { ICommandManager } from '../common/application/types';
 import { Commands } from '../common/constants';
@@ -16,7 +16,14 @@ import {
     isMultiLineText,
 } from './replUtils';
 import { registerCommand } from '../common/vscodeApis/commandApis';
-import { getActiveNotebookEditor, getActiveTextEditor } from '../common/vscodeApis/windowApis';
+import {
+    getActiveNotebookEditor,
+    getActiveTextEditor,
+    onDidChangeActiveTextEditor,
+} from '../common/vscodeApis/windowApis';
+import { onDidCloseTextDocument } from '../common/vscodeApis/workspaceApis';
+import { DisposableStore } from '../common/utils/resourceLifecycle';
+import { PythonEnvironment } from '../pythonEnvironments/info';
 import { sendTelemetryEvent } from '../telemetry';
 import { EventName } from '../telemetry/constants';
 import { ReplType } from './types';
@@ -68,6 +75,10 @@ export async function registerReplCommands(
             if (!code?.trim() || !isCurrentSource()) {
                 return;
             }
+            const interpreter = await getActiveInterpreter(uri, interpreterService, isCurrentSource);
+            if (!interpreter || !isCurrentSource()) {
+                return;
+            }
             const normalizedCode = await executionHelper.normalizeLines(
                 code,
                 ReplType.native,
@@ -77,10 +88,7 @@ export async function registerReplCommands(
                 return;
             }
 
-            const interpreter = await getActiveInterpreter(uri, interpreterService, isCurrentSource);
-            if (interpreter && isCurrentSource()) {
-                await withNativeRepl(interpreter, session, (repl) => repl.sendToNativeRepl(normalizedCode));
-            }
+            await withNativeRepl(interpreter, session, (repl) => repl.sendToNativeRepl(normalizedCode));
         }),
     );
 }
@@ -166,17 +174,54 @@ async function onInputEnter(
             }
         });
     } else {
-        const input = editor.document.getText();
-        if (!input) {
-            await finishInput(false);
-            return;
+        const complete = await validateInteractiveInput(interpreter, session, editor);
+        if (complete !== undefined) {
+            await finishInput(complete);
         }
-        // The Interactive Window needs syntax validation without owning a Native REPL.
-        const validator = createPythonServer([interpreter.path]);
-        try {
-            await finishInput(await validator.checkValidCommand(input));
-        } finally {
-            validator.dispose();
+    }
+}
+
+async function validateInteractiveInput(
+    interpreter: PythonEnvironment,
+    session: NativeReplSession,
+    editor: TextEditor,
+): Promise<boolean | undefined> {
+    session.interactiveValidation?.dispose();
+    const { document } = editor;
+    const input = document.getText();
+    if (!input) {
+        return false;
+    }
+
+    const validation = new DisposableStore();
+    session.interactiveValidation = validation;
+    try {
+        const validator = validation.add(createPythonServer([interpreter.path]));
+        validation.add(
+            onDidCloseTextDocument((closed) => {
+                if (closed === document) {
+                    validation.dispose();
+                }
+            }),
+        );
+        validation.add(
+            onDidChangeActiveTextEditor((active) => {
+                if (active !== editor) {
+                    validation.dispose();
+                }
+            }),
+        );
+        const complete = await validator.checkValidCommand(input);
+        return validation.isDisposed ? undefined : complete;
+    } catch (error) {
+        if (!validation.isDisposed) {
+            throw error;
         }
+        return undefined;
+    } finally {
+        if (session.interactiveValidation === validation) {
+            session.interactiveValidation = undefined;
+        }
+        validation.dispose();
     }
 }

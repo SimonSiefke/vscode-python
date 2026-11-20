@@ -124,9 +124,11 @@ suite('REPL - Native REPL', () => {
     });
 
     test('createReplController should publish stdout notebook output for REPL execution', async () => {
+        const runWhileBusy = sinon.spy((run: () => Promise<void>) => run());
         const mockServer = {
             interrupt: sinon.stub(),
             execute: sinon.stub().resolves({ status: true, output: 'hello\nworld' }),
+            runWhileBusy,
             dispose: sinon.stub(),
         } as any;
 
@@ -158,6 +160,7 @@ suite('REPL - Native REPL', () => {
             const mockCell = { document: mockTextDocument } as any;
             await (controller.executeHandler as any)([mockCell]);
 
+            sinon.assert.calledOnce(runWhileBusy);
             expect(mockServer.execute.calledOnceWithExactly('print("hi")')).to.be.true;
             expect(createNotebookCellExecutionStub.calledOnce).to.be.true;
             expect(replaceOutputStub.calledOnce).to.be.true;

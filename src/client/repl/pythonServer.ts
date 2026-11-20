@@ -21,6 +21,7 @@ export interface PythonServer extends Disposable {
     onDidBecomeIdle: Event<void>;
     readonly isExecuting: boolean;
     readonly isDisposed: boolean;
+    runWhileBusy<T>(request: () => Promise<T>): Promise<T>;
     execute(code: string): Promise<ExecutionResult | undefined>;
     executeSilently(code: string): Promise<ExecutionResult | undefined>;
     interrupt(): void;
@@ -96,7 +97,7 @@ class PythonServerImpl implements PythonServer, Disposable {
 
     @captureTelemetry(EventName.EXECUTION_CODE, { scope: 'selection' }, false)
     public async execute(code: string): Promise<ExecutionResult | undefined> {
-        return this.withRequest(async () => {
+        return this.runWhileBusy(async () => {
             const result = await this.executeCode(code);
             if (result?.status) {
                 this._onCodeExecuted.fire();
@@ -106,7 +107,7 @@ class PythonServerImpl implements PythonServer, Disposable {
     }
 
     public executeSilently(code: string): Promise<ExecutionResult | undefined> {
-        return this.withRequest(() => this.executeCode(code));
+        return this.runWhileBusy(() => this.executeCode(code));
     }
 
     private async executeCode(code: string): Promise<ExecutionResult | undefined> {
@@ -128,13 +129,13 @@ class PythonServerImpl implements PythonServer, Disposable {
     }
 
     public async checkValidCommand(code: string): Promise<boolean> {
-        return this.withRequest(async () => {
+        return this.runWhileBusy(async () => {
             const result: ExecutionResult = await this.connection.sendRequest('check_valid_command', code);
             return result.output === 'True';
         });
     }
 
-    private async withRequest<T>(request: () => Promise<T>): Promise<T> {
+    public async runWhileBusy<T>(request: () => Promise<T>): Promise<T> {
         this.inFlightRequests += 1;
         try {
             return await request();

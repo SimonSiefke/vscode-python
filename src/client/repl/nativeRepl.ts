@@ -40,6 +40,7 @@ export interface NativeReplSession {
     disposed: boolean;
     activeCommands: number;
     cancellation: CancellationTokenSource;
+    interactiveValidation?: DisposableStore;
 }
 
 let pendingMementoUpdate = Promise.resolve();
@@ -376,6 +377,8 @@ export function registerNativeRepl(disposables: Disposable[]): NativeReplSession
             session.disposed = true;
             session.cancellation.cancel();
             session.cancellation.dispose();
+            session.interactiveValidation?.dispose();
+            session.interactiveValidation = undefined;
             session.current?.dispose();
         },
     });

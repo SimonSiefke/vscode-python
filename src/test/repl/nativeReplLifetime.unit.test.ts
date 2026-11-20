@@ -70,6 +70,8 @@ suite('Native REPL lifetime', () => {
     let busyServers: Set<pythonServer.PythonServer>;
     let createServer: sinon.SinonStub;
     let validateCode: sinon.SinonStub;
+    let closedText: EventEmitter<TextDocument>;
+    let activeTextChanged: EventEmitter<TextEditor | undefined>;
     let createRepl: sinon.SinonSpy;
     let workspaceFolders: sinon.SinonStub;
 
@@ -114,6 +116,10 @@ suite('Native REPL lifetime', () => {
         registry = [];
         session = registerNativeRepl(registry);
         closed = new EventEmitter<NotebookDocument>();
+        closedText = new EventEmitter<TextDocument>();
+        activeTextChanged = new EventEmitter<TextEditor | undefined>();
+        sinon.stub(workspaceApis, 'onDidCloseTextDocument').callsFake(closedText.event);
+        sinon.stub(windowApis, 'onDidChangeActiveTextEditor').callsFake(activeTextChanged.event);
         closeWork = [];
         listenerDisposals = [];
         serverDisposals = [];
@@ -153,6 +159,7 @@ suite('Native REPL lifetime', () => {
                 get isExecuting() {
                     return busyServers.has(this);
                 },
+                runWhileBusy: (run) => run(),
                 isDisposed: false,
                 execute: async () => ({ status: true, output: '' }),
                 executeSilently: async () => ({ status: true, output: '' }),
@@ -183,6 +190,8 @@ suite('Native REPL lifetime', () => {
                 registry.forEach((disposable) => disposable.dispose());
             } finally {
                 closed.dispose();
+                closedText.dispose();
+                activeTextChanged.dispose();
                 sinon.restore();
             }
         }
@@ -382,18 +391,81 @@ suite('Native REPL lifetime', () => {
         sinon.assert.notCalled(createServer);
     });
 
-    test('Interactive Window Enter releases its syntax checker without creating a Native REPL', async () => {
+    test('Interactive Window releases its syntax checker before workbench execution finishes', async () => {
+        mockReplInput();
+        const started = createDeferred();
+        const execution = createDeferred();
+        const execute = sinon.stub(commands, 'executeCommand').callsFake(() => {
+            started.resolve();
+            return execution.promise;
+        });
+        const enter = await registerNativeEnter(() => Promise.resolve(interpreter), Commands.Exec_In_IW_Enter);
+        const pending = enter(notebook.uri);
+        await started.promise;
+
+        try {
+            sinon.assert.calledOnceWithExactly(execute, 'interactive.execute');
+            sinon.assert.calledOnceWithExactly(validateCode, 'print(1)');
+            sinon.assert.calledOnce(serverDisposals[0]);
+            assert.strictEqual(controllerDisposals.length, 0);
+            assert.strictEqual(listenerDisposals.length, 0);
+            assert.strictEqual(session.current, undefined);
+        } finally {
+            execution.resolve();
+            await pending;
+        }
+    });
+
+    test('closing Interactive Window input releases a checker with a held syntax reply', async () => {
+        const editor = mockReplInput()();
+        const execute = sinon.stub(commands, 'executeCommand').resolves();
+        const validation = createDeferred<boolean>();
+        const started = createDeferred();
+        validateCode.callsFake(() => {
+            started.resolve();
+            return validation.promise;
+        });
+        const enter = await registerNativeEnter(() => Promise.resolve(interpreter), Commands.Exec_In_IW_Enter);
+        const pending = enter(notebook.uri);
+        await started.promise;
+        serverDisposals[0].callsFake(() => validation.reject(new Error('closed transport')));
+
+        closedText.fire(editor!.document);
+        sinon.assert.calledOnce(serverDisposals[0]);
+        await pending;
+        sinon.assert.notCalled(execute);
+    });
+
+    test('another Interactive Window Enter supersedes a pending checker, and shutdown releases its replacement', async () => {
         mockReplInput();
         const execute = sinon.stub(commands, 'executeCommand').resolves();
+        const firstStarted = createDeferred();
+        const secondStarted = createDeferred();
+        const firstReply = createDeferred<boolean>();
+        const secondReply = createDeferred<boolean>();
+        validateCode.onFirstCall().callsFake(() => {
+            firstStarted.resolve();
+            return firstReply.promise;
+        });
+        validateCode.onSecondCall().callsFake(() => {
+            secondStarted.resolve();
+            return secondReply.promise;
+        });
         const enter = await registerNativeEnter(() => Promise.resolve(interpreter), Commands.Exec_In_IW_Enter);
-        await enter(notebook.uri);
-
-        sinon.assert.calledOnceWithExactly(execute, 'interactive.execute');
-        sinon.assert.calledOnceWithExactly(validateCode, 'print(1)');
+        const first = enter(notebook.uri);
+        await firstStarted.promise;
+        serverDisposals[0].callsFake(() => firstReply.reject(new Error('superseded')));
+        const second = enter(notebook.uri);
+        await secondStarted.promise;
+        serverDisposals[1].callsFake(() => secondReply.reject(new Error('shutdown')));
+        await first;
         sinon.assert.calledOnce(serverDisposals[0]);
-        assert.strictEqual(controllerDisposals.length, 0);
-        assert.strictEqual(listenerDisposals.length, 0);
-        assert.strictEqual(session.current, undefined);
+        sinon.assert.notCalled(serverDisposals[1]);
+
+        await disposeAll(registry);
+        sinon.assert.calledOnce(serverDisposals[1]);
+        await second;
+        sinon.assert.notCalled(execute);
     });
 
     test('a closed restored notebook does not discard Start already waiting for the same owner', async () => {

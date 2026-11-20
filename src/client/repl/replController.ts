@@ -11,23 +11,27 @@ export function createReplController(server: PythonServer): vscode.NotebookContr
         server.interrupt();
     };
 
-    controller.executeHandler = async (cells) => {
-        for (const cell of cells) {
-            const exec = controller.createNotebookCellExecution(cell);
-            exec.start(Date.now());
+    controller.executeHandler = (cells) =>
+        server.runWhileBusy(async () => {
+            for (const cell of cells) {
+                if (server.isDisposed) {
+                    break;
+                }
+                const exec = controller.createNotebookCellExecution(cell);
+                exec.start(Date.now());
 
-            const code = cell.document.getText();
-            const result = await server.execute(code);
+                const code = cell.document.getText();
+                const result = await server.execute(code);
 
-            if (result?.output) {
-                const stdoutItem = vscode.NotebookCellOutputItem.stdout(result.output);
-                const output = new vscode.NotebookCellOutput([stdoutItem], {});
-                exec.replaceOutput([output]);
-                // TODO: Properly update via NotebookCellOutputItem.error later.
+                if (result?.output) {
+                    const stdoutItem = vscode.NotebookCellOutputItem.stdout(result.output);
+                    const output = new vscode.NotebookCellOutput([stdoutItem], {});
+                    exec.replaceOutput([output]);
+                    // TODO: Properly update via NotebookCellOutputItem.error later.
+                }
+
+                exec.end(result?.status);
             }
-
-            exec.end(result?.status);
-        }
-    };
+        });
     return controller;
 }

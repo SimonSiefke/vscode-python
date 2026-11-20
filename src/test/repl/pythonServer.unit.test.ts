@@ -172,4 +172,31 @@ suite('Native REPL Python server lifetime', () => {
         assert.strictEqual(server.isExecuting, false);
         sinon.assert.calledOnce(idle);
     });
+
+    test('idle is reported after all cells in an execution batch', async () => {
+        const first = createDeferred<ExecutionResult>();
+        const second = createDeferred<ExecutionResult>();
+        const secondStarted = createDeferred();
+        sendRequest.onFirstCall().returns(first.promise);
+        sendRequest.onSecondCall().callsFake(() => {
+            secondStarted.resolve();
+            return second.promise;
+        });
+        const server = startServer();
+        const idle = sinon.spy();
+        server.onDidBecomeIdle(idle);
+
+        const batch = server.runWhileBusy(async () => {
+            await server.execute('first');
+            await server.execute('second');
+        });
+        first.resolve({ status: true, output: 'first' });
+        await secondStarted.promise;
+        sinon.assert.notCalled(idle);
+
+        second.resolve({ status: true, output: 'second' });
+        await batch;
+        assert.strictEqual(server.isExecuting, false);
+        sinon.assert.calledOnce(idle);
+    });
 });

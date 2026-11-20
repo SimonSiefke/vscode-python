@@ -217,9 +217,16 @@ suite('REPL - register native repl command', () => {
             .returns(() => Promise.resolve(undefined));
         mockSelection('print(1)');
         const { commandHandler, useRepl } = await registerShiftEnter();
+        const executeCommand = sinon.stub(commands, 'executeCommand').resolves();
+        const uri = Uri.file('/workspace/source.py');
 
-        await commandHandler(Uri.file('/workspace/source.py'));
+        await commandHandler(uri);
 
+        sinon.assert.calledOnceWithExactly(executeCommand, Commands.TriggerEnvironmentSelection, uri);
+        executionHelper.verify(
+            (helper) => helper.normalizeLines(TypeMoq.It.isAny(), TypeMoq.It.isAny(), TypeMoq.It.isAny()),
+            TypeMoq.Times.never(),
+        );
         sinon.assert.notCalled(useRepl);
     });
 });
