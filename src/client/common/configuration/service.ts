@@ -43,6 +43,7 @@ export class ConfigurationService implements IConfigurationService {
             interpreterPathService,
             defaultLS,
             extensions,
+            this.serviceContainer,
         );
     }
 

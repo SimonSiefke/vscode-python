@@ -19,6 +19,7 @@ import {
 import { LanguageServerType } from '../activation/types';
 import './extensions';
 import { IInterpreterAutoSelectionProxyService } from '../interpreter/autoSelection/types';
+import type { IServiceContainer } from '../ioc/types';
 import { traceError } from '../logging';
 import { sendTelemetryEvent } from '../telemetry';
 import { EventName } from '../telemetry/constants';
@@ -103,6 +104,13 @@ export class PythonSettings implements IPythonSettings {
 
     private static globalSettings: PythonSettings | undefined;
 
+    private static activeServiceContainer: IServiceContainer | undefined;
+
+    // Keep the telemetry marker with the host's folder if its weak settings value is collected.
+    private static reportedFolderFormatOnType = new WeakSet<WorkspaceFolder>();
+
+    private static reportedGlobalFormatOnType = false;
+
     private static subscriptions: Disposable[] | undefined;
 
     public envFile = '';
@@ -173,15 +181,19 @@ export class PythonSettings implements IPythonSettings {
         interpreterPathService: IInterpreterPathService,
         defaultLS: IDefaultLanguageServer | undefined,
         extensions: IExtensions,
+        serviceContainer?: IServiceContainer,
     ): PythonSettings {
         workspace = workspace || new WorkspaceService();
         const folder = PythonSettings.getWorkspaceFolder(resource, workspace);
-        const owner = folder && PythonSettings.ownersByUri.get(folder.uri.toString());
-        const cached = folder
-            ? owner?.folder.deref() === folder && owner.settings.deref()
-            : PythonSettings.globalSettings;
-        if (cached) {
-            return cached;
+        const canOwnSettings = !serviceContainer || serviceContainer === PythonSettings.activeServiceContainer;
+        const key = folder?.uri.toString() ?? '';
+        if (canOwnSettings) {
+            const cached = folder
+                ? PythonSettings.ownersByUri.get(key)?.settings.deref()
+                : PythonSettings.globalSettings;
+            if (cached) {
+                return cached;
+            }
         }
 
         const settings = new PythonSettings(
@@ -192,9 +204,13 @@ export class PythonSettings implements IPythonSettings {
             defaultLS,
             extensions,
         );
+        // An extension can still hold the API from before workspace trust reactivated Python.
+        if (!canOwnSettings) {
+            return settings;
+        }
+
         PythonSettings.subscribe(workspace, interpreterAutoSelectionService, interpreterPathService);
         if (folder) {
-            const key = folder.uri.toString();
             PythonSettings.disposeFolderSettings(key);
             const owner = { settings: new WeakRef(settings), folder: new WeakRef(folder) };
             PythonSettings.ownersByUri.set(key, owner);
@@ -202,13 +218,44 @@ export class PythonSettings implements IPythonSettings {
         } else {
             PythonSettings.globalSettings = settings;
         }
+        PythonSettings.reportFormatOnType(workspace, resource, folder);
+        return settings;
+    }
+
+    public static activateFor(serviceContainer: IServiceContainer): void {
+        PythonSettings.reset();
+        PythonSettings.activeServiceContainer = serviceContainer;
+    }
+
+    public static deactivateFor(serviceContainer: IServiceContainer): void {
+        if (PythonSettings.activeServiceContainer === serviceContainer) {
+            PythonSettings.activeServiceContainer = undefined;
+            PythonSettings.reset();
+        }
+    }
+
+    private static reportFormatOnType(
+        workspace: IWorkspaceService,
+        resource: Resource,
+        folder?: WorkspaceFolder,
+    ): void {
+        if (folder) {
+            if (PythonSettings.reportedFolderFormatOnType.has(folder)) {
+                return;
+            }
+            PythonSettings.reportedFolderFormatOnType.add(folder);
+        } else {
+            if (PythonSettings.reportedGlobalFormatOnType) {
+                return;
+            }
+            PythonSettings.reportedGlobalFormatOnType = true;
+        }
         // Pass null to avoid VSC from complaining about not passing in a value.
 
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const config = workspace.getConfiguration('editor', resource || (null as any));
         const formatOnType = config ? config.get('formatOnType', false) : false;
         sendTelemetryEvent(EventName.FORMAT_ON_TYPE, undefined, { enabled: formatOnType });
-        return settings;
     }
 
     @debounceSync(1)
@@ -287,15 +334,20 @@ export class PythonSettings implements IPythonSettings {
 
     private static rebindFolderSettings(folder: WorkspaceFolder): void {
         const owner = PythonSettings.ownersByUri.get(folder.uri.toString());
-        if (owner && owner.folder.deref() !== folder) {
+        const oldFolder = owner?.folder.deref();
+        if (owner && oldFolder !== folder) {
             // An overlapping edit can replace the host's folder object even when its URI remains in the workspace.
+            if (oldFolder && PythonSettings.reportedFolderFormatOnType.has(oldFolder)) {
+                PythonSettings.reportedFolderFormatOnType.add(folder);
+            }
             owner.folder = new WeakRef(folder);
         }
     }
 
     private static onWorkspaceFoldersChanged(workspace: IWorkspaceService, event: WorkspaceFoldersChangeEvent): void {
-        for (const { uri } of event.removed) {
-            PythonSettings.disposeFolderSettings(uri.toString());
+        for (const folder of event.removed) {
+            PythonSettings.reportedFolderFormatOnType.delete(folder);
+            PythonSettings.disposeFolderSettings(folder.uri.toString());
         }
         for (const folder of event.added) {
             const key = folder.uri.toString();
@@ -307,6 +359,7 @@ export class PythonSettings implements IPythonSettings {
         if (event.added.length > 0) {
             PythonSettings.globalSettings?.dispose();
             PythonSettings.globalSettings = undefined;
+            PythonSettings.reportedGlobalFormatOnType = false;
         }
 
         const folders = workspace.workspaceFolders;
@@ -324,7 +377,9 @@ export class PythonSettings implements IPythonSettings {
         }
     }
 
-    public static reset(): void {
+    private static reset(): void {
+        PythonSettings.reportedFolderFormatOnType = new WeakSet();
+        PythonSettings.reportedGlobalFormatOnType = false;
         PythonSettings.subscriptions?.forEach((subscription) => subscription?.dispose());
         PythonSettings.subscriptions = undefined;
         PythonSettings.ownersByUri.forEach((_owner, key) => PythonSettings.disposeFolderSettings(key));

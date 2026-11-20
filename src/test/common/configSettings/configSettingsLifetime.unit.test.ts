@@ -2,6 +2,9 @@
 // Licensed under the MIT License.
 
 import * as assert from 'assert';
+import { execFile } from 'child_process';
+import { setImmediate as yieldTurn } from 'timers/promises';
+import { promisify } from 'util';
 import * as sinon from 'sinon';
 import * as TypeMoq from 'typemoq';
 import {
@@ -16,6 +19,7 @@ import {
 import { IWorkspaceService } from '../../../client/common/application/types';
 import { PythonSettings } from '../../../client/common/configSettings';
 import { IInterpreterPathService } from '../../../client/common/types';
+import type { IServiceContainer } from '../../../client/ioc/types';
 import * as EnvFileTelemetry from '../../../client/telemetry/envFileTelemetry';
 import { MockAutoSelectionService } from '../../mocks/autoSelector';
 import { MockExtensions } from '../../mocks/extensions';
@@ -45,13 +49,14 @@ suite('Python settings workspace lifetime', () => {
     let changed: TrackedEvent<WorkspaceFoldersChangeEvent>;
     let configuration: TrackedEvent<ConfigurationChangeEvent>;
     let folderConfigurations: Map<string, WorkspaceConfiguration>;
+    let formatOnTypeReads: Map<string, number>;
     let interpreter: TrackedEvent<never>;
     let autoSelection: TrackedEvent<void>;
     let autoSelectionService: MockAutoSelectionService;
     let workspace: TypeMoq.IMock<IWorkspaceService>;
     let pathService: TypeMoq.IMock<IInterpreterPathService>;
     const folder = (name: string, index: number): WorkspaceFolder => ({ uri: Uri.file(`/work/${name}`), name, index });
-    const create = (resource?: Uri) =>
+    const create = (resource?: Uri, serviceContainer?: IServiceContainer) =>
         PythonSettings.getInstance(
             resource,
             autoSelectionService,
@@ -59,6 +64,7 @@ suite('Python settings workspace lifetime', () => {
             pathService.object,
             undefined,
             new MockExtensions(),
+            serviceContainer,
         );
     const remove = (...removed: WorkspaceFolder[]) => {
         folders = folders.filter((item) => !removed.includes(item));
@@ -79,6 +85,7 @@ suite('Python settings workspace lifetime', () => {
         changed = trackedEvent<WorkspaceFoldersChangeEvent>();
         configuration = trackedEvent<ConfigurationChangeEvent>();
         folderConfigurations = new Map();
+        formatOnTypeReads = new Map();
         interpreter = trackedEvent<never>();
         autoSelection = trackedEvent<void>();
         autoSelectionService = new MockAutoSelectionService();
@@ -92,9 +99,13 @@ suite('Python settings workspace lifetime', () => {
         workspace.setup((value) => value.onDidChangeConfiguration).returns(() => configuration.event);
         workspace
             .setup((value) => value.getConfiguration(TypeMoq.It.isAny(), TypeMoq.It.isAny()))
-            .returns((section: string, resource?: Uri) =>
-                section === 'python' && resource ? folderConfigurations.get(resource.toString())! : undefined!,
-            );
+            .returns((section: string, resource?: Uri) => {
+                if (section === 'editor' && resource) {
+                    const key = resource.toString();
+                    formatOnTypeReads.set(key, (formatOnTypeReads.get(key) ?? 0) + 1);
+                }
+                return section === 'python' && resource ? folderConfigurations.get(resource.toString())! : undefined!;
+            });
         pathService = TypeMoq.Mock.ofType<IInterpreterPathService>();
         pathService.setup((value) => value.get(TypeMoq.It.isAny())).returns(() => 'python');
         pathService.setup((value) => value.onDidChange).returns(() => interpreter.event);
@@ -265,14 +276,31 @@ suite('Python settings workspace lifetime', () => {
         assertListenerCount(1);
     });
 
-    test('a retained root keeps its owner when the host replaces the folder object without a delta', () => {
+    test('an early lookup after a folder object replacement preserves settings held by a caller', () => {
+        let readDuringEvent: PythonSettings | undefined;
+        const readEarly = changed.event(() => {
+            readDuringEvent = create(retainedFolder.uri);
+        });
+        const config = TypeMoq.Mock.ofType<WorkspaceConfiguration>();
+        let launchArgs: string[] = [];
+        config.setup((value) => value.get('terminal')).returns(() => ({ launchArgs }));
+        folderConfigurations.set(retainedFolder.uri.toString(), config.object);
+        sinon.stub(EnvFileTelemetry, 'sendSettingTelemetry');
         const retained = create(retainedFolder.uri);
+        const disposed = sinon.spy(retained, 'dispose');
         const replacement = { ...retainedFolder };
         folders = [replacement, removedFolder];
         changed.fire({ added: [], removed: [] });
+        readEarly.dispose();
 
+        assert.strictEqual(readDuringEvent, retained);
         assert.strictEqual(create(replacement.uri), retained);
-        const disposed = sinon.spy(retained, 'dispose');
+        assert.strictEqual(disposed.callCount, 0);
+
+        launchArgs = ['-u'];
+        configuration.fire({ affectsConfiguration: (section) => section === 'python' });
+        assert.deepStrictEqual(retained.terminal.launchArgs, ['-u']);
+
         remove(replacement);
         assert.strictEqual(disposed.callCount, 1);
         assertListenerCount(1);
@@ -319,14 +347,131 @@ suite('Python settings workspace lifetime', () => {
         assertListenerCount(1);
     });
 
+    test('retired service containers cannot create or replace shared settings ownership', () => {
+        const formerContainer = {} as IServiceContainer;
+        const currentContainer = {} as IServiceContainer;
+        PythonSettings.activateFor(formerContainer);
+        try {
+            const former = create(retainedFolder.uri, formerContainer);
+            assertListenerCount(1);
+            PythonSettings.deactivateFor(formerContainer);
+
+            assert.notStrictEqual(create(retainedFolder.uri, formerContainer), former);
+            assertListenerCount(0);
+
+            PythonSettings.activateFor(currentContainer);
+            assert.notStrictEqual(create(retainedFolder.uri, formerContainer), former);
+            assertListenerCount(0);
+            const current = create(retainedFolder.uri, currentContainer);
+            assert.notStrictEqual(create(retainedFolder.uri, formerContainer), current);
+            assert.strictEqual(create(retainedFolder.uri, currentContainer), current);
+            assertListenerCount(1);
+        } finally {
+            PythonSettings.deactivateFor(formerContainer);
+            PythonSettings.deactivateFor(currentContainer);
+        }
+    });
+
+    test('garbage collection releases rejected owners and prunes the URI index', async function () {
+        this.timeout(20000);
+        const collect = global.gc;
+        if (!collect) {
+            // Mocha runs with GC hidden by default. Isolate this one test in the same Node with GC exposed.
+            const { stdout } = await promisify(execFile)(
+                process.execPath,
+                [
+                    '--expose-gc',
+                    require.resolve('mocha/bin/mocha.js'),
+                    '--no-config',
+                    '--no-package',
+                    '--require',
+                    require.resolve('../../unittests'),
+                    '--ui',
+                    'tdd',
+                    '--grep',
+                    'garbage collection releases rejected owners and prunes the URI index',
+                    __filename,
+                ],
+                { timeout: 15000 },
+            );
+            assert.match(stdout, /1 passing/);
+            return;
+        }
+
+        const rejectedFolder = folder('rejected-before-first-lookup', 2);
+        const rejectedKey = rejectedFolder.uri.toString();
+        const retainedKey = retainedFolder.uri.toString();
+        folders.push(rejectedFolder);
+        const rejected = new WeakRef(create(rejectedFolder.uri));
+        const retained = new WeakRef(create(retainedFolder.uri));
+        const { ownersByUri } = (PythonSettings as unknown) as { ownersByUri: ReadonlyMap<string, unknown> };
+        assert.strictEqual(ownersByUri.has(rejectedKey), true);
+        assert.strictEqual(ownersByUri.has(retainedKey), true);
+
+        // The holder keeps the host folder object while VS Code rolls back without a workspace event.
+        folders = [retainedFolder, removedFolder];
+        for (let attempt = 0; attempt < 12 && ownersByUri.size > 0; attempt += 1) {
+            await yieldTurn();
+            collect();
+            await yieldTurn();
+        }
+
+        assert.strictEqual(rejectedFolder.uri.toString(), rejectedKey);
+        assert.strictEqual(rejected.deref(), undefined);
+        assert.strictEqual(retained.deref(), undefined);
+        assert.strictEqual(ownersByUri.has(rejectedKey), false);
+        assert.strictEqual(ownersByUri.has(retainedKey), false);
+        assert.strictEqual(formatOnTypeReads.get(retainedKey), 1);
+        create(retainedFolder.uri);
+        assert.strictEqual(formatOnTypeReads.get(retainedKey), 1);
+        assertListenerCount(1);
+    });
+
+    test('a failing owner cannot block a later owner from refreshing', () => {
+        sinon.stub(EnvFileTelemetry, 'sendSettingTelemetry');
+        let fail = false;
+        let supportedArgs: string[] = [];
+        const brokenConfig = TypeMoq.Mock.ofType<WorkspaceConfiguration>();
+        brokenConfig
+            .setup((value) => value.get('testing'))
+            .returns(() => ({
+                pytestPath: 'pytest',
+                pytestArgs: fail ? '-q' : supportedArgs,
+                unittestArgs: [],
+            }));
+        folderConfigurations.set(retainedFolder.uri.toString(), brokenConfig.object);
+        let launchArgs: string[] = [];
+        const healthyConfig = TypeMoq.Mock.ofType<WorkspaceConfiguration>();
+        healthyConfig.setup((value) => value.get('terminal')).returns(() => ({ launchArgs }));
+        folderConfigurations.set(removedFolder.uri.toString(), healthyConfig.object);
+        const earlierOwner = create(retainedFolder.uri);
+        const laterOwner = create(removedFolder.uri);
+        assert.deepStrictEqual(earlierOwner.testing.pytestArgs, []);
+        assert.deepStrictEqual(laterOwner.terminal.launchArgs, []);
+
+        fail = true;
+        launchArgs = ['-u'];
+        configuration.fire({ affectsConfiguration: (section) => section === 'python' });
+
+        assert.deepStrictEqual(laterOwner.terminal.launchArgs, ['-u']);
+
+        fail = false;
+        supportedArgs = ['-q'];
+        configuration.fire({ affectsConfiguration: (section) => section === 'python' });
+        assert.deepStrictEqual(earlierOwner.testing.pytestArgs, ['-q']);
+        assertListenerCount(1);
+    });
+
     test('a settings load that throws does not add an owner or start watching', () => {
         sinon.stub(EnvFileTelemetry, 'sendSettingTelemetry');
         const config = TypeMoq.Mock.ofType<WorkspaceConfiguration>();
-        config.setup((value) => value.get('testing')).returns(() => ({ pytestArgs: '-q', unittestArgs: [] }));
+        config
+            .setup((value) => value.get('testing'))
+            .returns(() => ({ pytestPath: 'pytest', pytestArgs: '-q', unittestArgs: [] }));
         folderConfigurations.set(removedFolder.uri.toString(), config.object);
 
-        assert.throws(() => create(removedFolder.uri), TypeError);
-        assert.throws(() => create(removedFolder.uri), TypeError);
+        assert.throws(() => create(removedFolder.uri), /pytestArgs\.map is not a function/);
+        assert.throws(() => create(removedFolder.uri), /pytestArgs\.map is not a function/);
         assertListenerCount(0);
         const retained = create(retainedFolder.uri);
         remove(removedFolder);
