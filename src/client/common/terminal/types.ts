@@ -35,6 +35,7 @@ export enum TerminalShellType {
 }
 
 export interface ITerminalService extends IDisposable {
+    /** Shared by wrappers for the same terminal service. */
     readonly onDidCloseTerminal: Event<void>;
     /**
      * Sends a command to the terminal.

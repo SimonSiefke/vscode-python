@@ -5,7 +5,7 @@
 
 import { inject, injectable } from 'inversify';
 import * as path from 'path';
-import { Disposable, TerminalOptions, Uri } from 'vscode';
+import { Disposable, Event, TerminalOptions, Uri } from 'vscode';
 import { IApplicationShell, ICommandManager, IWorkspaceService } from '../../common/application/types';
 import '../../common/extensions';
 import { IPlatformService } from '../../common/platform/types';
@@ -25,7 +25,7 @@ export class TerminalCodeExecutionProvider implements ICodeExecutionService {
     private hasRanOutsideCurrentDrive = false;
     protected terminalTitle!: string;
     protected terminalIcon?: TerminalOptions['iconPath'];
-    private replActive?: Promise<boolean>;
+    private readonly repls = new Map<Event<void>, { ready: Promise<boolean>; closeListener: IDisposable }>();
 
     constructor(
         @inject(ITerminalServiceFactory) protected readonly terminalServiceFactory: ITerminalServiceFactory,
@@ -36,7 +36,16 @@ export class TerminalCodeExecutionProvider implements ICodeExecutionService {
         @inject(IInterpreterService) protected readonly interpreterService: IInterpreterService,
         @inject(ICommandManager) protected readonly commandManager: ICommandManager,
         @inject(IApplicationShell) protected readonly applicationShell: IApplicationShell,
-    ) {}
+    ) {
+        this.disposables.push({
+            dispose: () => {
+                for (const { closeListener } of this.repls.values()) {
+                    closeListener.dispose();
+                }
+                this.repls.clear();
+            },
+        });
+    }
 
     public async executeFile(file: Uri, options?: { newTerminalPerFile: boolean }) {
         await this.setCwdForFileExecution(file, options);
@@ -66,12 +75,14 @@ export class TerminalCodeExecutionProvider implements ICodeExecutionService {
 
     public async initializeRepl(resource: Resource) {
         const terminalService = this.getTerminalService(resource);
-        if (this.replActive && (await this.replActive)) {
+        const onDidCloseTerminal = terminalService.onDidCloseTerminal;
+        const repl = this.repls.get(onDidCloseTerminal);
+        if (repl && (await repl.ready)) {
             await terminalService.show();
             return;
         }
         sendTelemetryEvent(EventName.REPL, undefined, { replType: 'Terminal' });
-        this.replActive = new Promise<boolean>(async (resolve) => {
+        const ready = new Promise<boolean>(async (resolve) => {
             const replCommandArgs = await this.getExecutableInfo(resource);
             let listener: IDisposable;
             Promise.race([
@@ -103,13 +114,14 @@ export class TerminalCodeExecutionProvider implements ICodeExecutionService {
 
             await terminalService.sendCommand(replCommandArgs.command, replCommandArgs.args);
         });
-        this.disposables.push(
-            terminalService.onDidCloseTerminal(() => {
-                this.replActive = undefined;
-            }),
-        );
+        const closeListener = onDidCloseTerminal(() => {
+            const closedRepl = this.repls.get(onDidCloseTerminal);
+            this.repls.delete(onDidCloseTerminal);
+            closedRepl?.closeListener.dispose();
+        });
+        this.repls.set(onDidCloseTerminal, { ready, closeListener });
 
-        await this.replActive;
+        await ready;
     }
 
     public async getExecutableInfo(resource?: Uri, args: string[] = []): Promise<PythonExecInfo> {
