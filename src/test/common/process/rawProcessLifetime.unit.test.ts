@@ -199,6 +199,51 @@ suite('Completed process handle lifetime', () => {
     });
 
     if (process.platform !== 'win32') {
+        test('cancelling from an observable process error leaves explicit shutdown available', async () => {
+            const handles = new Set<IDisposable>();
+            const cancellation = new ReplayingCancellationTokenSource();
+            const result = execObservable(
+                process.execPath,
+                ['-e', `process.disconnect(); ${exitIfNotStopped}`],
+                { doNotLog: true, stdio: ['ignore', 'pipe', 'pipe', 'ipc'], token: cancellation.token },
+                undefined,
+                handles,
+            );
+            const { proc } = result;
+            assert.ok(proc);
+            const closed = new Promise<NodeJS.Signals | null>((resolve) =>
+                proc.once('close', (_, signal) => resolve(signal)),
+            );
+            const kill = spy(process, 'kill');
+            try {
+                const failed = createDeferred<NodeJS.ErrnoException>();
+                result.out.subscribe({
+                    error(error) {
+                        cancellation.cancel();
+                        failed.resolve(error);
+                    },
+                });
+                await once(proc, 'disconnect');
+                proc.send('message');
+                const error = await Promise.race([failed.promise, closed.then(() => undefined)]);
+                assert.strictEqual(error?.code, 'ERR_IPC_CHANNEL_CLOSED');
+                assert.strictEqual(kill.withArgs(proc.pid).callCount, 0);
+
+                result.out.subscribe();
+                await new Promise<void>((resolve) => cancellation.token.onCancellationRequested(resolve));
+                assert.strictEqual(kill.withArgs(proc.pid).callCount, 0);
+                assert.strictEqual(handles.size, 1);
+                handles.forEach((handle) => handle.dispose());
+                assert.strictEqual(await closed, 'SIGTERM');
+                assert.strictEqual(handles.size, 0);
+            } finally {
+                kill.restore();
+                cancellation.dispose();
+                if (proc.exitCode === null && proc.signalCode === null) proc.kill('SIGKILL');
+                await closed;
+            }
+        });
+
         test('shell abort does not signal a child again while it handles SIGTERM', async () => {
             const service = new ProcessService();
             const controller = new AbortController();
@@ -351,6 +396,42 @@ suite('Completed process handle lifetime', () => {
                 cancellation.dispose();
                 if (proc.exitCode === null && proc.signalCode === null) proc.kill('SIGKILL');
                 await result;
+                service.dispose();
+            }
+        });
+
+        test('shutdown retries after an aborted plain execution rejects with a live child', async () => {
+            const service = new ProcessService();
+            const controller = new AbortController();
+            const spawn = spy(childProcess, 'spawn');
+            const result = service
+                .exec(
+                    process.execPath,
+                    ['-e', `${ignoreFirstSignal} process.stdout.write("ready"); ${exitIfNotStopped}`],
+                    { signal: controller.signal },
+                )
+                .catch((error: unknown) => error);
+            const proc = spawn.firstCall?.returnValue;
+            spawn.restore();
+            assert.ok(proc?.stdout);
+            const closed = new Promise<NodeJS.Signals | null>((resolve) =>
+                proc.once('close', (_, signal) => resolve(signal)),
+            );
+            try {
+                assert.strictEqual(await nextOutput(proc.stdout, closed), 'ready');
+                const survived = nextOutput(proc.stdout, closed);
+                controller.abort();
+                const error = await result;
+                assert.ok(error instanceof Error);
+                assert.strictEqual(error.name, 'AbortError');
+                assert.strictEqual(await survived, 'survived');
+
+                service.dispose();
+                assert.strictEqual(await closed, 'SIGTERM');
+            } finally {
+                controller.abort();
+                if (proc.exitCode === null && proc.signalCode === null) proc.kill('SIGKILL');
+                await closed;
                 service.dispose();
             }
         });

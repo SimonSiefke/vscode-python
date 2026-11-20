@@ -230,7 +230,7 @@ export function execObservable(
     };
     trackProcess(proc, { dispose }, disposables);
 
-    let cancellationRequested = false;
+    let stopOnCancellation = true;
     const output = new Observable<Output<string>>((subscriber) => {
         const internalDisposables: IDisposable[] = [];
 
@@ -246,8 +246,8 @@ export function execObservable(
             internalDisposables.push(
                 options.token.onCancellationRequested(() => {
                     // All subscriptions share one cancellation request for this child.
-                    if (!cancellationRequested) {
-                        cancellationRequested = true;
+                    if (stopOnCancellation) {
+                        stopOnCancellation = false;
                         stopProcess(proc);
                     }
                 }),
@@ -279,6 +279,8 @@ export function execObservable(
             internalDisposables.forEach((d) => d.dispose());
         });
         proc.once('error', (ex) => {
+            // An observer can cancel from its error handler while the child is still live.
+            stopOnCancellation = false;
             subscriber.error(ex);
             internalDisposables.forEach((d) => d.dispose());
         });
