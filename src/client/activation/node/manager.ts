@@ -27,6 +27,12 @@ export class NodeLanguageServerManager implements ILanguageServerManager {
 
     private connected = false;
 
+    private closed = false;
+
+    private initialStartup?: Promise<void>;
+
+    private restarting?: Promise<void>;
+
     private lsVersion: string | undefined;
 
     private started = false;
@@ -39,13 +45,24 @@ export class NodeLanguageServerManager implements ILanguageServerManager {
         private readonly languageServerProxy: NodeLanguageServerProxy,
         commandManager: ICommandManager,
         private readonly extensions: IExtensions,
+        private readonly replaceStartingServer?: () => Promise<void>,
     ) {
         if (NodeLanguageServerManager.commandDispose) {
             NodeLanguageServerManager.commandDispose.dispose();
         }
         NodeLanguageServerManager.commandDispose = commandManager.registerCommand(Commands.RestartLS, () => {
             sendTelemetryEvent(EventName.LANGUAGE_SERVER_RESTART, undefined, { reason: 'command' });
-            this.restartLanguageServer().ignoreErrors();
+            // The companion queues subsequent operations behind its current startup.
+            if (
+                !this.closed &&
+                this.replaceStartingServer &&
+                (this.initialStartup || this.restarting) &&
+                !this.languageServerProxy.usesPylanceClientApi
+            ) {
+                this.replaceStartingServer().ignoreErrors();
+            } else {
+                this.restartLanguageServer().ignoreErrors();
+            }
         });
     }
 
@@ -56,13 +73,22 @@ export class NodeLanguageServerManager implements ILanguageServerManager {
     }
 
     public dispose(): void {
-        this.stopLanguageServer().ignoreErrors();
-        NodeLanguageServerManager.commandDispose.dispose();
+        this.stop().ignoreErrors();
+        NodeLanguageServerManager.commandDispose?.dispose();
         this.disposables.forEach((d) => d.dispose());
     }
 
     @traceDecoratorError('Failed to start language server')
     public async start(resource: Resource, interpreter: PythonEnvironment | undefined): Promise<void> {
+        this.initialStartup = this.startInitialClient(resource, interpreter);
+        try {
+            await this.initialStartup;
+        } finally {
+            this.initialStartup = undefined;
+        }
+    }
+
+    private async startInitialClient(resource: Resource, interpreter: PythonEnvironment | undefined): Promise<void> {
         if (this.started) {
             throw new Error('Language server already started');
         }
@@ -76,11 +102,26 @@ export class NodeLanguageServerManager implements ILanguageServerManager {
         await this.analysisOptions.initialize(resource, interpreter);
         await this.startLanguageServer();
 
-        this.started = true;
+        this.started = !this.closed;
+    }
+
+    public async stop(): Promise<void> {
+        this.closed = true;
+        const wasConnected = this.connected;
+        this.disconnect();
+        try {
+            await this.languageServerProxy.close();
+        } catch (error) {
+            this.closed = false;
+            if (wasConnected) {
+                this.connect();
+            }
+            throw error;
+        }
     }
 
     public connect(): void {
-        if (!this.connected) {
+        if (!this.closed && !this.connected) {
             this.connected = true;
             this.middleware?.connect();
         }
@@ -102,8 +143,26 @@ export class NodeLanguageServerManager implements ILanguageServerManager {
     @traceDecoratorError('Failed to restart language server')
     @traceDecoratorVerbose('Restarting language server')
     protected async restartLanguageServer(): Promise<void> {
-        await this.stopLanguageServer();
-        await this.startLanguageServer();
+        if (this.closed) {
+            return;
+        }
+        if (!this.restarting) {
+            this.restarting = this.restartClient().finally(() => {
+                this.restarting = undefined;
+            });
+        }
+        await this.restarting;
+    }
+
+    private async restartClient(): Promise<void> {
+        await this.initialStartup?.catch(() => undefined);
+        if (this.closed) {
+            return;
+        }
+        await this.languageServerProxy.stop();
+        if (!this.closed) {
+            await this.startLanguageServer();
+        }
     }
 
     @captureTelemetry(
@@ -115,7 +174,13 @@ export class NodeLanguageServerManager implements ILanguageServerManager {
     )
     @traceDecoratorVerbose('Starting language server')
     protected async startLanguageServer(): Promise<void> {
+        if (this.closed) {
+            return;
+        }
         const options = await this.analysisOptions.getAnalysisOptions();
+        if (this.closed) {
+            return;
+        }
         this.middleware = new NodeLanguageClientMiddleware(this.serviceContainer, this.lsVersion);
         options.middleware = this.middleware;
 
@@ -126,12 +191,5 @@ export class NodeLanguageServerManager implements ILanguageServerManager {
 
         // Then use this middleware to start a new language client.
         await this.languageServerProxy.start(this.resource, this.interpreter, options);
-    }
-
-    @traceDecoratorVerbose('Stopping language server')
-    protected async stopLanguageServer(): Promise<void> {
-        if (this.languageServerProxy) {
-            await this.languageServerProxy.stop();
-        }
     }
 }

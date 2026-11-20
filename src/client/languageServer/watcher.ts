@@ -3,7 +3,7 @@
 
 import * as path from 'path';
 import { inject, injectable } from 'inversify';
-import { ConfigurationChangeEvent, l10n, Uri, WorkspaceFoldersChangeEvent } from 'vscode';
+import { CancellationError, ConfigurationChangeEvent, l10n, Uri, WorkspaceFoldersChangeEvent } from 'vscode';
 import { LanguageServerChangeHandler } from '../activation/common/languageServerChangeHandler';
 import { IExtensionActivationService, ILanguageServerOutputChannel, LanguageServerType } from '../activation/types';
 import { IApplicationShell, ICommandManager, IWorkspaceService } from '../common/application/types';
@@ -21,7 +21,7 @@ import { LanguageService } from '../common/utils/localize';
 import { IEnvironmentVariablesProvider } from '../common/variables/types';
 import { IInterpreterHelper, IInterpreterService } from '../interpreter/contracts';
 import { IServiceContainer } from '../ioc/types';
-import { traceLog } from '../logging';
+import { traceError, traceLog } from '../logging';
 import { PythonEnvironment } from '../pythonEnvironments/info';
 import { JediLSExtensionManager } from './jediLSExtensionManager';
 import { NoneLSExtensionManager } from './noneLSExtensionManager';
@@ -30,6 +30,11 @@ import { ILanguageServerExtensionManager, ILanguageServerWatcher } from './types
 import { sendTelemetryEvent } from '../telemetry';
 import { EventName } from '../telemetry/constants';
 import { StopWatch } from '../common/utils/stopWatch';
+
+interface LanguageServerLifetime {
+    readonly key: string;
+    shutdown?: Promise<void>;
+}
 
 @injectable()
 /**
@@ -48,6 +53,12 @@ export class LanguageServerWatcher implements IExtensionActivationService, ILang
     // When using Jedi, there will be one language server per workspace folder.
     // When using Pylance, there will only be one language server for the project.
     private workspaceLanguageServers: Map<string, ILanguageServerExtensionManager | undefined>;
+
+    private readonly activeLanguageServers = new Map<ILanguageServerExtensionManager, LanguageServerLifetime>();
+
+    private readonly pendingRefreshes = new Map<string, { languageServerType: LanguageServerType }>();
+
+    private shutdown?: Promise<void>;
 
     private registered = false;
 
@@ -70,6 +81,14 @@ export class LanguageServerWatcher implements IExtensionActivationService, ILang
         this.workspaceInterpreters = new Map();
         this.workspaceLanguageServers = new Map();
         this.languageServerType = this.configurationService.getSettings().languageServer;
+        this.disposables.push({
+            dispose: () => {
+                if (!this.shutdown) {
+                    this.shutdown = this.disposeLanguageServers();
+                }
+                return this.shutdown;
+            },
+        });
     }
 
     // IExtensionActivationService
@@ -89,7 +108,7 @@ export class LanguageServerWatcher implements IExtensionActivationService, ILang
     }
 
     public register(): void {
-        if (!this.registered) {
+        if (!this.registered && !this.shutdown) {
             this.registered = true;
             this.disposables.push(
                 this.workspaceService.onDidChangeConfiguration(this.onDidChangeConfiguration.bind(this)),
@@ -130,14 +149,25 @@ export class LanguageServerWatcher implements IExtensionActivationService, ILang
         languageServerType: LanguageServerType,
         resource?: Resource,
         startupStopWatch?: StopWatch,
-    ): Promise<ILanguageServerExtensionManager> {
+        isCurrent = () => true,
+    ): Promise<ILanguageServerExtensionManager | undefined> {
+        if (this.shutdown || !isCurrent()) {
+            return undefined;
+        }
+
         const lsResource = this.getWorkspaceUri(resource);
         const currentInterpreter = this.workspaceInterpreters.get(lsResource.fsPath);
         const interpreter = await this.interpreterService?.getActiveInterpreter(resource);
+        if (this.shutdown || !isCurrent()) {
+            return undefined;
+        }
 
         // Destroy the old language server if it's different.
         if (currentInterpreter && interpreter !== currentInterpreter) {
             await this.stopLanguageServer(lsResource);
+            if (this.shutdown || !isCurrent()) {
+                return undefined;
+            }
         }
 
         // If the interpreter is Python 2 and the LS setting is explicitly set to Jedi, turn it off.
@@ -164,14 +194,28 @@ export class LanguageServerWatcher implements IExtensionActivationService, ILang
         // We only need to instantiate the language server once, even in multiroot workspace scenarios,
         // so we only need one language server extension manager.
         const key = this.getWorkspaceKey(resource, serverType);
-        const languageServer = this.workspaceLanguageServers.get(key);
+        let languageServer = this.workspaceLanguageServers.get(key);
+        while (languageServer) {
+            const stopping = this.activeLanguageServers.get(languageServer)?.shutdown;
+            if (!stopping) {
+                break;
+            }
+            await stopping;
+            if (this.shutdown || !isCurrent()) {
+                return undefined;
+            }
+            languageServer = this.workspaceLanguageServers.get(key);
+        }
+
         if ((serverType === LanguageServerType.Node || serverType === LanguageServerType.None) && languageServer) {
             logStartup(serverType, lsResource);
             return languageServer;
         }
 
         // Instantiate the language server extension manager.
-        const languageServerExtensionManager = this.createLanguageServer(serverType);
+        const languageServerExtensionManager = this.createLanguageServer(serverType, lsResource);
+        const lifetime: LanguageServerLifetime = { key };
+        this.activeLanguageServers.set(languageServerExtensionManager, lifetime);
         this.workspaceLanguageServers.set(key, languageServerExtensionManager);
 
         if (languageServerExtensionManager.canStartLanguageServer(interpreter)) {
@@ -184,14 +228,16 @@ export class LanguageServerWatcher implements IExtensionActivationService, ILang
             }
             await languageServerExtensionManager.startLanguageServer(lsResource, interpreter);
 
-            logStartup(languageServerType, lsResource);
-            this.languageServerType = languageServerType;
-            this.workspaceInterpreters.set(lsResource.fsPath, interpreter);
+            if (!this.shutdown && !lifetime.shutdown && isCurrent()) {
+                logStartup(languageServerType, lsResource);
+                this.languageServerType = languageServerType;
+                this.workspaceInterpreters.set(lsResource.fsPath, interpreter);
+            }
         } else {
             await languageServerExtensionManager.languageServerNotAvailable();
         }
 
-        return languageServerExtensionManager;
+        return this.shutdown || lifetime.shutdown || !isCurrent() ? undefined : languageServerExtensionManager;
     }
 
     public async restartLanguageServers(): Promise<void> {
@@ -204,6 +250,9 @@ export class LanguageServerWatcher implements IExtensionActivationService, ILang
     }
 
     public async get(resource?: Resource): Promise<ILanguageServerExtensionManager> {
+        if (this.shutdown) {
+            throw new CancellationError();
+        }
         const key = this.getWorkspaceKey(resource, this.languageServerType);
         let languageServerExtensionManager = this.workspaceLanguageServers.get(key);
 
@@ -211,23 +260,78 @@ export class LanguageServerWatcher implements IExtensionActivationService, ILang
             languageServerExtensionManager = await this.startAndGetLanguageServer(this.languageServerType, resource);
         }
 
-        return Promise.resolve(languageServerExtensionManager);
+        if (!languageServerExtensionManager || this.shutdown) {
+            throw new CancellationError();
+        }
+        return languageServerExtensionManager;
     }
 
     // Private methods
 
-    private async stopLanguageServer(resource?: Resource): Promise<void> {
-        const key = this.getWorkspaceKey(resource, this.languageServerType);
+    private async stopLanguageServer(resource?: Resource, languageServerType = this.languageServerType): Promise<void> {
+        const key = this.getWorkspaceKey(resource, languageServerType);
         const languageServerExtensionManager = this.workspaceLanguageServers.get(key);
 
         if (languageServerExtensionManager) {
-            await languageServerExtensionManager.stopLanguageServer();
-            languageServerExtensionManager.dispose();
-            this.workspaceLanguageServers.delete(key);
+            await this.retireLanguageServer(languageServerExtensionManager);
         }
     }
 
-    private createLanguageServer(languageServerType: LanguageServerType): ILanguageServerExtensionManager {
+    private async retireLanguageServer(languageServer: ILanguageServerExtensionManager): Promise<void> {
+        const lifetime = this.activeLanguageServers.get(languageServer);
+        if (!lifetime) {
+            return;
+        }
+        if (!lifetime.shutdown) {
+            lifetime.shutdown = this.stopAndDisposeLanguageServer(languageServer, lifetime);
+        }
+        await lifetime.shutdown;
+    }
+
+    private async stopAndDisposeLanguageServer(
+        languageServer: ILanguageServerExtensionManager,
+        lifetime: LanguageServerLifetime,
+    ): Promise<void> {
+        // Prevent reentrant acquisition or retirement before the shutdown promise is assigned.
+        await Promise.resolve();
+        let stopped = false;
+        try {
+            await languageServer.stopLanguageServer();
+            stopped = true;
+        } finally {
+            if (stopped || this.shutdown) {
+                this.activeLanguageServers.delete(languageServer);
+                if (this.workspaceLanguageServers.get(lifetime.key) === languageServer) {
+                    this.workspaceLanguageServers.delete(lifetime.key);
+                }
+                languageServer.dispose();
+            } else {
+                // Keep the live manager reachable so a later refresh or command can retry the stop.
+                lifetime.shutdown = undefined;
+            }
+        }
+    }
+
+    private async disposeLanguageServers(): Promise<void> {
+        this.workspaceLanguageServers.clear();
+        this.workspaceInterpreters.clear();
+        this.pendingRefreshes.clear();
+        await Promise.all(
+            [...this.activeLanguageServers.keys()].map(async (languageServer) => {
+                try {
+                    await this.retireLanguageServer(languageServer);
+                } catch (error) {
+                    traceError('Failed to stop language server during extension shutdown', error);
+                }
+            }),
+        );
+    }
+
+    private createLanguageServer(
+        languageServerType: LanguageServerType,
+        resource: Uri,
+    ): ILanguageServerExtensionManager {
+        const replaceStartingServer = () => this.refreshLanguageServer(resource, true);
         let lsManager: ILanguageServerExtensionManager;
         switch (languageServerType) {
             case LanguageServerType.Jedi:
@@ -241,6 +345,7 @@ export class LanguageServerWatcher implements IExtensionActivationService, ILang
                     this.interpreterService,
                     this.environmentService,
                     this.commandManager,
+                    replaceStartingServer,
                 );
                 break;
             case LanguageServerType.Node:
@@ -257,6 +362,7 @@ export class LanguageServerWatcher implements IExtensionActivationService, ILang
                     this.fileSystem,
                     this.extensions,
                     this.applicationShell,
+                    replaceStartingServer,
                 );
                 break;
             case LanguageServerType.None:
@@ -265,22 +371,36 @@ export class LanguageServerWatcher implements IExtensionActivationService, ILang
                 break;
         }
 
-        this.disposables.push({
-            dispose: async () => {
-                await lsManager.stopLanguageServer();
-                lsManager.dispose();
-            },
-        });
         return lsManager;
     }
 
     private async refreshLanguageServer(resource?: Resource, forced?: boolean): Promise<void> {
+        if (this.shutdown) {
+            return;
+        }
+
         const lsResource = this.getWorkspaceUri(resource);
         const languageServerType = this.configurationService.getSettings(lsResource).languageServer;
+        const currentRefresh = this.pendingRefreshes.get(lsResource.fsPath);
+        if (!forced && languageServerType === (currentRefresh?.languageServerType ?? this.languageServerType)) {
+            return;
+        }
 
-        if (languageServerType !== this.languageServerType || forced) {
-            await this.stopLanguageServer(resource);
-            await this.startLanguageServer(languageServerType, lsResource);
+        const refresh = { languageServerType };
+        this.pendingRefreshes.set(lsResource.fsPath, refresh);
+        const isCurrent = () => this.pendingRefreshes.get(lsResource.fsPath) === refresh;
+        try {
+            await Promise.all([
+                this.stopLanguageServer(resource),
+                currentRefresh && currentRefresh.languageServerType !== this.languageServerType
+                    ? this.stopLanguageServer(resource, currentRefresh.languageServerType)
+                    : undefined,
+            ]);
+            await this.startAndGetLanguageServer(languageServerType, lsResource, undefined, isCurrent);
+        } finally {
+            if (isCurrent()) {
+                this.pendingRefreshes.delete(lsResource.fsPath);
+            }
         }
     }
 
@@ -292,13 +412,15 @@ export class LanguageServerWatcher implements IExtensionActivationService, ILang
     private async onDidChangeConfiguration(event: ConfigurationChangeEvent): Promise<void> {
         const workspacesUris = this.workspaceService.workspaceFolders?.map((workspace) => workspace.uri) ?? [];
 
-        workspacesUris.forEach(async (resource) => {
-            if (event.affectsConfiguration(`python.languageServer`, resource)) {
-                await this.refreshLanguageServer(resource);
-            } else if (event.affectsConfiguration(`python.analysis.pylanceLspClientEnabled`, resource)) {
-                await this.refreshLanguageServer(resource, /* forced */ true);
-            }
-        });
+        await Promise.all(
+            workspacesUris.map(async (resource) => {
+                if (event.affectsConfiguration(`python.languageServer`, resource)) {
+                    await this.refreshLanguageServer(resource);
+                } else if (event.affectsConfiguration(`python.analysis.pylanceLspClientEnabled`, resource)) {
+                    await this.refreshLanguageServer(resource, /* forced */ true);
+                }
+            }),
+        );
     }
 
     // Watch for interpreter changes.

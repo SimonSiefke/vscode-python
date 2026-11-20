@@ -3,20 +3,37 @@
 
 import * as assert from 'assert';
 import * as sinon from 'sinon';
-import { ConfigurationChangeEvent, Uri, WorkspaceFolder, WorkspaceFoldersChangeEvent } from 'vscode';
+import * as TypeMoq from 'typemoq';
+import {
+    CancellationError,
+    ConfigurationChangeEvent,
+    Extension,
+    Uri,
+    WorkspaceFolder,
+    WorkspaceFoldersChangeEvent,
+} from 'vscode';
+import { Commands } from '../../client/activation/commands';
+import { LanguageServerClient } from '../../client/activation/common/languageServerClient';
+import { JediLanguageClientFactory } from '../../client/activation/jedi/languageClientFactory';
 import { JediLanguageServerManager } from '../../client/activation/jedi/manager';
+import { NodeLanguageClientFactory } from '../../client/activation/node/languageClientFactory';
 import { NodeLanguageServerManager } from '../../client/activation/node/manager';
+import { PylanceApi } from '../../client/activation/node/pylanceApi';
 import { ILanguageServerOutputChannel, LanguageServerType } from '../../client/activation/types';
 import { IApplicationShell, ICommandManager, IWorkspaceService } from '../../client/common/application/types';
+import { PYLANCE_EXTENSION_ID } from '../../client/common/constants';
 import { IFileSystem } from '../../client/common/platform/types';
 import {
     IConfigurationService,
+    IPythonSettings,
     IDisposable,
     IExperimentService,
     IExtensions,
     IInterpreterPathService,
 } from '../../client/common/types';
+import { createDeferred } from '../../client/common/utils/async';
 import { LanguageService } from '../../client/common/utils/localize';
+import { Architecture } from '../../client/common/utils/platform';
 import { IEnvironmentVariablesProvider } from '../../client/common/variables/types';
 import { IInterpreterHelper, IInterpreterService } from '../../client/interpreter/contracts';
 import { IServiceContainer } from '../../client/ioc/types';
@@ -26,7 +43,528 @@ import { PylanceLSExtensionManager } from '../../client/languageServer/pylanceLS
 import { ILanguageServerExtensionManager } from '../../client/languageServer/types';
 import { LanguageServerWatcher } from '../../client/languageServer/watcher';
 import * as Logging from '../../client/logging';
-import { PythonEnvironment } from '../../client/pythonEnvironments/info';
+import { EnvironmentType, PythonEnvironment } from '../../client/pythonEnvironments/info';
+
+suite('Language server watcher lifetime', () => {
+    const sandbox = sinon.createSandbox();
+
+    teardown(() => sandbox.restore());
+
+    function createWatcher(languageServer = LanguageServerType.None, pylance?: Partial<Extension<PylanceApi>>) {
+        const disposables: IDisposable[] = [];
+        const resource = Uri.file('/project');
+        const firstInterpreter: PythonEnvironment = {
+            path: '/python/one',
+            architecture: Architecture.x64,
+            sysPrefix: '/python',
+            envType: EnvironmentType.Venv,
+            version: { raw: '3.11.0', major: 3, minor: 11, patch: 0, build: [], prerelease: [] },
+        };
+        let interpreter = firstInterpreter;
+        let interpreterNumber = 1;
+        let lookupInterpreter = async () => interpreter;
+        const interpreterService = TypeMoq.Mock.ofType<IInterpreterService>();
+        interpreterService.setup((s) => s.getActiveInterpreter(TypeMoq.It.isAny())).returns(() => lookupInterpreter());
+        const workspace = TypeMoq.Mock.ofType<IWorkspaceService>();
+        const workspaceFolder = { uri: resource, name: 'project', index: 0 };
+        workspace.setup((w) => w.workspaceFolders).returns(() => [workspaceFolder]);
+        workspace.setup((w) => w.isTrusted).returns(() => true);
+        workspace.setup((w) => w.getWorkspaceFolder(TypeMoq.It.isAny())).returns(() => workspaceFolder);
+        const subscription = () => ({ dispose: () => {} });
+        workspace.setup((w) => w.onDidGrantWorkspaceTrust(TypeMoq.It.isAny())).returns(subscription);
+        const interpreterPath = TypeMoq.Mock.ofType<IInterpreterPathService>();
+        interpreterPath.setup((i) => i.onDidChange(TypeMoq.It.isAny())).returns(subscription);
+        const environment = TypeMoq.Mock.ofType<IEnvironmentVariablesProvider>();
+        environment.setup((e) => e.onDidEnvironmentVariablesChange).returns(() => subscription);
+        const settings = TypeMoq.Mock.ofType<IPythonSettings>();
+        settings.setup((s) => s.languageServer).returns(() => languageServer);
+        settings.setup((s) => s.languageServerIsDefault).returns(() => false);
+        settings.setup((s) => s.autoComplete).returns(() => ({ extraPaths: [] }));
+        const configuration = TypeMoq.Mock.ofType<IConfigurationService>();
+        configuration.setup((c) => c.getSettings(TypeMoq.It.isAny())).returns(() => settings.object);
+        const commands = TypeMoq.Mock.ofType<ICommandManager>();
+        let restart: (() => void) | undefined;
+        commands
+            .setup((c) => c.registerCommand(Commands.RestartLS, TypeMoq.It.isAny()))
+            .returns((_command, run) => {
+                restart = run;
+                return {
+                    dispose: () => {
+                        restart = undefined;
+                    },
+                };
+            });
+        const extensions = TypeMoq.Mock.ofType<IExtensions>();
+        extensions.setup((x) => x.getExtension(PYLANCE_EXTENSION_ID)).returns(() => pylance as Extension<PylanceApi>);
+        const watcher = new LanguageServerWatcher(
+            TypeMoq.Mock.ofType<IServiceContainer>().object,
+            TypeMoq.Mock.ofType<ILanguageServerOutputChannel>().object,
+            configuration.object,
+            TypeMoq.Mock.ofType<IExperimentService>().object,
+            TypeMoq.Mock.ofType<IInterpreterHelper>().object,
+            interpreterPath.object,
+            interpreterService.object,
+            environment.object,
+            workspace.object,
+            commands.object,
+            TypeMoq.Mock.ofType<IFileSystem>().object,
+            extensions.object,
+            TypeMoq.Mock.ofType<IApplicationShell>().object,
+            disposables,
+        );
+        return {
+            watcher,
+            disposables,
+            resource,
+            changeInterpreter: () => {
+                interpreter = { ...firstInterpreter, path: `/python/${++interpreterNumber}` };
+            },
+            setInterpreterLookup: (lookup: () => Promise<PythonEnvironment>) => {
+                lookupInterpreter = lookup;
+            },
+            setLanguageServer: (type: LanguageServerType) => {
+                languageServer = type;
+            },
+            changeLanguageServer: (type: LanguageServerType) => {
+                languageServer = type;
+                return watcher['onDidChangeConfiguration']({
+                    affectsConfiguration: (section) => section === 'python.languageServer',
+                });
+            },
+            restart: () => {
+                assert.ok(restart);
+                restart();
+            },
+        };
+    }
+
+    test('Replacing a language server does not grow the session disposal registry', async () => {
+        const { watcher, disposables, resource, changeInterpreter } = createWatcher();
+        try {
+            await watcher.startLanguageServer(LanguageServerType.None, resource);
+            let activeServer = await watcher.get(resource);
+            const registeredDisposables = disposables.length;
+            for (let replacement = 0; replacement < 3; replacement += 1) {
+                changeInterpreter();
+                await watcher.startLanguageServer(LanguageServerType.None, resource);
+                const nextServer = await watcher.get(resource);
+                assert.notStrictEqual(nextServer, activeServer);
+                assert.deepStrictEqual([...watcher['activeLanguageServers'].keys()], [nextServer]);
+                activeServer = nextServer;
+            }
+            assert.strictEqual(disposables.length, registeredDisposables);
+        } finally {
+            await Promise.all(disposables.map((disposable) => disposable.dispose()));
+        }
+        assert.strictEqual(watcher['activeLanguageServers'].size, 0);
+    });
+
+    test('Session disposal cleans up the active server without stopping an old server again', async () => {
+        const { watcher, disposables, resource, changeInterpreter } = createWatcher();
+        const stop = sandbox.spy(NoneLSExtensionManager.prototype, 'stopLanguageServer');
+        const dispose = sandbox.spy(NoneLSExtensionManager.prototype, 'dispose');
+        try {
+            await watcher.startLanguageServer(LanguageServerType.None, resource);
+            const oldServer = await watcher.get(resource);
+
+            changeInterpreter();
+            await watcher.startLanguageServer(LanguageServerType.None, resource);
+            const activeServer = await watcher.get(resource);
+            assert.notStrictEqual(oldServer, activeServer);
+            assert.strictEqual(stop.callCount, 1);
+            assert.strictEqual(stop.firstCall.thisValue, oldServer);
+            assert.strictEqual(dispose.callCount, 1);
+            assert.strictEqual(dispose.firstCall.thisValue, oldServer);
+
+            await Promise.all(disposables.map((disposable) => disposable.dispose()));
+            assert.strictEqual(stop.callCount, 2);
+            assert.strictEqual(stop.secondCall.thisValue, activeServer);
+            assert.strictEqual(dispose.callCount, 2);
+            assert.strictEqual(dispose.secondCall.thisValue, activeServer);
+        } finally {
+            await Promise.all(disposables.map((disposable) => disposable.dispose()));
+        }
+    });
+
+    test('Shutdown prevents a pending interpreter lookup and later activation from starting a server', async () => {
+        const { watcher, disposables, resource, setInterpreterLookup } = createWatcher();
+        const interpreter = createDeferred<PythonEnvironment>();
+        const lookup = sandbox.stub().returns(interpreter.promise);
+        const start = sandbox.spy(NoneLSExtensionManager.prototype, 'startLanguageServer');
+        setInterpreterLookup(lookup);
+
+        const starting = watcher.startLanguageServer(LanguageServerType.None, resource);
+        assert.ok(lookup.calledOnce);
+        await Promise.all(disposables.map((disposable) => disposable.dispose()));
+        disposables.length = 0;
+        interpreter.resolve({
+            path: '/python/one',
+            architecture: Architecture.x64,
+            sysPrefix: '/python',
+            envType: EnvironmentType.Venv,
+        });
+        await starting;
+        await watcher.activate(resource);
+
+        assert.ok(start.notCalled);
+        assert.ok(lookup.calledOnce);
+        assert.strictEqual(disposables.length, 0);
+    });
+
+    test('Shutdown joins an in-flight replacement without starting another server', async () => {
+        const { watcher, disposables, resource, setLanguageServer } = createWatcher();
+        const enteredStop = createDeferred();
+        const finishStop = createDeferred();
+        const start = sandbox.spy(NoneLSExtensionManager.prototype, 'startLanguageServer');
+        const stop = sandbox.stub(NoneLSExtensionManager.prototype, 'stopLanguageServer').callsFake(async () => {
+            enteredStop.resolve();
+            await finishStop.promise;
+        });
+        const dispose = sandbox.spy(NoneLSExtensionManager.prototype, 'dispose');
+        await watcher.startLanguageServer(LanguageServerType.None, resource);
+        setLanguageServer(LanguageServerType.Node);
+        const refreshing = watcher['refreshLanguageServer'](resource);
+        try {
+            await Promise.race([enteredStop.promise, refreshing]);
+            assert.ok(enteredStop.completed);
+            const firstShutdown = disposables[0].dispose();
+            const secondShutdown = disposables[0].dispose();
+            assert.strictEqual(firstShutdown, secondShutdown);
+            assert.ok(stop.calledOnce);
+            assert.ok(dispose.notCalled);
+            await assert.rejects(watcher.get(resource), CancellationError);
+            finishStop.resolve();
+
+            await Promise.all([refreshing, firstShutdown, secondShutdown]);
+            assert.ok(start.calledOnce);
+            assert.ok(stop.calledOnce);
+            assert.ok(dispose.calledOnce);
+            assert.strictEqual(watcher.languageServerType, LanguageServerType.None);
+        } finally {
+            finishStop.resolve();
+            await refreshing;
+            await Promise.all(disposables.map((disposable) => disposable.dispose()));
+        }
+    });
+
+    test('Replacing Pylance completes while startup is waiting to acquire the client', async () => {
+        const acquiring = createDeferred();
+        const release = createDeferred();
+        const start = sandbox.stub().resolves();
+        const client = { isEnabled: () => true, start, stop: sandbox.stub().resolves() };
+        const extension = {
+            packageJSON: { version: '1' },
+            exports: { client },
+            isActive: false,
+            activate: async () => {
+                acquiring.resolve();
+                await release.promise;
+                extension.isActive = true;
+                return extension.exports;
+            },
+        };
+        const { watcher, disposables, resource, changeLanguageServer } = createWatcher(
+            LanguageServerType.Node,
+            extension,
+        );
+        const starting = watcher.startLanguageServer(LanguageServerType.Node, resource);
+        try {
+            await Promise.race([acquiring.promise, starting]);
+            assert.ok(acquiring.completed);
+            const oldServer = await watcher.get(resource);
+            await changeLanguageServer(LanguageServerType.None);
+            assert.ok((await watcher.get(resource)) instanceof NoneLSExtensionManager);
+            assert.strictEqual(watcher['activeLanguageServers'].has(oldServer), false);
+            assert.strictEqual(release.completed, false);
+
+            release.resolve();
+            await starting;
+            assert.ok(start.notCalled);
+            assert.strictEqual(watcher.languageServerType, LanguageServerType.None);
+            await changeLanguageServer(LanguageServerType.Node);
+            assert.ok(start.calledOnce);
+        } finally {
+            release.resolve();
+            await Promise.all([starting, ...disposables.map((disposable) => disposable.dispose())]);
+        }
+    });
+
+    test('Retiring a manager prevents a pending Restart Language Server command from reviving it', async () => {
+        const stopping = createDeferred();
+        const release = createDeferred();
+        const stop = sandbox.stub().resolves();
+        stop.onFirstCall().callsFake(async () => {
+            stopping.resolve();
+            await release.promise;
+        });
+        const start = sandbox.stub().resolves();
+        const { watcher, disposables, resource, changeLanguageServer, restart } = createWatcher(
+            LanguageServerType.Node,
+            {
+                packageJSON: { version: '1' },
+                exports: { client: { isEnabled: () => true, start, stop } },
+                isActive: true,
+            },
+        );
+        try {
+            await watcher.startLanguageServer(LanguageServerType.Node, resource);
+            const oldServer = (await watcher.get(resource)) as PylanceLSExtensionManager;
+            restart();
+            const restarting = oldServer.serverManager['restarting'];
+            await Promise.race([stopping.promise, restarting]);
+            assert.ok(stopping.completed);
+            const switchToNone = changeLanguageServer(LanguageServerType.None);
+            release.resolve();
+            await Promise.all([switchToNone, restarting]);
+
+            assert.ok(start.calledOnce);
+            assert.ok(stop.calledOnce);
+            assert.ok((await watcher.get(resource)) instanceof NoneLSExtensionManager);
+            assert.strictEqual(watcher['activeLanguageServers'].has(oldServer), false);
+            await changeLanguageServer(LanguageServerType.Node);
+            assert.notStrictEqual(await watcher.get(resource), oldServer);
+            assert.ok(start.calledTwice);
+        } finally {
+            release.resolve();
+            await Promise.all(disposables.map((disposable) => disposable.dispose()));
+        }
+    });
+
+    test('Repeated restart commands share one manager while Pylance companion startup is pending', async () => {
+        const firstStartEntered = createDeferred();
+        const finishFirstStart = createDeferred();
+        let queued = Promise.resolve();
+        const enqueue = (operation: () => Promise<void>) => {
+            queued = queued.then(operation);
+            return queued;
+        };
+        const start = sandbox.stub().callsFake(() => enqueue(async () => {}));
+        start.onFirstCall().callsFake(() =>
+            enqueue(async () => {
+                firstStartEntered.resolve();
+                await finishFirstStart.promise;
+            }),
+        );
+        const stop = sandbox.spy(async () => {
+            // The companion returns once the stop is enqueued.
+            void enqueue(async () => {});
+        });
+        const { watcher, disposables, resource, restart } = createWatcher(LanguageServerType.Node, {
+            packageJSON: { version: '1' },
+            exports: { client: { isEnabled: () => true, start, stop } },
+            isActive: true,
+        });
+        const startup = watcher.startLanguageServer(LanguageServerType.Node, resource);
+        try {
+            await Promise.race([firstStartEntered.promise, startup]);
+            assert.ok(firstStartEntered.completed);
+            const manager = (await watcher.get(resource)) as PylanceLSExtensionManager;
+            restart();
+            const restarting = manager.serverManager['restarting'];
+            assert.ok(restarting);
+            restart();
+            restart();
+
+            assert.strictEqual(manager.serverManager['restarting'], restarting);
+            assert.strictEqual(await watcher.get(resource), manager);
+            sinon.assert.calledOnce(start);
+            sinon.assert.notCalled(stop);
+
+            finishFirstStart.resolve();
+            await Promise.all([startup, restarting]);
+            assert.strictEqual(await watcher.get(resource), manager);
+            assert.deepStrictEqual([...watcher['activeLanguageServers'].keys()], [manager]);
+            sinon.assert.calledOnce(stop);
+            sinon.assert.calledTwice(start);
+        } finally {
+            finishFirstStart.resolve();
+            await Promise.all([startup, ...disposables.map((disposable) => disposable.dispose())]);
+            await queued;
+        }
+    });
+
+    test('A failed companion stop keeps the manager and allows the restart command to retry the same API', async () => {
+        const failure = new Error('Companion stop failed');
+        const start = sandbox.stub().resolves();
+        const stop = sandbox.stub().resolves();
+        stop.onFirstCall().rejects(failure);
+        const { watcher, disposables, resource, restart } = createWatcher(LanguageServerType.Node, {
+            packageJSON: { version: '1' },
+            exports: { client: { isEnabled: () => true, start, stop } },
+            isActive: true,
+        });
+        try {
+            await watcher.startLanguageServer(LanguageServerType.Node, resource);
+            const manager = (await watcher.get(resource)) as PylanceLSExtensionManager;
+            await assert.rejects(
+                watcher['onDidChangeConfiguration']({
+                    affectsConfiguration: (section) => section === 'python.analysis.pylanceLspClientEnabled',
+                }),
+                failure,
+            );
+            assert.strictEqual(await watcher.get(resource), manager);
+            assert.deepStrictEqual([...watcher['activeLanguageServers'].keys()], [manager]);
+            sinon.assert.calledOnce(start);
+            sinon.assert.calledOnce(stop);
+
+            restart();
+            const restarting = manager.serverManager['restarting'];
+            assert.ok(restarting);
+            await restarting;
+            assert.strictEqual(await watcher.get(resource), manager);
+            sinon.assert.calledTwice(stop);
+            sinon.assert.calledTwice(start);
+        } finally {
+            await Promise.all(disposables.map((disposable) => disposable.dispose()));
+        }
+    });
+
+    for (const type of [LanguageServerType.Jedi, LanguageServerType.Node]) {
+        test(`Restart Language Server replaces stalled native ${type} startup and a stalled restart`, async () => {
+            const finishFirstStartup = createDeferred();
+            const finishRestart = createDeferred();
+            const firstStartupEntered = createDeferred();
+            const restartEntered = createDeferred();
+            const createClient = (start: () => Promise<void>) => ({
+                onNotification: () => {},
+                onTelemetry: () => {},
+                onRequest: () => ({ dispose: () => {} }),
+                cancelStartup: sandbox.spy(),
+                stop: sandbox.stub().resolves(),
+                dispose: sandbox.stub().resolves(),
+                start: sandbox.spy(start),
+            });
+            const firstClient = createClient(async () => {
+                firstStartupEntered.resolve();
+                await finishFirstStartup.promise;
+            });
+            const secondClient = createClient(async () => {});
+            const stalledRestart = createClient(async () => {
+                restartEntered.resolve();
+                await finishRestart.promise;
+            });
+            const fourthClient = createClient(async () => {});
+            const factory =
+                type === LanguageServerType.Jedi
+                    ? sandbox.stub(JediLanguageClientFactory.prototype, 'createLanguageClient')
+                    : sandbox.stub(NodeLanguageClientFactory.prototype, 'createLanguageClient');
+            [firstClient, secondClient, stalledRestart, fourthClient].forEach((client, index) => {
+                factory.onCall(index).resolves((client as unknown) as LanguageServerClient);
+            });
+
+            const { watcher, disposables, resource, restart } = createWatcher(type, {
+                packageJSON: { version: '1' },
+                exports: { client: { isEnabled: () => false, start: async () => {}, stop: async () => {} } },
+                isActive: true,
+            });
+            const refresh = sandbox.spy(
+                (watcher as unknown) as { refreshLanguageServer(resource: Uri, forced: boolean): Promise<void> },
+                'refreshLanguageServer',
+            );
+            const startup = watcher.startLanguageServer(type, resource);
+            try {
+                await Promise.race([firstStartupEntered.promise, startup]);
+                assert.ok(firstStartupEntered.completed);
+                const firstManager = await watcher.get(resource);
+                restart();
+                sinon.assert.calledOnce(refresh);
+                await refresh.firstCall.returnValue;
+                const replacement = (await watcher.get(resource)) as JediLSExtensionManager | PylanceLSExtensionManager;
+                assert.notStrictEqual(replacement, firstManager);
+                assert.strictEqual(finishFirstStartup.completed, false);
+                sinon.assert.called(firstClient.cancelStartup);
+                sinon.assert.calledOnce(secondClient.start);
+                finishFirstStartup.resolve();
+                await startup;
+                assert.strictEqual(await watcher.get(resource), replacement);
+
+                restart();
+                const { restarting } = (replacement.serverManager as unknown) as { restarting?: Promise<void> };
+                assert.ok(restarting);
+                await Promise.race([restartEntered.promise, restarting]);
+                assert.ok(restartEntered.completed);
+                restart();
+                sinon.assert.calledTwice(refresh);
+                await refresh.secondCall.returnValue;
+                const finalManager = await watcher.get(resource);
+                assert.notStrictEqual(finalManager, replacement);
+                assert.deepStrictEqual([...watcher['activeLanguageServers'].keys()], [finalManager]);
+                assert.strictEqual(finishRestart.completed, false);
+                sinon.assert.calledOnce(secondClient.stop);
+                sinon.assert.called(stalledRestart.cancelStartup);
+                sinon.assert.calledOnce(fourthClient.start);
+
+                finishRestart.resolve();
+                await restarting;
+                assert.strictEqual(await watcher.get(resource), finalManager);
+            } finally {
+                finishFirstStartup.resolve();
+                finishRestart.resolve();
+                await Promise.all([startup, ...disposables.map((disposable) => disposable.dispose())]);
+            }
+        });
+    }
+
+    test('An unrelated configuration event leaves the current manager running', async () => {
+        const { watcher, disposables, resource, setLanguageServer } = createWatcher();
+        const stop = sandbox.spy(NoneLSExtensionManager.prototype, 'stopLanguageServer');
+        const start = sandbox.stub(PylanceLSExtensionManager.prototype, 'startLanguageServer').resolves();
+        sandbox.stub(PylanceLSExtensionManager.prototype, 'canStartLanguageServer').returns(true);
+        try {
+            await watcher.startLanguageServer(LanguageServerType.None, resource);
+            const manager = await watcher.get(resource);
+            setLanguageServer(LanguageServerType.Node);
+
+            const affectsConfiguration = sandbox.spy((_section: string, _resource?: Uri) => false);
+            await watcher['onDidChangeConfiguration']({ affectsConfiguration });
+            sinon.assert.calledWithExactly(affectsConfiguration, 'python.languageServer', resource);
+            sinon.assert.notCalled(stop);
+            sinon.assert.notCalled(start);
+            assert.strictEqual(await watcher.get(resource), manager);
+        } finally {
+            await Promise.all(disposables.map((disposable) => disposable.dispose()));
+        }
+    });
+
+    test('A setting change back to Pylance takes precedence over a pending switch to None', async () => {
+        const stopping = createDeferred();
+        const release = createDeferred();
+        const stop = sandbox.stub().resolves();
+        stop.onFirstCall().callsFake(async () => {
+            stopping.resolve();
+            await release.promise;
+        });
+        const start = sandbox.stub().resolves();
+        const startNone = sandbox.spy(NoneLSExtensionManager.prototype, 'startLanguageServer');
+        const { watcher, disposables, resource, changeLanguageServer } = createWatcher(LanguageServerType.Node, {
+            packageJSON: { version: '1' },
+            exports: { client: { isEnabled: () => true, start, stop } },
+            isActive: true,
+        });
+        try {
+            await watcher.startLanguageServer(LanguageServerType.Node, resource);
+            const oldServer = await watcher.get(resource);
+            const switchToNone = changeLanguageServer(LanguageServerType.None);
+            await Promise.race([stopping.promise, switchToNone]);
+            assert.ok(stopping.completed);
+            const switchBack = changeLanguageServer(LanguageServerType.Node);
+            release.resolve();
+            await Promise.all([switchToNone, switchBack]);
+
+            const activeServer = await watcher.get(resource);
+            assert.ok(activeServer instanceof PylanceLSExtensionManager);
+            assert.notStrictEqual(activeServer, oldServer);
+            assert.deepStrictEqual([...watcher['activeLanguageServers'].keys()], [activeServer]);
+            assert.strictEqual(watcher.languageServerType, LanguageServerType.Node);
+            assert.ok(stop.calledOnce);
+            assert.ok(start.calledTwice);
+            assert.ok(startNone.notCalled);
+        } finally {
+            release.resolve();
+            await Promise.all(disposables.map((disposable) => disposable.dispose()));
+        }
+    });
+});
 
 suite('Language server watcher', () => {
     let watcher: LanguageServerWatcher;
@@ -131,7 +669,7 @@ suite('Language server watcher', () => {
             disposables,
         );
         watcher.register();
-        assert.strictEqual(disposables.length, 11);
+        assert.strictEqual(disposables.length, 13);
     });
 
     test('The constructor should not add a listener to onDidChange to the list of disposables if it is not a trusted workspace', () => {
@@ -176,7 +714,7 @@ suite('Language server watcher', () => {
             disposables,
         );
         watcher.register();
-        assert.strictEqual(disposables.length, 10);
+        assert.strictEqual(disposables.length, 12);
     });
 
     test(`When starting the language server, the language server extension manager should not be undefined`, async () => {
@@ -355,68 +893,6 @@ suite('Language server watcher', () => {
         assert.ok(languageServerNotAvailableStub.calledOnce);
     });
 
-    test('When the config settings change, but the python.languageServer setting is not affected, the watcher should not restart the language server', async () => {
-        let onDidChangeConfigListener: (event: ConfigurationChangeEvent) => Promise<void> = () => Promise.resolve();
-
-        const workspaceService = ({
-            getWorkspaceFolder: (uri: Uri) => ({ uri }),
-            onDidChangeConfiguration: (listener: (event: ConfigurationChangeEvent) => Promise<void>) => {
-                onDidChangeConfigListener = listener;
-            },
-            onDidChangeWorkspaceFolders: () => {
-                /* do nothing */
-            },
-        } as unknown) as IWorkspaceService;
-
-        watcher = new LanguageServerWatcher(
-            {} as IServiceContainer,
-            {} as ILanguageServerOutputChannel,
-            {
-                getSettings: () => ({ languageServer: LanguageServerType.None }),
-            } as IConfigurationService,
-            {} as IExperimentService,
-            ({
-                getActiveWorkspaceUri: () => undefined,
-            } as unknown) as IInterpreterHelper,
-            ({
-                onDidChange: () => {
-                    /* do nothing */
-                },
-            } as unknown) as IInterpreterPathService,
-            ({
-                getActiveInterpreter: () => 'python',
-                onDidChangeInterpreterInformation: () => {
-                    /* do nothing */
-                },
-            } as unknown) as IInterpreterService,
-            {} as IEnvironmentVariablesProvider,
-            workspaceService,
-            ({
-                registerCommand: () => {
-                    /* do nothing */
-                },
-            } as unknown) as ICommandManager,
-            {} as IFileSystem,
-            ({
-                getExtension: () => undefined,
-                onDidChange: () => {
-                    /* do nothing */
-                },
-            } as unknown) as IExtensions,
-            {} as IApplicationShell,
-            disposables,
-        );
-        watcher.register();
-        const startLanguageServerSpy = sandbox.spy(watcher, 'startLanguageServer');
-
-        await watcher.startLanguageServer(LanguageServerType.None);
-
-        await onDidChangeConfigListener({ affectsConfiguration: () => false });
-
-        // Check that startLanguageServer was only called once: When we called it above.
-        assert.ok(startLanguageServerSpy.calledOnce);
-    });
-
     test('When the config settings change, and the python.languageServer setting is affected, the watcher should restart the language server', async () => {
         let onDidChangeConfigListener: (event: ConfigurationChangeEvent) => Promise<void> = () => Promise.resolve();
 
@@ -431,12 +907,10 @@ suite('Language server watcher', () => {
             workspaceFolders: [{ uri: Uri.parse('workspace') }],
         } as unknown) as IWorkspaceService;
 
-        const getSettingsStub = sandbox.stub();
-        getSettingsStub.onFirstCall().returns({ languageServer: LanguageServerType.None });
-        getSettingsStub.onSecondCall().returns({ languageServer: LanguageServerType.Node });
+        const settings = { languageServer: LanguageServerType.None };
 
         const configService = ({
-            getSettings: getSettingsStub,
+            getSettings: () => settings,
         } as unknown) as IConfigurationService;
 
         watcher = new LanguageServerWatcher(
@@ -453,7 +927,7 @@ suite('Language server watcher', () => {
                 },
             } as unknown) as IInterpreterPathService,
             ({
-                getActiveInterpreter: () => 'python',
+                getActiveInterpreter: () => undefined,
                 onDidChangeInterpreterInformation: () => {
                     /* do nothing */
                 },
@@ -477,15 +951,17 @@ suite('Language server watcher', () => {
         );
         watcher.register();
 
-        // Use a fake here so we don't actually start up language servers.
-        const startLanguageServerFake = sandbox.fake.resolves(undefined);
-        sandbox.replace(watcher, 'startLanguageServer', startLanguageServerFake);
+        sandbox.stub(PylanceLSExtensionManager.prototype, 'canStartLanguageServer').returns(true);
+        const start = sandbox.stub(PylanceLSExtensionManager.prototype, 'startLanguageServer').resolves();
+        const stop = sandbox.spy(NoneLSExtensionManager.prototype, 'stopLanguageServer');
         await watcher.startLanguageServer(LanguageServerType.None);
+        settings.languageServer = LanguageServerType.Node;
 
         await onDidChangeConfigListener({ affectsConfiguration: () => true });
 
-        // Check that startLanguageServer was called twice: When we called it above, and implicitly because of the event.
-        assert.ok(startLanguageServerFake.calledTwice);
+        assert.ok(stop.calledOnce);
+        assert.ok(start.calledOnce);
+        assert.strictEqual(watcher.languageServerType, LanguageServerType.Node);
     });
 
     test('When starting a language server with a Python 2.7 interpreter and the python.languageServer setting is Jedi, do not instantiate a language server', async () => {

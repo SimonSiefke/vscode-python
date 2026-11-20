@@ -4,10 +4,11 @@
 'use strict';
 
 import { Event } from 'vscode';
-import { LanguageClient, LanguageClientOptions } from 'vscode-languageclient/node';
+import { LanguageClientOptions } from 'vscode-languageclient/node';
 import type { IDisposable, ILogOutputChannel, Resource } from '../common/types';
 import { StopWatch } from '../common/utils/stopWatch';
 import { PythonEnvironment } from '../pythonEnvironments/info';
+import { LanguageServerClient } from './common/languageServerClient';
 
 export const IExtensionActivationManager = Symbol('IExtensionActivationManager');
 /**
@@ -58,7 +59,7 @@ export interface ILanguageClientFactory {
         interpreter: PythonEnvironment | undefined,
         clientOptions: LanguageClientOptions,
         env?: NodeJS.ProcessEnv,
-    ): Promise<LanguageClient>;
+    ): Promise<LanguageServerClient>;
 }
 export const ILanguageServerAnalysisOptions = Symbol('ILanguageServerAnalysisOptions');
 export interface ILanguageServerAnalysisOptions extends IDisposable {
@@ -81,6 +82,7 @@ export interface ILanguageServerProxy extends IDisposable {
         options: LanguageClientOptions,
     ): Promise<void>;
     stop(): Promise<void>;
+    close(): Promise<void>;
     /**
      * Sends a request to LS so as to load other extensions.
      * This is used as a plugin loader mechanism.

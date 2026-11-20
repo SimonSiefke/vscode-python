@@ -2,7 +2,7 @@
 // Licensed under the MIT License.
 
 import '../../common/extensions';
-import { Disposable, LanguageClient, LanguageClientOptions } from 'vscode-languageclient/node';
+import { Disposable, LanguageClient, LanguageClientOptions, State } from 'vscode-languageclient/node';
 
 import { ChildProcess } from 'child_process';
 import { Resource } from '../../common/types';
@@ -11,12 +11,19 @@ import { captureTelemetry } from '../../telemetry';
 import { EventName } from '../../telemetry/constants';
 import { JediLanguageClientMiddleware } from './languageClientMiddleware';
 import { ProgressReporting } from '../progress';
+import { LanguageServerClient } from '../common/languageServerClient';
 import { ILanguageClientFactory, ILanguageServerProxy } from '../types';
 import { killPid } from '../../common/process/rawProcessApis';
 import { traceDecoratorError, traceDecoratorVerbose, traceError } from '../../logging';
 
 export class JediLanguageServerProxy implements ILanguageServerProxy {
-    private languageClient: LanguageClient | undefined;
+    private languageClient: LanguageServerClient | undefined;
+
+    private startingClient?: LanguageServerClient;
+
+    private stopping?: Promise<void>;
+
+    private closed = false;
 
     private readonly disposables: Disposable[] = [];
 
@@ -32,7 +39,7 @@ export class JediLanguageServerProxy implements ILanguageServerProxy {
 
     @traceDecoratorVerbose('Disposing language server')
     public dispose(): void {
-        this.stop().ignoreErrors();
+        this.close().ignoreErrors();
     }
 
     @traceDecoratorError('Failed to start language server')
@@ -54,17 +61,50 @@ export class JediLanguageServerProxy implements ILanguageServerProxy {
 
         try {
             const client = await this.factory.createLanguageClient(resource, interpreter, options);
+            if (this.closed) {
+                await client.dispose();
+                return;
+            }
             this.registerHandlers(client);
-            await client.start();
-            this.languageClient = client;
+            this.startingClient = client;
+            try {
+                await client.start();
+                if (!this.closed) {
+                    this.languageClient = client;
+                }
+            } finally {
+                this.startingClient = undefined;
+                if (this.closed) {
+                    await client.dispose().catch(() => undefined);
+                }
+            }
         } catch (ex) {
-            traceError('Failed to start language server:', ex);
-            throw new Error('Launching Jedi language server using python failed, see output.');
+            if (!this.closed) {
+                traceError('Failed to start language server:', ex);
+                throw new Error('Launching Jedi language server using python failed, see output.');
+            }
         }
     }
 
+    public close(): Promise<void> {
+        this.closed = true;
+        this.startingClient?.cancelStartup();
+        return this.stop();
+    }
+
+    public stop(): Promise<void> {
+        if (!this.stopping) {
+            this.stopping = Promise.resolve()
+                .then(() => this.stopClient())
+                .finally(() => {
+                    this.stopping = undefined;
+                });
+        }
+        return this.stopping;
+    }
+
     @traceDecoratorVerbose('Stopping language server')
-    public async stop(): Promise<void> {
+    private async stopClient(): Promise<void> {
         while (this.disposables.length > 0) {
             const d = this.disposables.shift()!;
             d.dispose();
@@ -73,6 +113,10 @@ export class JediLanguageServerProxy implements ILanguageServerProxy {
         if (this.languageClient) {
             const client = this.languageClient;
             this.languageClient = undefined;
+            if (client.state === State.Starting) {
+                client.cancelStartup();
+                return;
+            }
 
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             const pid: number | undefined = ((client as any)._serverProcess as ChildProcess)?.pid;
