@@ -313,5 +313,65 @@ suite('Terminal Service (synchronous)', () => {
                 source.dispose();
             }
         });
+
+        for (const { marker, expected, description } of [
+            { marker: 'CANCELED\n', expected: CancellationError, description: 'the shell interrupts the command' },
+            {
+                marker: 'FAIL\nexample: waiting for END',
+                expected: /example: waiting for END/,
+                description: 'the command reports failure details',
+            },
+        ]) {
+            test(`A terminal marker settles the wait when ${description}`, async () => {
+                const clock = sinon.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+                const source = new CancellationTokenSource();
+                const lock = { filePath: 'status marker', dispose: sinon.spy() };
+                const dispatched = createDeferred<void>();
+                when(interpreterService.getActiveInterpreter(undefined)).thenResolve(undefined);
+                when(fs.createTemporaryFile('.log')).thenResolve(lock);
+                when(fs.readFile(lock.filePath)).thenResolve(marker);
+                when(terminalService.sendCommand(anything(), anything(), anything())).thenCall(async () => {
+                    dispatched.resolve();
+                });
+                try {
+                    const rejected = rejects(service.sendCommand('install', [], source.token), expected);
+                    await dispatched.promise;
+                    await clock.tickAsync(100);
+                    await rejected;
+                    sinon.assert.calledOnce(lock.dispose);
+                    verify(fs.readFile(lock.filePath)).once();
+                } finally {
+                    source.cancel();
+                    source.dispose();
+                    clock.restore();
+                }
+            });
+        }
+
+        test('Transient file sharing failures do not replace the canceled result', async () => {
+            const clock = sinon.useFakeTimers();
+            const source = new CancellationTokenSource();
+            const sharingError = Object.assign(new Error('File in use'), { code: 'EBUSY' });
+            const lock = { filePath: 'status marker', dispose: sinon.stub().throws(sharingError) };
+            const dispatched = createDeferred<void>();
+            when(interpreterService.getActiveInterpreter(undefined)).thenResolve(undefined);
+            when(fs.createTemporaryFile('.log')).thenResolve(lock);
+            when(fs.deleteFile(lock.filePath)).thenReject(sharingError).thenResolve();
+            when(terminalService.sendCommand(anything(), anything(), anything())).thenCall(async () => {
+                dispatched.resolve();
+            });
+            try {
+                const canceled = rejects(service.sendCommand('install', [], source.token), CancellationError);
+                await dispatched.promise;
+                source.cancel();
+                await clock.tickAsync(75);
+                await canceled;
+                sinon.assert.calledOnce(lock.dispose);
+                verify(fs.deleteFile(lock.filePath)).twice();
+            } finally {
+                source.dispose();
+                clock.restore();
+            }
+        });
     });
 });

@@ -6,25 +6,18 @@
 import { inject } from 'inversify';
 import { CancellationToken, CancellationTokenSource, Disposable, Event, TerminalShellExecution } from 'vscode';
 import { IInterpreterService } from '../../interpreter/contracts';
-import { traceVerbose } from '../../logging';
+import { traceError, traceVerbose } from '../../logging';
 import { PythonEnvironment } from '../../pythonEnvironments/info';
-import { Cancellation } from '../cancellation';
+import { Cancellation, CancellationError } from '../cancellation';
 import { IFileSystem, TemporaryFile } from '../platform/types';
 import * as internalScripts from '../process/internal/scripts';
-import { createDeferred, Deferred } from '../utils/async';
+import { createDeferred, Deferred, sleep } from '../utils/async';
 import { noop } from '../utils/misc';
 import { TerminalService } from './service';
 import { ITerminalService } from './types';
 
-enum State {
-    notStarted = 0,
-    started = 1,
-    completed = 2,
-    errored = 4,
-}
-
 class ExecutionState implements Disposable {
-    public state: State = State.notStarted;
+    private state = '';
     private _completed: Deferred<void> = createDeferred();
     private disposable?: Disposable;
     constructor(
@@ -58,16 +51,18 @@ class ExecutionState implements Disposable {
         };
     }
     private async updateState(): Promise<void> {
-        const state = await this.getLockFileState(this.lockFile);
+        const contents = await this.fs.readFile(this.lockFile);
         if (!this.disposable) {
             return;
         }
+        const endOfState = contents.indexOf('\n');
+        const state = (endOfState === -1 ? contents : contents.slice(0, endOfState)).trim();
         if (state !== this.state) {
             traceVerbose(`Command state changed to ${state}. ${this.command.join(' ')}`);
         }
         this.state = state;
-        if (state & State.errored) {
-            const errorContents = await this.fs.readFile(`${this.lockFile}.error`).catch(() => '');
+        if (state === 'FAIL') {
+            const errorContents = endOfState === -1 ? '' : contents.slice(endOfState + 1);
             this._completed.reject(
                 new Error(
                     `Command failed with errors, check the terminal for details. Command: ${this.command.join(
@@ -75,23 +70,11 @@ class ExecutionState implements Disposable {
                     )}\n${errorContents}`,
                 ),
             );
-        } else if (state & State.completed) {
+        } else if (state === 'CANCELED') {
+            this._completed.reject(new CancellationError());
+        } else if (state === 'END') {
             this._completed.resolve();
         }
-    }
-    private async getLockFileState(file: string): Promise<State> {
-        const source = await this.fs.readFile(file);
-        let state: State = State.notStarted;
-        if (source.includes('START')) {
-            state |= State.started;
-        }
-        if (source.includes('END')) {
-            state |= State.completed;
-        }
-        if (source.includes('FAIL')) {
-            state |= State.completed | State.errored;
-        }
-        return state;
     }
 }
 
@@ -156,7 +139,7 @@ export class SynchronousTerminalService implements ITerminalService, Disposable 
             const file = await Cancellation.race(async () => {
                 const allocated = await this.createLockFile();
                 if (executionToken.isCancellationRequested) {
-                    allocated.dispose();
+                    await this.disposeLockFile(allocated);
                 } else {
                     lockFile = allocated;
                 }
@@ -176,7 +159,9 @@ export class SynchronousTerminalService implements ITerminalService, Disposable 
             cancelListener?.dispose();
             completionCancellation.dispose();
             state?.dispose();
-            lockFile?.dispose();
+            if (lockFile) {
+                await this.disposeLockFile(lockFile);
+            }
         }
     }
     /** @deprecated */
@@ -195,5 +180,34 @@ export class SynchronousTerminalService implements ITerminalService, Disposable 
             this.disposables.push(l);
             return l;
         });
+    }
+
+    private async disposeLockFile(file: TemporaryFile): Promise<void> {
+        try {
+            file.dispose();
+            return;
+        } catch (error) {
+            const code = (error as NodeJS.ErrnoException | undefined)?.code;
+            if (code !== 'EBUSY' && code !== 'EPERM' && code !== 'EACCES') {
+                throw error;
+            }
+        }
+
+        // The terminal helper can be opening or updating the marker when cancellation removes it.
+        let deletionError: unknown;
+        for (const delay of [25, 50, 100]) {
+            await sleep(delay);
+            try {
+                await this.fs.deleteFile(file.filePath);
+                return;
+            } catch (error) {
+                const code = (error as NodeJS.ErrnoException | undefined)?.code;
+                if (code === 'ENOENT' || code === 'FileNotFound') {
+                    return;
+                }
+                deletionError = error;
+            }
+        }
+        traceError('Failed to remove the terminal command marker', deletionError);
     }
 }
