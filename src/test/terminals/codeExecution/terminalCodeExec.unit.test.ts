@@ -37,7 +37,16 @@ import { IInterpreterService } from '../../../client/interpreter/contracts';
 import { buildPythonExecInfo } from '../../../client/pythonEnvironments/exec';
 
 suite('Terminal - REPL lifetime', () => {
+    let disposeFixture: (() => void) | undefined;
+
+    teardown(() => {
+        const dispose = disposeFixture;
+        disposeFixture = undefined;
+        dispose?.();
+    });
+
     function createExecutor() {
+        const sandbox = sinon.createSandbox();
         const closeListeners = new Set<() => void>();
         const disposables: Disposable[] = [];
         const dataWritten = new EventEmitter<TerminalDataWriteEvent>();
@@ -53,7 +62,7 @@ suite('Terminal - REPL lifetime', () => {
                 closeListeners.add(listener);
                 return new Disposable(() => closeListeners.delete(listener));
             });
-        const sendCommand = sinon.spy(async () => {
+        const sendCommand = sandbox.spy(async () => {
             dataWritten.fire({ terminal: terminal.object, data: '>>> ' });
         });
         service.setup((s) => s.sendCommand(TypeMoq.It.isAny(), TypeMoq.It.isAny())).returns(sendCommand);
@@ -71,56 +80,51 @@ suite('Terminal - REPL lifetime', () => {
             TypeMoq.Mock.ofType<ICommandManager>().object,
             applicationShell.object,
         );
-        return { executor, sendCommand, closeListeners, disposables, dataWritten };
+        disposeFixture = () => {
+            try {
+                disposables.forEach((disposable) => disposable.dispose());
+                dataWritten.dispose();
+            } finally {
+                sandbox.restore();
+            }
+        };
+        sandbox.useFakeTimers();
+        return { executor, sendCommand, closeListeners, disposables };
     }
 
     test('Reusing and closing a REPL keeps its close listener until close', async () => {
-        const { executor, sendCommand, closeListeners, disposables, dataWritten } = createExecutor();
-        const clock = sinon.useFakeTimers();
-        try {
-            await executor.initializeRepl(undefined);
-            const registeredDisposables = disposables.length;
-            expect(closeListeners.size).to.equal(1);
-            const [closeListener] = closeListeners;
+        const { executor, sendCommand, closeListeners, disposables } = createExecutor();
+        await executor.initializeRepl(undefined);
+        const registeredDisposables = disposables.length;
+        expect(closeListeners.size).to.equal(1);
+        const [closeListener] = closeListeners;
 
-            await executor.initializeRepl(undefined);
-            expect([...closeListeners]).to.deep.equal([closeListener]);
-            expect(sendCommand.callCount).to.equal(1);
+        await executor.initializeRepl(undefined);
+        expect([...closeListeners]).to.deep.equal([closeListener]);
+        expect(sendCommand.callCount).to.equal(1);
 
-            closeListener();
-            expect(closeListeners.size).to.equal(0);
+        closeListener();
+        expect(closeListeners.size).to.equal(0);
 
-            await executor.initializeRepl(undefined);
-            expect(closeListeners.size).to.equal(1);
-            expect(sendCommand.callCount).to.equal(2);
-            expect(disposables.length).to.equal(registeredDisposables);
-            [...closeListeners].forEach((listener) => listener());
-            expect(closeListeners.size).to.equal(0);
-        } finally {
-            disposables.forEach((disposable) => disposable.dispose());
-            dataWritten.dispose();
-            clock.restore();
-        }
+        await executor.initializeRepl(undefined);
+        expect(closeListeners.size).to.equal(1);
+        expect(sendCommand.callCount).to.equal(2);
+        expect(disposables.length).to.equal(registeredDisposables);
+        [...closeListeners].forEach((listener) => listener());
+        expect(closeListeners.size).to.equal(0);
     });
 
     test('Session disposal releases the close listener of a reopened REPL', async () => {
-        const { executor, closeListeners, disposables, dataWritten } = createExecutor();
-        const clock = sinon.useFakeTimers();
-        try {
-            await executor.initializeRepl(undefined);
-            expect(closeListeners.size).to.equal(1);
-            [...closeListeners].forEach((listener) => listener());
-            expect(closeListeners.size).to.equal(0);
+        const { executor, closeListeners, disposables } = createExecutor();
+        await executor.initializeRepl(undefined);
+        expect(closeListeners.size).to.equal(1);
+        [...closeListeners].forEach((listener) => listener());
+        expect(closeListeners.size).to.equal(0);
 
-            await executor.initializeRepl(undefined);
-            expect(closeListeners.size).to.equal(1);
-            disposables.forEach((disposable) => disposable.dispose());
-            expect(closeListeners.size).to.equal(0);
-        } finally {
-            disposables.forEach((disposable) => disposable.dispose());
-            dataWritten.dispose();
-            clock.restore();
-        }
+        await executor.initializeRepl(undefined);
+        expect(closeListeners.size).to.equal(1);
+        disposables.forEach((disposable) => disposable.dispose());
+        expect(closeListeners.size).to.equal(0);
     });
 });
 
