@@ -1,12 +1,13 @@
 import * as path from 'path';
 import * as ch from 'child_process';
 import * as rpc from 'vscode-jsonrpc/node';
-import { Disposable, Event, EventEmitter, window } from 'vscode';
+import { CancellationTokenSource, Disposable, Event, EventEmitter } from 'vscode';
 import { EXTENSION_ROOT_DIR } from '../constants';
 import { traceError, traceLog } from '../logging';
 import { captureTelemetry } from '../telemetry';
 import { EventName } from '../telemetry/constants';
 import { dispose } from '../common/utils/resourceLifecycle';
+import { showInputBox } from '../common/vscodeApis/windowApis';
 
 const SERVER_PATH = path.join(EXTENSION_ROOT_DIR, 'python_files', 'python_server.py');
 const SERVER_EXIT_TIMEOUT_MS = 1000;
@@ -18,6 +19,7 @@ export interface ExecutionResult {
 
 export interface PythonServer extends Disposable {
     onCodeExecuted: Event<void>;
+    onDidBecomeIdle: Event<void>;
     readonly isExecuting: boolean;
     readonly isDisposed: boolean;
     execute(code: string): Promise<ExecutionResult | undefined>;
@@ -33,6 +35,12 @@ class PythonServerImpl implements PythonServer, Disposable {
     private readonly _onCodeExecuted = new EventEmitter<void>();
 
     onCodeExecuted = this._onCodeExecuted.event;
+
+    private readonly _onDidBecomeIdle = new EventEmitter<void>();
+
+    onDidBecomeIdle = this._onDidBecomeIdle.event;
+
+    private readonly inputCancellation = new CancellationTokenSource();
 
     private inFlightRequests = 0;
 
@@ -72,44 +80,43 @@ class PythonServerImpl implements PythonServer, Disposable {
 
     public input(): void {
         // Register input request handler
-        this.connection.onRequest('input', async (request) => {
-            // Ask for user input via popup quick input, send it back to Python
-            let userPrompt = 'Enter your input here: ';
-            if (request && request.prompt) {
-                userPrompt = request.prompt;
-            }
-            const input = await window.showInputBox({
-                title: 'Input Request',
-                prompt: userPrompt,
-                ignoreFocusOut: true,
-            });
-            return { userInput: input };
-        });
+        this.disposables.push(
+            this.connection.onRequest('input', async (request) => {
+                const input = await showInputBox(
+                    {
+                        title: 'Input Request',
+                        prompt: request?.prompt || 'Enter your input here: ',
+                        ignoreFocusOut: true,
+                    },
+                    this.inputCancellation.token,
+                );
+                return { userInput: input };
+            }),
+        );
     }
 
     @captureTelemetry(EventName.EXECUTION_CODE, { scope: 'selection' }, false)
     public async execute(code: string): Promise<ExecutionResult | undefined> {
-        const result = await this.executeCode(code);
-        if (result?.status) {
-            this._onCodeExecuted.fire();
-        }
-        return result;
+        return this.withRequest(async () => {
+            const result = await this.executeCode(code);
+            if (result?.status) {
+                this._onCodeExecuted.fire();
+            }
+            return result;
+        });
     }
 
     public executeSilently(code: string): Promise<ExecutionResult | undefined> {
-        return this.executeCode(code);
+        return this.withRequest(() => this.executeCode(code));
     }
 
     private async executeCode(code: string): Promise<ExecutionResult | undefined> {
-        this.inFlightRequests += 1;
         try {
             const result = await this.connection.sendRequest('execute', code);
             return result as ExecutionResult;
         } catch (err) {
             const error = err as Error;
             traceError(`Error getting response from REPL server:`, error);
-        } finally {
-            this.inFlightRequests -= 1;
         }
         return undefined;
     }
@@ -122,12 +129,21 @@ class PythonServerImpl implements PythonServer, Disposable {
     }
 
     public async checkValidCommand(code: string): Promise<boolean> {
+        return this.withRequest(async () => {
+            const result: ExecutionResult = await this.connection.sendRequest('check_valid_command', code);
+            return result.output === 'True';
+        });
+    }
+
+    private async withRequest<T>(request: () => Promise<T>): Promise<T> {
         this.inFlightRequests += 1;
         try {
-            const completeCode: ExecutionResult = await this.connection.sendRequest('check_valid_command', code);
-            return completeCode.output === 'True';
+            return await request();
         } finally {
             this.inFlightRequests -= 1;
+            if (!this.disposed && this.inFlightRequests === 0) {
+                this._onDidBecomeIdle.fire();
+            }
         }
     }
 
@@ -158,7 +174,14 @@ class PythonServerImpl implements PythonServer, Disposable {
         if (serverInstance === this) {
             serverInstance = undefined;
         }
-        dispose([...this.disposables.splice(0), this.connection, this._onCodeExecuted]);
+        this.inputCancellation.cancel();
+        dispose([
+            ...this.disposables.splice(0),
+            this.inputCancellation,
+            this.connection,
+            this._onCodeExecuted,
+            this._onDidBecomeIdle,
+        ]);
     }
 }
 
@@ -173,10 +196,10 @@ export function createPythonServer(interpreter: string[], cwd?: string): PythonS
     pythonServer.stderr.on('data', (data) => {
         traceError(data.toString());
     });
-    const connection = rpc.createMessageConnection(
-        new rpc.StreamMessageReader(pythonServer.stdout),
-        new rpc.StreamMessageWriter(pythonServer.stdin),
-    );
+    const reader = new rpc.StreamMessageReader(pythonServer.stdout);
+    // There is no partial-message listener, and the reader can retain an incomplete frame after disposal.
+    reader.partialMessageTimeout = 0;
+    const connection = rpc.createMessageConnection(reader, new rpc.StreamMessageWriter(pythonServer.stdin));
     serverInstance = new PythonServerImpl(connection, pythonServer);
     return serverInstance;
 }

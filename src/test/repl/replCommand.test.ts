@@ -25,6 +25,7 @@ suite('REPL - register native repl command', () => {
     let getNativeReplStub: sinon.SinonStub;
     let disposable: TypeMoq.IMock<Disposable>;
     let disposableArray: Disposable[] = [];
+    let session: nativeRepl.NativeReplSession;
 
     setup(() => {
         interpreterService = TypeMoq.Mock.ofType<IInterpreterService>();
@@ -41,6 +42,7 @@ suite('REPL - register native repl command', () => {
         registerCommandSpy = sinon.spy(commandManager.object, 'registerCommand');
         disposable = TypeMoq.Mock.ofType<Disposable>();
         disposableArray = [disposable.object];
+        session = nativeRepl.registerNativeRepl(disposableArray);
     });
 
     teardown(() => {
@@ -61,6 +63,7 @@ suite('REPL - register native repl command', () => {
 
         await replCommands.registerReplCommands(
             disposableArray,
+            session,
             interpreterService.object,
             executionHelper.object,
             commandManager.object,
@@ -91,6 +94,7 @@ suite('REPL - register native repl command', () => {
             });
         replCommands.registerReplCommands(
             disposableArray,
+            session,
             interpreterService.object,
             executionHelper.object,
             commandManager.object,
@@ -123,6 +127,7 @@ suite('REPL - register native repl command', () => {
             });
         replCommands.registerReplCommands(
             disposableArray,
+            session,
             interpreterService.object,
             executionHelper.object,
             commandManager.object,
@@ -156,6 +161,7 @@ suite('REPL - register native repl command', () => {
             });
         replCommands.registerReplCommands(
             disposableArray,
+            session,
             interpreterService.object,
             executionHelper.object,
             commandManager.object,
@@ -194,6 +200,7 @@ suite('REPL - register native repl command', () => {
 
         replCommands.registerReplCommands(
             disposableArray,
+            session,
             interpreterService.object,
             executionHelper.object,
             commandManager.object,

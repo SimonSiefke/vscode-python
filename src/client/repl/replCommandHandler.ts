@@ -79,14 +79,18 @@ export async function selectNotebookKernel(
 /**
  * Function that executes notebook cell given code.
  */
-export async function executeNotebookCell(notebookEditor: NotebookEditor, code: string): Promise<void> {
+export async function executeNotebookCell(
+    notebookEditor: NotebookEditor,
+    code: string,
+    isCurrentSession: () => boolean = () => true,
+): Promise<void> {
     const { notebook, replOptions } = notebookEditor;
     const cellIndex = replOptions?.appendIndex ?? notebook.cellCount;
-    if (notebook.isClosed) {
+    if (notebook.isClosed || !isCurrentSession()) {
         return;
     }
     const applied = await addCellToNotebook(notebook, cellIndex, code);
-    if (!applied || notebook.isClosed) {
+    if (!applied || notebook.isClosed || !isCurrentSession()) {
         return;
     }
 

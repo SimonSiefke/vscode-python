@@ -25,8 +25,8 @@ suite('REPL - Native REPL', () => {
 
     let disposable: TypeMoq.IMock<Disposable>;
     let disposableArray: Disposable[] = [];
+    let session: NativeReplModule.NativeReplSession;
     let setReplDirectoryStub: sinon.SinonStub;
-    let setReplControllerSpy: sinon.SinonSpy;
     let getWorkspaceStateValueStub: sinon.SinonStub;
     let updateWorkspaceStateValueStub: sinon.SinonStub;
     let createReplControllerStub: sinon.SinonStub;
@@ -47,11 +47,19 @@ suite('REPL - Native REPL', () => {
             .returns(() => Promise.resolve(({ path: 'ps' } as unknown) as PythonEnvironment));
         disposable = TypeMoq.Mock.ofType<Disposable>();
         disposableArray = [disposable.object];
+        session = NativeReplModule.registerNativeRepl(disposableArray);
 
         createReplControllerStub = sinon.stub(replController, 'createReplController').returns(mockNotebookController);
         sinon.stub(replCommandHandler, 'openInteractiveREPL').resolves(undefined);
         setReplDirectoryStub = sinon.stub(NativeReplModule.NativeRepl.prototype as any, 'setReplDirectory').resolves();
-        setReplControllerSpy = sinon.spy(NativeReplModule.NativeRepl.prototype, 'setReplController');
+        sinon.stub(PythonServer, 'createPythonServer').callsFake(
+            () =>
+                (({
+                    onCodeExecuted: () => ({ dispose: () => undefined }),
+                    onDidBecomeIdle: () => ({ dispose: () => undefined }),
+                    dispose: () => undefined,
+                } as unknown) as PythonServer.PythonServer),
+        );
         updateWorkspaceStateValueStub = sinon.stub(persistentState, 'updateWorkspaceStateValue').resolves();
     });
 
@@ -70,7 +78,7 @@ suite('REPL - Native REPL', () => {
         const instance = await NativeReplModule.NativeRepl.create(interpreter as PythonEnvironment);
         disposableArray.push(instance);
         const createMethodStub = sinon.stub(NativeReplModule.NativeRepl, 'create').resolves(instance);
-        await NativeReplModule.getNativeRepl(interpreter as PythonEnvironment, disposableArray);
+        await NativeReplModule.getNativeRepl(interpreter as PythonEnvironment, session);
 
         expect(createMethodStub.calledOnce).to.be.true;
     });
@@ -81,7 +89,7 @@ suite('REPL - Native REPL', () => {
             .setup((i) => i.getActiveInterpreter(TypeMoq.It.isAny()))
             .returns(() => Promise.resolve(({ path: 'ps' } as unknown) as PythonEnvironment));
         const interpreter = await interpreterService.object.getActiveInterpreter();
-        const nativeRepl = await NativeReplModule.getNativeRepl(interpreter as PythonEnvironment, disposableArray);
+        const nativeRepl = await NativeReplModule.getNativeRepl(interpreter as PythonEnvironment, session);
 
         await nativeRepl.sendToNativeRepl(undefined, false);
 
@@ -94,14 +102,14 @@ suite('REPL - Native REPL', () => {
             .setup((i) => i.getActiveInterpreter(TypeMoq.It.isAny()))
             .returns(() => Promise.resolve(({ path: 'ps' } as unknown) as PythonEnvironment));
         const interpreter = await interpreterService.object.getActiveInterpreter();
-        const nativeRepl = await NativeReplModule.getNativeRepl(interpreter as PythonEnvironment, disposableArray);
+        const nativeRepl = await NativeReplModule.getNativeRepl(interpreter as PythonEnvironment, session);
 
         await nativeRepl.sendToNativeRepl(undefined, false);
 
         expect(updateWorkspaceStateValueStub.calledOnce).to.be.true;
     });
 
-    test('create should call setReplDirectory, setReplController', async () => {
+    test('create should set the directory and create the controller', async () => {
         const interpreter = await interpreterService.object.getActiveInterpreter();
         interpreterService
             .setup((i) => i.getActiveInterpreter(TypeMoq.It.isAny()))
@@ -110,7 +118,6 @@ suite('REPL - Native REPL', () => {
         disposableArray.push(await NativeReplModule.NativeRepl.create(interpreter as PythonEnvironment));
 
         expect(setReplDirectoryStub.calledOnce).to.be.true;
-        expect(setReplControllerSpy.calledOnce).to.be.true;
         expect(createReplControllerStub.calledOnce).to.be.true;
     });
 
@@ -120,7 +127,6 @@ suite('REPL - Native REPL', () => {
             execute: sinon.stub().resolves({ status: true, output: 'hello\nworld' }),
             dispose: sinon.stub(),
         } as any;
-        const createPythonServerStub = sinon.stub(PythonServer, 'createPythonServer').returns(mockServer as any);
 
         const replaceOutputStub = sinon.stub();
         const execStub = {
@@ -144,15 +150,12 @@ suite('REPL - Native REPL', () => {
         sinon.stub(vscode.notebooks, 'createNotebookController').returns(mockNotebookController);
         createReplControllerStub.restore();
 
-        const disposables: Disposable[] = [];
+        const controller = replController.createReplController(mockServer);
         try {
-            const controller = replController.createReplController('python', disposables, '/cwd');
-
             const mockTextDocument = { getText: sinon.stub().returns('print("hi")') } as any;
             const mockCell = { document: mockTextDocument } as any;
             await (controller.executeHandler as any)([mockCell]);
 
-            expect(createPythonServerStub.calledOnce).to.be.true;
             expect(mockServer.execute.calledOnceWithExactly('print("hi")')).to.be.true;
             expect(createNotebookCellExecutionStub.calledOnce).to.be.true;
             expect(replaceOutputStub.calledOnce).to.be.true;
@@ -167,7 +170,7 @@ suite('REPL - Native REPL', () => {
             const outputText = Buffer.from((output.items[0] as any).data).toString();
             expect(outputText).to.equal('hello\nworld');
         } finally {
-            disposables.forEach((disposable) => disposable.dispose());
+            controller.dispose();
         }
     });
 });
@@ -223,5 +226,20 @@ suite('REPL - cell submission', () => {
         await sending;
 
         sinon.assert.notCalled(executeCommand);
+    });
+
+    test('does not execute an old edit when the REPL owner changed and the notebook stayed open', async () => {
+        const applied = createDeferred<boolean>();
+        applyEdit.returns(applied.promise);
+        let originalOwner = true;
+        const sending = replCommandHandler.executeNotebookCell(editor, 'print(1)', () => originalOwner);
+        sinon.assert.calledOnce(applyEdit);
+        originalOwner = false;
+        applied.resolve(true);
+        await sending;
+        sinon.assert.notCalled(executeCommand);
+
+        await replCommandHandler.executeNotebookCell(editor, 'print(2)', () => true);
+        sinon.assert.calledOnce(executeCommand);
     });
 });

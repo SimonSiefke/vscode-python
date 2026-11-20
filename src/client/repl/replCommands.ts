@@ -4,16 +4,18 @@ import { ICommandManager } from '../common/application/types';
 import { Commands } from '../common/constants';
 import { IInterpreterService } from '../interpreter/contracts';
 import { ICodeExecutionHelper } from '../terminals/types';
-import { getNativeRepl } from './nativeRepl';
+import { getNativeRepl, NativeReplSession } from './nativeRepl';
 import {
     executeInTerminal,
     getActiveInterpreter,
     getSelectedTextToExecute,
     getSendToNativeREPLSetting,
+    getTabNameForUri,
     insertNewLineToREPLInput,
     isMultiLineText,
 } from './replUtils';
 import { registerCommand } from '../common/vscodeApis/commandApis';
+import { getActiveNotebookEditor, getActiveTextEditor } from '../common/vscodeApis/windowApis';
 import { sendTelemetryEvent } from '../telemetry';
 import { EventName } from '../telemetry/constants';
 import { ReplType } from './types';
@@ -23,14 +25,15 @@ import { ReplType } from './types';
  */
 export async function registerStartNativeReplCommand(
     disposables: Disposable[],
+    session: NativeReplSession,
     interpreterService: IInterpreterService,
 ): Promise<void> {
     disposables.push(
         registerCommand(Commands.Start_Native_REPL, async (uri: Uri) => {
             sendTelemetryEvent(EventName.REPL, undefined, { replType: 'Native' });
             const interpreter = await getActiveInterpreter(uri, interpreterService);
-            if (interpreter) {
-                const nativeRepl = await getNativeRepl(interpreter, disposables);
+            if (interpreter && !session.disposed) {
+                const nativeRepl = await getNativeRepl(interpreter, session);
                 await nativeRepl.sendToNativeRepl(undefined, false);
             }
         }),
@@ -42,6 +45,7 @@ export async function registerStartNativeReplCommand(
  */
 export async function registerReplCommands(
     disposables: Disposable[],
+    session: NativeReplSession,
     interpreterService: IInterpreterService,
     executionHelper: ICodeExecutionHelper,
     commandManager: ICommandManager,
@@ -56,8 +60,8 @@ export async function registerReplCommands(
             }
             const interpreter = await getActiveInterpreter(uri, interpreterService);
 
-            if (interpreter) {
-                const nativeRepl = await getNativeRepl(interpreter, disposables);
+            if (interpreter && !session.disposed) {
+                const nativeRepl = await getNativeRepl(interpreter, session);
                 const activeEditor = window.activeTextEditor;
                 if (activeEditor) {
                     const code = await getSelectedTextToExecute(activeEditor);
@@ -85,17 +89,18 @@ export async function registerReplCommands(
  */
 export async function registerReplExecuteOnEnter(
     disposables: Disposable[],
+    session: NativeReplSession,
     interpreterService: IInterpreterService,
     commandManager: ICommandManager,
 ): Promise<void> {
     disposables.push(
         commandManager.registerCommand(Commands.Exec_In_REPL_Enter, async (uri: Uri) => {
-            await onInputEnter(uri, 'repl.execute', interpreterService, disposables);
+            await onInputEnter(uri, 'repl.execute', interpreterService, session);
         }),
     );
     disposables.push(
         commandManager.registerCommand(Commands.Exec_In_IW_Enter, async (uri: Uri) => {
-            await onInputEnter(uri, 'interactive.execute', interpreterService, disposables);
+            await onInputEnter(uri, 'interactive.execute', interpreterService, session);
         }),
     );
 }
@@ -104,28 +109,47 @@ async function onInputEnter(
     uri: Uri | undefined,
     commandName: string,
     interpreterService: IInterpreterService,
-    disposables: Disposable[],
+    session: NativeReplSession,
 ): Promise<void> {
+    const editor = getActiveTextEditor();
+    if (!editor) {
+        return;
+    }
+    const notebookEditor = commandName === 'repl.execute' ? getActiveNotebookEditor() : undefined;
+    const notebook = notebookEditor?.notebook;
+    if (
+        commandName === 'repl.execute' &&
+        (!notebook || !notebookEditor?.replOptions || getTabNameForUri(notebook.uri) !== 'Python REPL')
+    ) {
+        return;
+    }
+    const isCurrentInput = () =>
+        !session.disposed &&
+        getActiveTextEditor() === editor &&
+        !editor.document.isClosed &&
+        !notebook?.isClosed &&
+        (!notebookEditor || getActiveNotebookEditor() === notebookEditor);
+
     const interpreter = await getActiveInterpreter(uri, interpreterService);
-    if (!interpreter) {
+    if (!interpreter || !isCurrentInput()) {
         return;
     }
 
-    const nativeRepl = await getNativeRepl(interpreter, disposables);
-    const completeCode = await nativeRepl?.checkUserInputCompleteCode(window.activeTextEditor);
-    const editor = window.activeTextEditor;
+    const nativeRepl = await getNativeRepl(interpreter, session);
+    if ((notebook && !nativeRepl.useNotebook(notebook)) || !isCurrentInput()) {
+        return;
+    }
+    const completeCode = await nativeRepl.checkUserInputCompleteCode(editor);
+    if (!isCurrentInput()) {
+        return;
+    }
 
-    if (editor) {
-        // Execute right away when complete code and Not multi-line
-        if (completeCode && !isMultiLineText(editor)) {
+    if (completeCode && !isMultiLineText(editor)) {
+        await commands.executeCommand(commandName);
+    } else {
+        insertNewLineToREPLInput(editor);
+        if (editor.document.lineAt(editor.selection.active.line).text === '') {
             await commands.executeCommand(commandName);
-        } else {
-            insertNewLineToREPLInput(editor);
-
-            // Handle case when user enters on blank line, just trigger interactive.execute
-            if (editor && editor.document.lineAt(editor.selection.active.line).text === '') {
-                await commands.executeCommand(commandName);
-            }
         }
     }
 }

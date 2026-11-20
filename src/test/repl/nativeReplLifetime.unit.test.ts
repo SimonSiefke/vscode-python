@@ -11,6 +11,8 @@ import {
     NotebookDocument,
     NotebookEditor,
     QuickPickItem,
+    TextDocument,
+    TextEditor,
     Uri,
 } from 'vscode';
 import { Architecture } from '../../client/common/utils/platform';
@@ -22,10 +24,23 @@ import * as envApi from '../../client/envExt/api.internal';
 import * as legacyEnvApi from '../../client/envExt/api.legacy';
 import { DidChangeEnvironmentEventArgs } from '../../client/envExt/types';
 import { EnvironmentType, PythonEnvironment } from '../../client/pythonEnvironments/info';
-import { getNativeRepl, NativeRepl, NATIVE_REPL_URI_MEMENTO } from '../../client/repl/nativeRepl';
+import {
+    getNativeRepl,
+    NativeRepl,
+    NativeReplSession,
+    NATIVE_REPL_URI_MEMENTO,
+    registerNativeRepl,
+} from '../../client/repl/nativeRepl';
 import * as pythonServer from '../../client/repl/pythonServer';
 import * as commandHandler from '../../client/repl/replCommandHandler';
 import * as controllerFactory from '../../client/repl/replController';
+import * as commandApis from '../../client/common/vscodeApis/commandApis';
+import { disposeAll } from '../../client/common/utils/resourceLifecycle';
+import { Commands } from '../../client/common/constants';
+import { ICommandManager } from '../../client/common/application/types';
+import { IInterpreterService } from '../../client/interpreter/contracts';
+import { registerReplExecuteOnEnter, registerStartNativeReplCommand } from '../../client/repl/replCommands';
+import * as replUtils from '../../client/repl/replUtils';
 
 suite('Native REPL lifetime', () => {
     const interpreter: PythonEnvironment = {
@@ -35,6 +50,7 @@ suite('Native REPL lifetime', () => {
         envType: EnvironmentType.Venv,
     };
     let registry: Disposable[];
+    let session: NativeReplSession;
     let notebook: NotebookDocument;
     let notebookEditor: NotebookEditor;
     let openNotebook: sinon.SinonStub;
@@ -47,7 +63,8 @@ suite('Native REPL lifetime', () => {
     let listenerDisposals: sinon.SinonSpy[];
     let serverDisposals: sinon.SinonStub[];
     let controllerDisposals: sinon.SinonSpy[];
-    let servers: pythonServer.PythonServer[];
+    let serverIdleEvents: EventEmitter<void>[];
+    let busyServers: Set<pythonServer.PythonServer>;
     let createServer: sinon.SinonStub;
     let createRepl: sinon.SinonSpy;
     let workspaceFolders: sinon.SinonStub;
@@ -61,19 +78,40 @@ suite('Native REPL lifetime', () => {
         const document = TypeMoq.Mock.ofType<NotebookDocument>();
         document.setup((d) => d.uri).returns(() => Uri.parse(`vscode-interactive:/${name}`));
         document.setup((d) => d.isClosed).returns(() => false);
-        const editor = TypeMoq.Mock.ofType<NotebookEditor>();
-        editor.setup((e) => e.notebook).returns(() => document.object);
-        return editor.object;
+        return { notebook: document.object, replOptions: { appendIndex: 0 } } as NotebookEditor;
+    }
+
+    function mockReplInput() {
+        const editor = TypeMoq.Mock.ofType<TextEditor>();
+        const document = TypeMoq.Mock.ofType<TextDocument>();
+        document.setup((d) => d.getText()).returns(() => 'print(1)');
+        document.setup((d) => d.isClosed).returns(() => false);
+        document.setup((d) => d.lineCount).returns(() => 1);
+        editor.setup((e) => e.document).returns(() => document.object);
+        sinon.stub(windowApis, 'getActiveNotebookEditor').returns(notebookEditor);
+        sinon.stub(replUtils, 'getTabNameForUri').returns('Python REPL');
+        return sinon.stub(windowApis, 'getActiveTextEditor').returns(editor.object);
+    }
+
+    async function registerNativeEnter(lookup: () => Promise<PythonEnvironment>) {
+        const interpreterService = TypeMoq.Mock.ofType<IInterpreterService>();
+        interpreterService.setup((value) => value.getActiveInterpreter(TypeMoq.It.isAny())).returns(lookup);
+        const registerCommand = sinon.stub().returns({ dispose: () => undefined });
+        const commandManager = ({ registerCommand } as unknown) as ICommandManager;
+        await registerReplExecuteOnEnter(registry, session, interpreterService.object, commandManager);
+        return registerCommand.withArgs(Commands.Exec_In_REPL_Enter).firstCall.args[1];
     }
 
     setup(() => {
         registry = [];
+        session = registerNativeRepl(registry);
         closed = new EventEmitter<NotebookDocument>();
         closeWork = [];
         listenerDisposals = [];
         serverDisposals = [];
         controllerDisposals = [];
-        servers = [];
+        serverIdleEvents = [];
+        busyServers = new Set();
         notebookEditor = createNotebookEditor('memory-lifetime');
         notebook = notebookEditor.notebook;
         workspaceFolders = sinon.stub(workspaceApis, 'getWorkspaceFolders').returns([]);
@@ -93,10 +131,18 @@ suite('Native REPL lifetime', () => {
         executeCell = sinon.stub(commandHandler, 'executeNotebookCell').resolves();
         createServer = sinon.stub(pythonServer, 'createPythonServer').callsFake(() => {
             const executed = new EventEmitter<void>();
-            const dispose = sinon.stub().callsFake(() => executed.dispose());
+            const idle = new EventEmitter<void>();
+            serverIdleEvents.push(idle);
+            const dispose = sinon.stub().callsFake(() => {
+                executed.dispose();
+                idle.dispose();
+            });
             const server: pythonServer.PythonServer = {
                 onCodeExecuted: executed.event,
-                isExecuting: false,
+                onDidBecomeIdle: idle.event,
+                get isExecuting() {
+                    return busyServers.has(this);
+                },
                 isDisposed: false,
                 execute: async () => ({ status: true, output: '' }),
                 executeSilently: async () => ({ status: true, output: '' }),
@@ -105,18 +151,15 @@ suite('Native REPL lifetime', () => {
                 input: () => undefined,
                 dispose,
             };
-            servers.push(server);
             serverDisposals.push(dispose);
             return server;
         });
-        sinon.stub(controllerFactory, 'createReplController').callsFake((_path, disposables) => {
+        sinon.stub(controllerFactory, 'createReplController').callsFake(() => {
             const controller = TypeMoq.Mock.ofType<NotebookController>();
             const dispose = sinon.spy();
             controller.setup((c) => c.id).returns(() => 'pythonREPL');
             controller.setup((c) => c.dispose()).callback(dispose);
             controllerDisposals.push(dispose);
-            // The real controller factory registers the same server a second time.
-            disposables.push(servers[servers.length - 1], controller.object);
             return controller.object;
         });
         createRepl = sinon.spy(NativeRepl, 'create');
@@ -136,7 +179,7 @@ suite('Native REPL lifetime', () => {
     });
 
     test('closing the notebook releases its session without starting another server', async () => {
-        const repl = await getNativeRepl(interpreter, registry);
+        const repl = await getNativeRepl(interpreter, session);
         await repl.sendToNativeRepl();
         await closeNotebook();
         assert.strictEqual(createServer.callCount, 1);
@@ -146,19 +189,22 @@ suite('Native REPL lifetime', () => {
     });
 
     test('closing and reopening keeps one registration and shutdown releases the live replacement', async () => {
-        const first = await getNativeRepl(interpreter, registry);
+        const first = await getNativeRepl(interpreter, session);
         await first.sendToNativeRepl('first');
         await closeNotebook();
 
         const replacementEditor = createNotebookEditor('replacement');
         openNotebook.resolves({ notebookEditor: replacementEditor, documentCreated: true });
-        const replacement = await getNativeRepl(interpreter, registry);
+        const replacement = await getNativeRepl(interpreter, session);
         assert.notStrictEqual(first, replacement);
         await replacement.sendToNativeRepl('second');
-        assert.deepStrictEqual(executeCell.args, [
-            [notebookEditor, 'first'],
-            [replacementEditor, 'second'],
-        ]);
+        assert.deepStrictEqual(
+            executeCell.args.map((args) => args.slice(0, 2)),
+            [
+                [notebookEditor, 'first'],
+                [replacementEditor, 'second'],
+            ],
+        );
         sinon.assert.calledOnceWithExactly(selectKernel, replacementEditor, 'pythonREPL', 'ms-python.python');
         assert.strictEqual(registry.length, 1);
         sinon.assert.calledOnce(listenerDisposals[0]);
@@ -170,20 +216,129 @@ suite('Native REPL lifetime', () => {
         [...listenerDisposals, ...serverDisposals, ...controllerDisposals].forEach((disposable) =>
             sinon.assert.calledOnce(disposable),
         );
-        await assert.rejects(getNativeRepl(interpreter, registry), /disposed/);
+        await assert.rejects(getNativeRepl(interpreter, session), /disposed/);
     });
 
     test('simultaneous commands share the same pending session creation', async () => {
         const [first, second] = await Promise.all([
-            getNativeRepl(interpreter, registry),
-            getNativeRepl(interpreter, registry),
+            getNativeRepl(interpreter, session),
+            getNativeRepl(interpreter, session),
         ]);
         assert.strictEqual(first, second);
         assert.strictEqual(createRepl.callCount, 1);
     });
 
+    test('the registered Start command cannot create a REPL after its activation shuts down', async () => {
+        const lookup = createDeferred<PythonEnvironment>();
+        const started = createDeferred();
+        const finishShutdown = createDeferred();
+        const service = TypeMoq.Mock.ofType<IInterpreterService>();
+        service
+            .setup((value) => value.getActiveInterpreter(TypeMoq.It.isAny()))
+            .returns(() => {
+                started.resolve();
+                return lookup.promise;
+            });
+        const register = sinon.stub(commandApis, 'registerCommand').returns({ dispose: () => undefined });
+        await registerStartNativeReplCommand(registry, session, service.object);
+        const oldStart = register.lastCall.args[1];
+        const start = oldStart(Uri.file('/workspace/source.py'));
+        await started.promise;
+
+        registry.push({ dispose: () => finishShutdown.promise });
+        const shutdown = disposeAll(registry);
+        try {
+            lookup.resolve(interpreter);
+            await start;
+            sinon.assert.notCalled(createServer);
+        } finally {
+            finishShutdown.resolve();
+            await shutdown;
+        }
+        registry.length = 0;
+        session = registerNativeRepl(registry);
+        await registerStartNativeReplCommand(registry, session, service.object);
+        await oldStart(Uri.file('/workspace/source.py'));
+        sinon.assert.notCalled(createServer);
+        await register.lastCall.args[1](Uri.file('/workspace/source.py'));
+        sinon.assert.calledOnce(createServer);
+    });
+
+    test('an unusable first open releases the unbound session', async () => {
+        const repl = await getNativeRepl(interpreter, session);
+        const opening = createDeferred<{ notebookEditor: NotebookEditor; documentCreated: boolean } | undefined>();
+        const started = createDeferred();
+        openNotebook.callsFake(() => {
+            started.resolve();
+            return opening.promise;
+        });
+        const send = repl.sendToNativeRepl();
+        await started.promise;
+        await closeNotebook();
+        opening.resolve(undefined);
+        await send;
+
+        sinon.assert.calledOnce(serverDisposals[0]);
+        sinon.assert.calledOnce(controllerDisposals[0]);
+        sinon.assert.calledOnce(listenerDisposals[0]);
+        assert.notStrictEqual(await getNativeRepl(interpreter, session), repl);
+    });
+
+    test('a queued send can recover after a failed first open', async () => {
+        const repl = await getNativeRepl(interpreter, session);
+        const opening = createDeferred<never>();
+        const started = createDeferred();
+        openNotebook.onFirstCall().callsFake(() => {
+            started.resolve();
+            return opening.promise;
+        });
+        const first = assert.rejects(repl.sendToNativeRepl(), /editor closed/);
+        await started.promise;
+        const second = repl.sendToNativeRepl('deliver');
+        opening.reject(new Error('editor closed'));
+        await Promise.all([first, second]);
+
+        sinon.assert.calledOnceWithExactly(executeCell, notebookEditor, 'deliver', sinon.match.func);
+        sinon.assert.notCalled(serverDisposals[0]);
+        await closeNotebook();
+        sinon.assert.calledOnce(serverDisposals[0]);
+    });
+
+    test('Enter associates a restored Native REPL notebook so closing it releases the owner', async () => {
+        mockReplInput();
+        const enter = await registerNativeEnter(() => Promise.resolve(interpreter));
+        await enter(notebook.uri);
+        const owner = await getNativeRepl(interpreter, session);
+        sinon.assert.notCalled(openNotebook);
+        sinon.assert.calledOnce(createServer);
+
+        await closeNotebook();
+        sinon.assert.calledOnce(serverDisposals[0]);
+        sinon.assert.calledOnce(controllerDisposals[0]);
+        assert.notStrictEqual(await getNativeRepl(interpreter, session), owner);
+    });
+
+    test('Enter does not acquire a session or edit another editor after its input loses focus', async () => {
+        const activeEditor = mockReplInput();
+        const insertLine = sinon.stub(replUtils, 'insertNewLineToREPLInput');
+        const lookingUp = createDeferred();
+        const lookup = createDeferred<PythonEnvironment>();
+        const enter = await registerNativeEnter(() => {
+            lookingUp.resolve();
+            return lookup.promise;
+        });
+        const oldEnter = enter(notebook.uri);
+        await lookingUp.promise;
+        activeEditor.returns(TypeMoq.Mock.ofType<TextEditor>().object);
+        lookup.resolve(interpreter);
+        await oldEnter;
+
+        sinon.assert.notCalled(createServer);
+        sinon.assert.notCalled(insertLine);
+    });
+
     test('overlapping sends open one notebook and run each submission after kernel selection', async () => {
-        const repl = await getNativeRepl(interpreter, registry);
+        const repl = await getNativeRepl(interpreter, session);
         const opening = createDeferred<{ notebookEditor: NotebookEditor; documentCreated: boolean }>();
         const openingStarted = createDeferred();
         // If the second send opens another untitled document, return a distinct notebook.
@@ -211,10 +366,13 @@ suite('Native REPL lifetime', () => {
         ]);
         sinon.assert.calledOnce(selectKernel);
         sinon.assert.callOrder(selectKernel, executeCell);
-        assert.deepStrictEqual(executeCell.args, [
-            [notebookEditor, 'first'],
-            [notebookEditor, 'second'],
-        ]);
+        assert.deepStrictEqual(
+            executeCell.args.map((args) => args.slice(0, 2)),
+            [
+                [notebookEditor, 'first'],
+                [notebookEditor, 'second'],
+            ],
+        );
     });
 
     test('closing during a memento save skips the old send and orders the replacement save after the clear', async () => {
@@ -225,14 +383,14 @@ suite('Native REPL lifetime', () => {
             return saving.promise;
         });
         openNotebook.resolves({ notebookEditor, documentCreated: true });
-        const first = await getNativeRepl(interpreter, registry);
+        const first = await getNativeRepl(interpreter, session);
         const oldSend = first.sendToNativeRepl('closed');
         await savingStarted.promise;
         const closing = closeNotebook();
 
         const replacementEditor = createNotebookEditor('replacement');
         openNotebook.resolves({ notebookEditor: replacementEditor, documentCreated: true });
-        const replacement = await getNativeRepl(interpreter, registry);
+        const replacement = await getNativeRepl(interpreter, session);
         const newSend = replacement.sendToNativeRepl('live');
         saving.resolve();
         await Promise.all([oldSend, closing, newSend]);
@@ -242,7 +400,7 @@ suite('Native REPL lifetime', () => {
             [undefined, notebook.uri.toString(), undefined, undefined, replacementEditor.notebook.uri.toString()],
         );
         sinon.assert.calledOnceWithExactly(selectKernel, replacementEditor, 'pythonREPL', 'ms-python.python');
-        sinon.assert.calledOnceWithExactly(executeCell, replacementEditor, 'live');
+        sinon.assert.calledOnceWithExactly(executeCell, replacementEditor, 'live', sinon.match.func);
     });
 
     test('closing during kernel selection skips execution', async () => {
@@ -253,7 +411,7 @@ suite('Native REPL lifetime', () => {
             return selecting.promise;
         });
         openNotebook.resolves({ notebookEditor, documentCreated: true });
-        const repl = await getNativeRepl(interpreter, registry);
+        const repl = await getNativeRepl(interpreter, session);
         const sending = repl.sendToNativeRepl('closed');
         await selectionStarted.promise;
         await closeNotebook();
@@ -264,7 +422,7 @@ suite('Native REPL lifetime', () => {
     });
 
     test('a throwing server disposer still releases the controller and allows a new session', async () => {
-        const first = await getNativeRepl(interpreter, registry);
+        const first = await getNativeRepl(interpreter, session);
         await first.sendToNativeRepl();
         serverDisposals[0].throws('closed transport');
         await closeNotebook();
@@ -272,13 +430,13 @@ suite('Native REPL lifetime', () => {
         sinon.assert.calledOnce(controllerDisposals[0]);
         sinon.assert.calledOnce(listenerDisposals[0]);
         assert.deepStrictEqual(updateMemento.lastCall.args, [NATIVE_REPL_URI_MEMENTO, undefined]);
-        const replacement = await getNativeRepl(interpreter, registry);
+        const replacement = await getNativeRepl(interpreter, session);
         assert.notStrictEqual(first, replacement);
         assert.strictEqual(createServer.callCount, 2);
     });
 
     test('notebook closure and extension shutdown dispose each resource once', async () => {
-        const repl = await getNativeRepl(interpreter, registry);
+        const repl = await getNativeRepl(interpreter, session);
         await repl.sendToNativeRepl();
         await closeNotebook();
         registry.forEach((disposable) => disposable.dispose());
@@ -302,7 +460,7 @@ suite('Native REPL lifetime', () => {
             { uri: Uri.file('/two'), name: 'two', index: 1 },
         ]);
         sinon.stub(windowApis, 'showQuickPick').returns(selection.promise);
-        const pending = getNativeRepl(interpreter, registry);
+        const pending = getNativeRepl(interpreter, session);
         registry.forEach((disposable) => disposable.dispose());
         selection.resolve({ label: 'one', description: '/one' });
         await assert.rejects(pending, /disposed/);
@@ -318,12 +476,13 @@ suite('Native REPL lifetime', () => {
             { uri: Uri.file('/two'), name: 'two', index: 1 },
         ]);
         sinon.stub(windowApis, 'showQuickPick').returns(selection.promise);
-        const pending = getNativeRepl(interpreter, registry);
+        const pending = getNativeRepl(interpreter, session);
         registry.forEach((disposable) => disposable.dispose());
-        await assert.rejects(getNativeRepl(interpreter, registry), /disposed/);
+        await assert.rejects(getNativeRepl(interpreter, session), /disposed/);
         registry.length = 0;
+        session = registerNativeRepl(registry);
         workspaceFolders.returns([]);
-        const replacement = await getNativeRepl(interpreter, registry);
+        const replacement = await getNativeRepl(interpreter, session);
         await replacement.sendToNativeRepl();
         selection.resolve({ label: 'one', description: '/one' });
         await assert.rejects(pending, /disposed/);
@@ -332,7 +491,7 @@ suite('Native REPL lifetime', () => {
         sinon.assert.notCalled(serverDisposals[0]);
         assert.strictEqual(listenerDisposals.length, 1);
         sinon.assert.notCalled(listenerDisposals[0]);
-        assert.strictEqual(await getNativeRepl(interpreter, registry), replacement);
+        assert.strictEqual(await getNativeRepl(interpreter, session), replacement);
     });
 
     test('closing releases the environment subscription and ignores an interpreter lookup result that arrives late', async () => {
@@ -353,7 +512,7 @@ suite('Native REPL lifetime', () => {
         const lookup = createDeferred<PythonEnvironment | undefined>();
         const getInterpreter = sinon.stub(legacyEnvApi, 'getActiveInterpreterLegacy').returns(lookup.promise);
         try {
-            const repl = await getNativeRepl(interpreter, registry);
+            const repl = await getNativeRepl(interpreter, session);
             await repl.sendToNativeRepl();
             changeEvents.fire({ uri: undefined, old: undefined, new: undefined });
             sinon.assert.calledOnce(getInterpreter);
@@ -372,13 +531,74 @@ suite('Native REPL lifetime', () => {
         }
     });
 
+    test('interpreter changes wait for work started during lookup and use the replacement idle event', async () => {
+        const changeEvents = new EventEmitter<DidChangeEnvironmentEventArgs>();
+        useEnvExtension.returns(true);
+        sinon.stub(envApi, 'onDidChangeEnvironmentEnvExt').callsFake(changeEvents.event);
+        const lookup = createDeferred<PythonEnvironment | undefined>();
+        const second = { ...interpreter, path: '/another/python' };
+        const third = { ...interpreter, path: '/third/python' };
+        const resolveInterpreter = sinon.stub(legacyEnvApi, 'getActiveInterpreterLegacy');
+        resolveInterpreter.onFirstCall().returns(lookup.promise);
+        resolveInterpreter.onSecondCall().resolves(second);
+        resolveInterpreter.onThirdCall().resolves(third);
+        const selectedSecond = createDeferred();
+        const selectedThird = createDeferred();
+        selectKernel.onFirstCall().callsFake(() => {
+            selectedSecond.resolve();
+            return Promise.resolve();
+        });
+        selectKernel.onSecondCall().callsFake(() => {
+            selectedThird.resolve();
+            return Promise.resolve();
+        });
+
+        try {
+            const repl = await getNativeRepl(interpreter, session);
+            await repl.sendToNativeRepl();
+            const change = { uri: undefined, old: undefined, new: undefined };
+            changeEvents.fire(change);
+            sinon.assert.calledOnce(resolveInterpreter);
+            const initialServer: pythonServer.PythonServer = createServer.firstCall.returnValue;
+            busyServers.add(initialServer);
+            lookup.resolve(second);
+            await lookup.promise;
+            sinon.assert.notCalled(serverDisposals[0]);
+
+            busyServers.delete(initialServer);
+            serverIdleEvents[0].fire();
+            await selectedSecond.promise;
+            sinon.assert.calledOnce(serverDisposals[0]);
+            sinon.assert.calledOnce(controllerDisposals[0]);
+
+            const secondServer: pythonServer.PythonServer = createServer.secondCall.returnValue;
+            busyServers.add(secondServer);
+            changeEvents.fire(change);
+            sinon.assert.calledTwice(resolveInterpreter);
+            busyServers.delete(secondServer);
+            serverIdleEvents[1].fire();
+            await selectedThird.promise;
+            sinon.assert.calledOnce(serverDisposals[1]);
+            sinon.assert.calledOnce(controllerDisposals[1]);
+            assert.deepStrictEqual(
+                createServer.args.map(([args]) => args),
+                [[interpreter.path], [second.path], [third.path]],
+            );
+            await closeNotebook();
+            [...serverDisposals, ...controllerDisposals].forEach((disposal) => sinon.assert.calledOnce(disposal));
+        } finally {
+            lookup.resolve(undefined);
+            changeEvents.dispose();
+        }
+    });
+
     test('closing another notebook preserves the active session', async () => {
-        const repl = await getNativeRepl(interpreter, registry);
+        const repl = await getNativeRepl(interpreter, session);
         await repl.sendToNativeRepl();
         const other = TypeMoq.Mock.ofType<NotebookDocument>();
         other.setup((d) => d.uri).returns(() => Uri.parse('vscode-interactive:/other'));
         await closeNotebook(other.object);
         assert.strictEqual(serverDisposals[0].callCount, 0);
-        assert.strictEqual(await getNativeRepl(interpreter, registry), repl);
+        assert.strictEqual(await getNativeRepl(interpreter, session), repl);
     });
 });

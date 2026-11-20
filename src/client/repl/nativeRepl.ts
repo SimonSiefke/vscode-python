@@ -14,7 +14,7 @@ import {
 } from 'vscode';
 import * as path from 'path';
 import { PVSC_EXTENSION_ID } from '../common/constants';
-import { showNotebookDocument, showQuickPick } from '../common/vscodeApis/windowApis';
+import { showQuickPick } from '../common/vscodeApis/windowApis';
 import { getWorkspaceFolders, onDidCloseNotebookDocument } from '../common/vscodeApis/workspaceApis';
 import { PythonEnvironment } from '../pythonEnvironments/info';
 import { createPythonServer, PythonServer } from './pythonServer';
@@ -28,19 +28,17 @@ import { getTabNameForUri } from './replUtils';
 import { getWorkspaceStateValue, updateWorkspaceStateValue } from '../common/persistentState';
 import { onDidChangeEnvironmentEnvExt, useEnvExtension } from '../envExt/api.internal';
 import { getActiveInterpreterLegacy } from '../envExt/api.legacy';
-import { dispose } from '../common/utils/resourceLifecycle';
+import { DisposableStore } from '../common/utils/resourceLifecycle';
 
 export const NATIVE_REPL_URI_MEMENTO = 'nativeReplUri';
 const SESSION_DISPOSED = 'Native REPL session is disposed';
 
-interface NativeReplSession {
+export interface NativeReplSession {
     current?: NativeRepl;
     pending?: Promise<NativeRepl>;
-    subscription: Disposable;
     disposed: boolean;
 }
 
-const sessions = new WeakMap<Disposable[], NativeReplSession>();
 let pendingMementoUpdate = Promise.resolve();
 
 function updateNotebookMemento(uri: string | undefined): Promise<void> {
@@ -58,7 +56,9 @@ export class NativeRepl implements Disposable {
 
     private interpreter!: PythonEnvironment;
 
-    private disposables: Disposable[] = [];
+    private readonly disposables = new DisposableStore();
+
+    private readonly kernelDisposables = this.disposables.add(new DisposableStore());
 
     private replController!: NotebookController;
 
@@ -66,13 +66,13 @@ export class NativeRepl implements Disposable {
 
     public newReplSession: boolean | undefined = true;
 
-    private envChangeListenerRegistered = false;
-
     private pendingInterpreterChange?: { resource?: Uri };
 
     private disposed = false;
 
     private pendingSend = Promise.resolve();
+
+    private pendingSends = 0;
 
     // TODO: In the future, could also have attribute of URI for file specific REPL.
     private constructor(private readonly owner?: NativeReplSession) {}
@@ -81,15 +81,12 @@ export class NativeRepl implements Disposable {
     public static async create(interpreter: PythonEnvironment, owner?: NativeReplSession): Promise<NativeRepl> {
         const repl = new NativeRepl(owner);
         try {
-            repl.interpreter = interpreter;
             await repl.setReplDirectory();
             if (owner?.disposed) {
                 throw new Error(SESSION_DISPOSED);
             }
             repl.watchNotebookClosed();
-            repl.pythonServer = createPythonServer([interpreter.path as string], repl.cwd);
-            repl.disposables.push(repl.pythonServer);
-            repl.setReplController();
+            repl.startKernel(interpreter);
             repl.registerInterpreterChangeHandler();
             return repl;
         } catch (error) {
@@ -107,7 +104,7 @@ export class NativeRepl implements Disposable {
         this.newReplSession = true;
         this.pendingInterpreterChange = undefined;
         try {
-            dispose(new Set(this.disposables.splice(0)));
+            this.disposables.dispose();
         } finally {
             if (this.owner?.current === this) {
                 this.owner.current = undefined;
@@ -120,7 +117,7 @@ export class NativeRepl implements Disposable {
      * This is for the purposes of correctly updating the notebookEditor and notebookDocument on close.
      */
     private watchNotebookClosed(): void {
-        this.disposables.push(
+        this.disposables.add(
             onDidCloseNotebookDocument(async (nb) => {
                 if (this.notebookDocument && nb.uri.toString() === this.notebookDocument.uri.toString()) {
                     this.dispose();
@@ -128,6 +125,24 @@ export class NativeRepl implements Disposable {
                 }
             }),
         );
+    }
+
+    public useNotebook(notebook: NotebookDocument): boolean {
+        if (this.disposed || (this.notebookDocument && this.notebookDocument !== notebook)) {
+            return false;
+        }
+        if (notebook.isClosed) {
+            this.disposeIfUnused();
+            return false;
+        }
+        this.notebookDocument = notebook;
+        return true;
+    }
+
+    private disposeIfUnused(): void {
+        if (!this.notebookDocument && this.pendingSends === 0) {
+            this.dispose();
+        }
     }
 
     /**
@@ -163,72 +178,65 @@ export class NativeRepl implements Disposable {
         }
     }
 
-    /**
-     * Function that check if NotebookController for REPL exists, and returns it in Singleton manner.
-     */
-    public setReplController(force: boolean = false): NotebookController {
-        if (!this.replController || force) {
-            this.replController = createReplController(this.interpreter!.path, this.disposables, this.cwd);
-            this.replController.variableProvider = new VariablesProvider(
-                new VariableRequester(this.pythonServer),
-                () => this.notebookDocument,
-                this.pythonServer.onCodeExecuted,
-            );
-        }
-        return this.replController;
+    private startKernel(interpreter: PythonEnvironment): NotebookController {
+        this.interpreter = interpreter;
+        this.pythonServer = this.kernelDisposables.add(createPythonServer([interpreter.path], this.cwd));
+        const controller = this.kernelDisposables.add(createReplController(this.pythonServer));
+        this.replController = controller;
+        controller.variableProvider = new VariablesProvider(
+            new VariableRequester(this.pythonServer),
+            () => this.notebookDocument,
+            this.pythonServer.onCodeExecuted,
+        );
+        this.kernelDisposables.add(this.pythonServer.onDidBecomeIdle(() => this.applyPendingInterpreterChange()));
+        return controller;
     }
 
     private registerInterpreterChangeHandler(): void {
-        if (!useEnvExtension() || this.envChangeListenerRegistered) {
+        if (!useEnvExtension()) {
             return;
         }
-        this.envChangeListenerRegistered = true;
-        this.disposables.push(
+        this.disposables.add(
             onDidChangeEnvironmentEnvExt((event) => {
-                this.updateInterpreterForChange(event.uri).catch(() => undefined);
-            }),
-        );
-        this.disposables.push(
-            this.pythonServer.onCodeExecuted(() => {
-                if (this.pendingInterpreterChange) {
-                    const { resource } = this.pendingInterpreterChange;
-                    this.pendingInterpreterChange = undefined;
-                    this.updateInterpreterForChange(resource).catch(() => undefined);
+                if (this.shouldApplyInterpreterChange(event.uri)) {
+                    this.pendingInterpreterChange = { resource: event.uri };
+                    this.applyPendingInterpreterChange();
                 }
             }),
         );
     }
 
-    private async updateInterpreterForChange(resource?: Uri): Promise<void> {
-        if (this.disposed) {
-            return;
+    private applyPendingInterpreterChange(): void {
+        const change = this.pendingInterpreterChange;
+        if (change && !this.disposed && !this.pythonServer.isExecuting) {
+            this.updateInterpreter(change).catch(() => undefined);
         }
-        if (this.pythonServer?.isExecuting) {
-            this.pendingInterpreterChange = { resource };
-            return;
-        }
-        if (!this.shouldApplyInterpreterChange(resource)) {
-            return;
-        }
-        const scope = resource ?? (this.cwd ? Uri.file(this.cwd) : undefined);
+    }
+
+    private async updateInterpreter(change: { resource?: Uri }): Promise<void> {
+        const scope = change.resource ?? (this.cwd ? Uri.file(this.cwd) : undefined);
         const interpreter = await getActiveInterpreterLegacy(scope);
-        if (this.disposed || !interpreter || interpreter.path === this.interpreter?.path) {
+        if (this.disposed || this.pendingInterpreterChange !== change || this.pythonServer.isExecuting) {
+            return;
+        }
+        this.pendingInterpreterChange = undefined;
+        if (!interpreter || interpreter.path === this.interpreter.path) {
             return;
         }
 
-        this.interpreter = interpreter;
-        this.pythonServer.dispose();
-        this.pythonServer = createPythonServer([interpreter.path as string], this.cwd);
-        this.disposables.push(this.pythonServer);
-        if (this.replController) {
-            this.replController.dispose();
+        this.kernelDisposables.clear();
+        let controller: NotebookController;
+        try {
+            controller = this.startKernel(interpreter);
+        } catch (error) {
+            this.dispose();
+            throw error;
         }
-        const controller = this.setReplController(true);
 
         if (this.notebookDocument) {
-            const notebookEditor = await showNotebookDocument(this.notebookDocument, { preserveFocus: true });
-            if (!this.disposed && this.replController === controller) {
-                await selectNotebookKernel(notebookEditor, controller.id, PVSC_EXTENSION_ID);
+            const result = await openInteractiveREPL(this.notebookDocument);
+            if (result && !this.disposed && this.replController === controller) {
+                await selectNotebookKernel(result.notebookEditor, controller.id, PVSC_EXTENSION_ID);
             }
         }
     }
@@ -249,26 +257,32 @@ export class NativeRepl implements Disposable {
         if (this.disposed) {
             return false;
         }
-        let completeCode = false;
-        let userTextInput;
-        if (activeEditor) {
-            const { document } = activeEditor;
-            userTextInput = document.getText();
+        const input = activeEditor?.document.getText();
+        if (!input) {
+            return false;
         }
 
-        // Check if userTextInput is a complete Python command
-        if (userTextInput) {
-            completeCode = await this.pythonServer.checkValidCommand(userTextInput);
+        try {
+            return await this.pythonServer.checkValidCommand(input);
+        } catch (error) {
+            if (this.disposed) {
+                return false;
+            }
+            throw error;
         }
-
-        return completeCode;
     }
 
     /**
      * Function that opens interactive repl, selects kernel, and send/execute code to the native repl.
      */
     public sendToNativeRepl(code?: string, preserveFocus: boolean = true): Promise<void> {
-        const send = this.pendingSend.then(() => this.sendToNotebook(code, preserveFocus));
+        this.pendingSends += 1;
+        const send = this.pendingSend
+            .then(() => this.sendToNotebook(code, preserveFocus))
+            .finally(() => {
+                this.pendingSends -= 1;
+                this.disposeIfUnused();
+            });
         this.pendingSend = send.catch(() => undefined);
         return send;
     }
@@ -296,51 +310,49 @@ export class NativeRepl implements Disposable {
             return;
         }
 
-        const result = await openInteractiveREPL(this.notebookDocument ?? wsMementoUri, preserveFocus);
+        let result: Awaited<ReturnType<typeof openInteractiveREPL>>;
+        try {
+            result = await openInteractiveREPL(this.notebookDocument ?? wsMementoUri, preserveFocus);
+        } finally {
+            if (!result && wsMementoUri && !this.disposed) {
+                await updateNotebookMemento(undefined);
+            }
+        }
         if (!result || this.disposed) {
             return;
         }
 
         const { notebookEditor, documentCreated } = result;
-        if (notebookEditor.notebook.isClosed) {
-            this.dispose();
-            await updateNotebookMemento(undefined);
+        if (!this.useNotebook(notebookEditor.notebook)) {
+            if (notebookEditor.notebook.isClosed) {
+                await updateNotebookMemento(undefined);
+            }
             return;
         }
-        this.notebookDocument = notebookEditor.notebook;
-        await updateNotebookMemento(this.notebookDocument.uri.toString());
+        await updateNotebookMemento(notebookEditor.notebook.uri.toString());
 
         if (!this.disposed && documentCreated) {
             await selectNotebookKernel(notebookEditor, this.replController.id, PVSC_EXTENSION_ID);
         }
         if (code && !this.disposed) {
-            await executeNotebookCell(notebookEditor, code);
+            await executeNotebookCell(notebookEditor, code, () => !this.disposed);
         }
     }
 }
 
-/**
- * Get Singleton Native REPL Instance
- * @param interpreter
- * @returns Native REPL instance
- */
-export async function getNativeRepl(interpreter: PythonEnvironment, disposables: Disposable[]): Promise<NativeRepl> {
-    let session = sessions.get(disposables);
-    // Reactivation clears and then reuses the extension's subscriptions array.
-    if (!session || (session.disposed && !disposables.includes(session.subscription))) {
-        const owner: NativeReplSession = {
-            disposed: false,
-            subscription: {
-                dispose: () => {
-                    owner.disposed = true;
-                    owner.current?.dispose();
-                },
-            },
-        };
-        sessions.set(disposables, owner);
-        disposables.push(owner.subscription);
-        session = owner;
-    }
+// Register before any command can suspend on interpreter discovery.
+export function registerNativeRepl(disposables: Disposable[]): NativeReplSession {
+    const session: NativeReplSession = { disposed: false };
+    disposables.push({
+        dispose: () => {
+            session.disposed = true;
+            session.current?.dispose();
+        },
+    });
+    return session;
+}
+
+export async function getNativeRepl(interpreter: PythonEnvironment, session: NativeReplSession): Promise<NativeRepl> {
     if (session.disposed) {
         throw new Error(SESSION_DISPOSED);
     }

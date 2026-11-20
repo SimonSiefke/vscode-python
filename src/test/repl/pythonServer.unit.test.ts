@@ -7,15 +7,19 @@ import { EventEmitter } from 'events';
 import { PassThrough } from 'stream';
 import * as sinon from 'sinon';
 import * as rpc from 'vscode-jsonrpc/node';
+import * as windowApis from '../../client/common/vscodeApis/windowApis';
 import { createDeferred } from '../../client/common/utils/async';
 import { createPythonServer, ExecutionResult, PythonServer } from '../../client/repl/pythonServer';
 
 suite('Native REPL Python server lifetime', () => {
+    const createRealConnection = rpc.createMessageConnection;
     let clock: sinon.SinonFakeTimers;
     let children: ReturnType<typeof createChild>[];
     let sendNotification: sinon.SinonStub;
     let sendRequest: sinon.SinonStub;
     let disposeConnection: sinon.SinonStub;
+    let createConnection: sinon.SinonStub;
+    let onRequest: sinon.SinonStub;
     let servers: PythonServer[];
 
     function createChild() {
@@ -45,10 +49,11 @@ suite('Native REPL Python server lifetime', () => {
         sendNotification = sinon.stub().resolves();
         sendRequest = sinon.stub();
         disposeConnection = sinon.stub();
-        sinon.stub(rpc, 'createMessageConnection').returns(({
+        onRequest = sinon.stub().returns({ dispose: () => undefined });
+        createConnection = sinon.stub(rpc, 'createMessageConnection').returns(({
             listen: () => undefined,
             onNotification: () => ({ dispose: () => undefined }),
-            onRequest: () => ({ dispose: () => undefined }),
+            onRequest,
             sendNotification,
             sendRequest,
             dispose: disposeConnection,
@@ -109,5 +114,62 @@ suite('Native REPL Python server lifetime', () => {
         clock.runAll();
         sinon.assert.calledOnceWithExactly(children[0].kill, 'SIGKILL');
         assert.notStrictEqual(startServer(), server);
+    });
+
+    test('a truncated JSON-RPC reply leaves no partial-message timer after shutdown', () => {
+        createConnection.callsFake(createRealConnection);
+        const server = startServer();
+        children[0].stdout.write('Content-Length: 64\r\n\r\n{"jsonrpc":');
+        server.dispose();
+        children[0].emit('exit', null, 'SIGKILL');
+
+        assert.strictEqual(clock.countTimers(), 0);
+    });
+
+    test('shutdown cancels only prompts belonging to the closed server', async () => {
+        const oldPrompt = createDeferred<string | undefined>();
+        const newPrompt = createDeferred<string | undefined>();
+        const showInput = sinon.stub(windowApis, 'showInputBox');
+        showInput.onFirstCall().callsFake((_options, token) => {
+            token?.onCancellationRequested(() => oldPrompt.resolve(undefined));
+            return oldPrompt.promise;
+        });
+        showInput.onSecondCall().callsFake((_options, token) => {
+            token?.onCancellationRequested(() => newPrompt.resolve(undefined));
+            return newPrompt.promise;
+        });
+
+        const server = startServer();
+        const oldInput = onRequest.firstCall.args[1]({ prompt: 'old' });
+        server.dispose();
+        const replacement = startServer();
+        const newInput = onRequest.secondCall.args[1]({ prompt: 'new' });
+        assert.strictEqual(showInput.firstCall.args[1]?.isCancellationRequested, true);
+        assert.notStrictEqual(showInput.secondCall.args[1]?.isCancellationRequested, true);
+        assert.deepStrictEqual(await oldInput, { userInput: undefined });
+        newPrompt.resolve('still working');
+        assert.deepStrictEqual(await newInput, { userInput: 'still working' });
+        replacement.dispose();
+    });
+
+    test('the idle event fires after unsuccessful execution and the final pending request', async () => {
+        const execution = createDeferred<ExecutionResult>();
+        const validation = createDeferred<ExecutionResult>();
+        sendRequest.withArgs('execute').returns(execution.promise);
+        sendRequest.withArgs('check_valid_command').returns(validation.promise);
+        const server = startServer();
+        const idle = sinon.spy();
+        server.onDidBecomeIdle(idle);
+        const running = server.execute('invalid()');
+        const checking = server.checkValidCommand('incomplete(');
+
+        execution.resolve({ status: false, output: '' });
+        await running;
+        assert.strictEqual(server.isExecuting, true);
+        sinon.assert.notCalled(idle);
+        validation.resolve({ status: true, output: 'False' });
+        assert.strictEqual(await checking, false);
+        assert.strictEqual(server.isExecuting, false);
+        sinon.assert.calledOnce(idle);
     });
 });
