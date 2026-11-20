@@ -25,30 +25,32 @@ import { dispose } from '../utils/resourceLifecycle';
 import { useEnvExtension } from '../../envExt/api.internal';
 import { ensureTerminalLegacy } from '../../envExt/api.legacy';
 
-const terminalServiceOwners = new WeakMap<Disposable[], Set<TerminalService>>();
-
 interface StartedTerminal {
     terminal: Terminal;
 }
 
-function getTerminalServices(registry: Disposable[]): Set<TerminalService> {
-    let services = terminalServiceOwners.get(registry);
-    if (!services) {
-        const owned = new Set<TerminalService>();
-        services = owned;
-        terminalServiceOwners.set(registry, owned);
-        registry.push({
-            dispose: () => {
-                if (terminalServiceOwners.get(registry) === owned) {
-                    terminalServiceOwners.delete(registry);
-                }
-                const active = Array.from(owned);
-                owned.clear();
-                dispose(active);
-            },
-        });
+class TerminalServiceOwner implements Disposable {
+    public readonly services = new Set<TerminalService>();
+    private disposed = false;
+
+    public static getOrCreate(registry: IDisposableRegistry): TerminalServiceOwner {
+        const existing = registry.find(
+            (entry): entry is TerminalServiceOwner => entry instanceof TerminalServiceOwner && !entry.disposed,
+        );
+        if (existing) {
+            return existing;
+        }
+        const owner = new TerminalServiceOwner();
+        registry.push(owner);
+        return owner;
     }
-    return services;
+
+    public dispose(): void {
+        this.disposed = true;
+        const active = Array.from(this.services);
+        this.services.clear();
+        dispose(active);
+    }
 }
 
 @injectable()
@@ -79,14 +81,14 @@ export class TerminalService implements ITerminalService, Disposable {
         @inject(IServiceContainer) private serviceContainer: IServiceContainer,
         private readonly options?: TerminalCreationOptions & { disposeOnClose?: boolean },
     ) {
-        const disposableRegistry = this.serviceContainer.get<Disposable[]>(IDisposableRegistry);
+        const disposableRegistry = this.serviceContainer.get<IDisposableRegistry>(IDisposableRegistry);
         this.terminalHelper = this.serviceContainer.get<ITerminalHelper>(ITerminalHelper);
         this.terminalManager = this.serviceContainer.get<ITerminalManager>(ITerminalManager);
         this.terminalAutoActivator = this.serviceContainer.get<ITerminalAutoActivation>(ITerminalAutoActivation);
         this.applicationShell = this.serviceContainer.get<IApplicationShell>(IApplicationShell);
         this.terminalActivator = this.serviceContainer.get<ITerminalActivator>(ITerminalActivator);
         this.terminalCloseListener = this.terminalManager.onDidCloseTerminal(this.terminalCloseHandler, this);
-        this.ownedServices = getTerminalServices(disposableRegistry);
+        this.ownedServices = TerminalServiceOwner.getOrCreate(disposableRegistry).services;
         this.ownedServices.add(this);
     }
     public dispose() {
