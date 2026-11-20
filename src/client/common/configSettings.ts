@@ -11,6 +11,7 @@ import {
     EventEmitter,
     Uri,
     WorkspaceConfiguration,
+    WorkspaceFoldersChangeEvent,
 } from 'vscode';
 import { LanguageServerType } from '../activation/types';
 import './extensions';
@@ -405,17 +406,17 @@ export class PythonSettings implements IPythonSettings {
         return getPythonExecutable(pythonPath);
     }
 
-    protected onWorkspaceFoldersChanged(): void {
-        // If an activated workspace folder was removed, delete its key
-        const workspaceKeys = this.workspace.workspaceFolders!.map((workspaceFolder) => workspaceFolder.uri.fsPath);
-        const activatedWkspcKeys = Array.from(PythonSettings.pythonSettings.keys());
-        const activatedWkspcFoldersRemoved = activatedWkspcKeys.filter((item) => workspaceKeys.indexOf(item) < 0);
-        if (activatedWkspcFoldersRemoved.length > 0) {
-            for (const folder of activatedWkspcFoldersRemoved) {
-                const settings = PythonSettings.pythonSettings.get(folder);
-                PythonSettings.pythonSettings.delete(folder);
-                settings?.dispose();
-            }
+    protected onWorkspaceFoldersChanged(event: WorkspaceFoldersChangeEvent): void {
+        // The live workspace folders can reflect another listener's unconfirmed update.
+        const workspaceUri = this.workspaceRoot?.toString();
+        const obsolete =
+            workspaceUri === undefined
+                ? event.added.length > 0
+                : event.removed.some(({ uri }) => uri.toString() === workspaceUri);
+        const cacheKey = this.workspaceRoot?.fsPath ?? '';
+        if (obsolete && PythonSettings.pythonSettings.get(cacheKey) === this) {
+            PythonSettings.pythonSettings.delete(cacheKey);
+            this.dispose();
         }
     }
 
