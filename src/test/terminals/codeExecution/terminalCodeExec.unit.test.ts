@@ -53,11 +53,10 @@ suite('Terminal - REPL lifetime', () => {
                 closeListeners.add(listener);
                 return new Disposable(() => closeListeners.delete(listener));
             });
-        service
-            .setup((s) => s.sendCommand(TypeMoq.It.isAny(), TypeMoq.It.isAny()))
-            .returns(async () => {
-                dataWritten.fire({ terminal: terminal.object, data: '>>> ' });
-            });
+        const sendCommand = sinon.spy(async () => {
+            dataWritten.fire({ terminal: terminal.object, data: '>>> ' });
+        });
+        service.setup((s) => s.sendCommand(TypeMoq.It.isAny(), TypeMoq.It.isAny())).returns(sendCommand);
         const executor = new (class extends TerminalCodeExecutionProvider {
             public async getExecutableInfo() {
                 return buildPythonExecInfo(PYTHON_PATH);
@@ -72,21 +71,28 @@ suite('Terminal - REPL lifetime', () => {
             TypeMoq.Mock.ofType<ICommandManager>().object,
             applicationShell.object,
         );
-        return { executor, closeListeners, disposables, dataWritten };
+        return { executor, sendCommand, closeListeners, disposables, dataWritten };
     }
 
-    test('Closing a REPL releases its close listener without growing the session registry', async () => {
-        const { executor, closeListeners, disposables, dataWritten } = createExecutor();
+    test('Reusing and closing a REPL keeps its close listener until close', async () => {
+        const { executor, sendCommand, closeListeners, disposables, dataWritten } = createExecutor();
         const clock = sinon.useFakeTimers();
         try {
             await executor.initializeRepl(undefined);
             const registeredDisposables = disposables.length;
             expect(closeListeners.size).to.equal(1);
-            [...closeListeners].forEach((listener) => listener());
+            const [closeListener] = closeListeners;
+
+            await executor.initializeRepl(undefined);
+            expect([...closeListeners]).to.deep.equal([closeListener]);
+            expect(sendCommand.callCount).to.equal(1);
+
+            closeListener();
             expect(closeListeners.size).to.equal(0);
 
             await executor.initializeRepl(undefined);
             expect(closeListeners.size).to.equal(1);
+            expect(sendCommand.callCount).to.equal(2);
             expect(disposables.length).to.equal(registeredDisposables);
             [...closeListeners].forEach((listener) => listener());
             expect(closeListeners.size).to.equal(0);
