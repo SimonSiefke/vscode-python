@@ -285,8 +285,14 @@ export class TerminalService implements ITerminalService, Disposable {
         try {
             return await pending;
         } catch (error) {
-            if (this.options?.disposeOnClose && !this.terminal) {
-                this.dispose();
+            if (this.pendingTerminal === pending) {
+                if (this.options?.disposeOnClose) {
+                    dispose([this]);
+                } else if (this.terminal) {
+                    const terminal = this.terminal;
+                    dispose([terminal]);
+                    this.terminalCloseHandler(terminal);
+                }
             }
             throw error;
         } finally {

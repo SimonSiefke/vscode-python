@@ -5,8 +5,13 @@ import * as assert from 'assert';
 import * as sinon from 'sinon';
 import * as TypeMoq from 'typemoq';
 import { Disposable, Event, EventEmitter, Terminal } from 'vscode';
-import { IApplicationShell, ITerminalManager } from '../../../client/common/application/types';
-import { IFileSystem } from '../../../client/common/platform/types';
+import {
+    IApplicationShell,
+    ICommandManager,
+    ITerminalManager,
+    IWorkspaceService,
+} from '../../../client/common/application/types';
+import { IFileSystem, IPlatformService } from '../../../client/common/platform/types';
 import { TerminalServiceFactory } from '../../../client/common/terminal/factory';
 import { ITerminalActivator, ITerminalHelper, TerminalShellType } from '../../../client/common/terminal/types';
 import { IConfigurationService, IDisposableRegistry, IPythonSettings } from '../../../client/common/types';
@@ -17,7 +22,9 @@ import * as envApi from '../../../client/envExt/api.internal';
 import * as envLegacy from '../../../client/envExt/api.legacy';
 import { IInterpreterService } from '../../../client/interpreter/contracts';
 import { IServiceContainer } from '../../../client/ioc/types';
+import { buildPythonExecInfo } from '../../../client/pythonEnvironments/exec';
 import { EnvironmentType, PythonEnvironment } from '../../../client/pythonEnvironments/info';
+import { TerminalCodeExecutionProvider } from '../../../client/terminals/codeExecution/terminalCodeExecution';
 import { ITerminalAutoActivation } from '../../../client/terminals/types';
 
 suite('Terminal service lifetime', () => {
@@ -193,7 +200,15 @@ suite('Terminal service lifetime', () => {
     });
 
     test('shutdown disposes remaining services after one terminal disposal throws', async () => {
-        await factory.createTerminalService().show();
+        const disposeReplState = sinon.spy();
+        const disposeTerminalData = sinon.spy();
+        subscribeToReplState.returns({ dispose: disposeReplState });
+        subscribeToTerminalData.returns({ dispose: disposeTerminalData });
+        const first = factory.createTerminalService();
+        await first.show();
+        await first.executeCommand('print(1)', true);
+        sinon.assert.calledOnce(subscribeToReplState);
+        sinon.assert.calledOnce(subscribeToTerminalData);
         await factory.createTerminalService().show();
         terminalDisposals[0].throws(new Error('terminal disposal failed'));
 
@@ -207,6 +222,8 @@ suite('Terminal service lifetime', () => {
             listenerDisposals.map((dispose) => dispose.callCount),
             [1, 1],
         );
+        sinon.assert.calledOnce(disposeReplState);
+        sinon.assert.calledOnce(disposeTerminalData);
     });
 
     test('a cached service can open another terminal after its terminal closes', async () => {
@@ -282,6 +299,100 @@ suite('Terminal service lifetime', () => {
         sinon.assert.calledOnce(activate);
         sinon.assert.calledOnceWithExactly(terminalWrites[0], 'print(1)');
         sinon.assert.callOrder(activationComplete, terminalWrites[0]);
+    });
+
+    test('a native activation rejection releases the uncached terminal and its ownership', async () => {
+        const failure = new Error('environment activation failed');
+        activate.onFirstCall().rejects(failure);
+        const service = factory.createTerminalService();
+        const serviceDispose = sinon.spy(service, 'dispose');
+
+        await assert.rejects(service.show(), (error) => error === failure);
+
+        assert.strictEqual(terminals.length, 1);
+        sinon.assert.calledOnce(terminalDisposals[0]);
+        sinon.assert.calledOnce(listenerDisposals[0]);
+        await disposeAll(registry);
+        sinon.assert.calledOnce(serviceDispose);
+    });
+
+    test('a cached service retries native activation after disposing the failed terminal', async () => {
+        const failure = new Error('environment activation failed');
+        activate.onFirstCall().rejects(failure);
+        const service = factory.getTerminalService({});
+        const close = sinon.spy();
+        service.onDidCloseTerminal(close);
+
+        await assert.rejects(service.show(), (error) => error === failure);
+        await service.sendText('print(1)');
+
+        assert.strictEqual(terminals.length, 2);
+        assert.deepStrictEqual(activate.args, [[terminals[0]], [terminals[1]]]);
+        sinon.assert.calledOnce(terminalDisposals[0]);
+        sinon.assert.notCalled(listenerDisposals[0]);
+        sinon.assert.calledOnce(close);
+        sinon.assert.notCalled(terminalWrites[0]);
+        sinon.assert.calledOnceWithExactly(terminalWrites[1], 'print(1)');
+    });
+
+    test('a retired REPL startup rejects promptly and leaves its replacement ready', async () => {
+        const firstActivation = createDeferred<boolean>();
+        const replacementActivation = createDeferred<boolean>();
+        activate.onFirstCall().returns(firstActivation.promise);
+        activate.onSecondCall().returns(replacementActivation.promise);
+        const promptDisposals: sinon.SinonSpy[] = [];
+        const onData = () => {
+            const dispose = sinon.spy();
+            promptDisposals.push(dispose);
+            return { dispose };
+        };
+        const shell = TypeMoq.Mock.ofType<IApplicationShell>();
+        shell.setup((s) => s.onDidWriteTerminalData).returns(() => onData);
+        const provider = new TerminalCodeExecutionProvider(
+            factory,
+            TypeMoq.Mock.ofType<IConfigurationService>().object,
+            TypeMoq.Mock.ofType<IWorkspaceService>().object,
+            registry,
+            TypeMoq.Mock.ofType<IPlatformService>().object,
+            TypeMoq.Mock.ofType<IInterpreterService>().object,
+            TypeMoq.Mock.ofType<ICommandManager>().object,
+            shell.object,
+        );
+        sinon.stub(provider, 'getExecutableInfo').resolves(buildPythonExecInfo('python'));
+        const clock = sinon.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+
+        try {
+            const opening = assert.rejects(provider.initializeRepl(undefined), /closed/);
+            await clock.tickAsync(100);
+            sinon.assert.calledOnce(activate);
+
+            closed.fire(terminals[0]);
+            const replacement = provider.initializeRepl(undefined);
+            await clock.tickAsync(100);
+            assert.strictEqual(activate.callCount, 2);
+            const replacementWrites = sinon.spy();
+            Object.assign(terminals[1], { shellIntegration: { executeCommand: replacementWrites } });
+            replacementActivation.resolve(false);
+            await clock.tickAsync(0);
+            firstActivation.resolve(false);
+            await clock.tickAsync(0);
+
+            sinon.assert.calledOnce(promptDisposals[0]);
+            sinon.assert.notCalled(promptDisposals[1]);
+            await opening;
+            await clock.tickAsync(3000);
+            await replacement;
+
+            const reuse = provider.initializeRepl(undefined);
+            await clock.tickAsync(3000);
+            await reuse;
+            assert.strictEqual(promptDisposals.length, 2);
+            sinon.assert.calledOnce(promptDisposals[1]);
+            sinon.assert.calledOnce(replacementWrites);
+            sinon.assert.notCalled(terminalWrites[0]);
+        } finally {
+            clock.restore();
+        }
     });
 
     test('a late REPL command cannot attach listeners to a disposed service', async () => {
