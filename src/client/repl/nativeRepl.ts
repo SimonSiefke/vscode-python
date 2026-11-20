@@ -4,6 +4,7 @@
 // Native Repl class that holds instance of pythonServer and replController
 
 import {
+    CancellationTokenSource,
     Disposable,
     NotebookController,
     NotebookDocument,
@@ -37,6 +38,8 @@ export interface NativeReplSession {
     current?: NativeRepl;
     pending?: Promise<NativeRepl>;
     disposed: boolean;
+    activeCommands: number;
+    cancellation: CancellationTokenSource;
 }
 
 let pendingMementoUpdate = Promise.resolve();
@@ -73,6 +76,8 @@ export class NativeRepl implements Disposable {
     private pendingSend = Promise.resolve();
 
     private pendingSends = 0;
+
+    private releaseWhenUnused = false;
 
     // TODO: In the future, could also have attribute of URI for file specific REPL.
     private constructor(private readonly owner?: NativeReplSession) {}
@@ -132,6 +137,7 @@ export class NativeRepl implements Disposable {
             return false;
         }
         if (notebook.isClosed) {
+            this.releaseWhenUnused = true;
             this.disposeIfUnused();
             return false;
         }
@@ -139,8 +145,13 @@ export class NativeRepl implements Disposable {
         return true;
     }
 
-    private disposeIfUnused(): void {
-        if (!this.notebookDocument && this.pendingSends === 0) {
+    public disposeIfUnused(): void {
+        if (
+            this.releaseWhenUnused &&
+            !this.notebookDocument &&
+            this.pendingSends === 0 &&
+            !this.owner?.activeCommands
+        ) {
             this.dispose();
         }
     }
@@ -168,11 +179,15 @@ export class NativeRepl implements Disposable {
                 this.cwd = workspacesQuickPickItems[0].description;
             } else {
                 // Show choices of workspaces for user to choose from.
-                const selection = (await showQuickPick(workspacesQuickPickItems, {
-                    placeHolder: 'Select current working directory for new REPL',
-                    matchOnDescription: true,
-                    ignoreFocusOut: true,
-                })) as QuickPickItem;
+                const selection = await showQuickPick(
+                    workspacesQuickPickItems,
+                    {
+                        placeHolder: 'Select current working directory for new REPL',
+                        matchOnDescription: true,
+                        ignoreFocusOut: true,
+                    },
+                    this.owner?.cancellation.token,
+                );
                 this.cwd = selection?.description;
             }
         }
@@ -234,7 +249,11 @@ export class NativeRepl implements Disposable {
         }
 
         if (this.notebookDocument) {
-            const result = await openInteractiveREPL(this.notebookDocument);
+            const result = await openInteractiveREPL(
+                this.notebookDocument,
+                true,
+                () => !this.disposed && this.replController === controller,
+            );
             if (result && !this.disposed && this.replController === controller) {
                 await selectNotebookKernel(result.notebookEditor, controller.id, PVSC_EXTENSION_ID);
             }
@@ -281,6 +300,7 @@ export class NativeRepl implements Disposable {
             .then(() => this.sendToNotebook(code, preserveFocus))
             .finally(() => {
                 this.pendingSends -= 1;
+                this.releaseWhenUnused = true;
                 this.disposeIfUnused();
             });
         this.pendingSend = send.catch(() => undefined);
@@ -312,7 +332,11 @@ export class NativeRepl implements Disposable {
 
         let result: Awaited<ReturnType<typeof openInteractiveREPL>>;
         try {
-            result = await openInteractiveREPL(this.notebookDocument ?? wsMementoUri, preserveFocus);
+            result = await openInteractiveREPL(
+                this.notebookDocument ?? wsMementoUri,
+                preserveFocus,
+                () => !this.disposed,
+            );
         } finally {
             if (!result && wsMementoUri && !this.disposed) {
                 await updateNotebookMemento(undefined);
@@ -342,14 +366,44 @@ export class NativeRepl implements Disposable {
 
 // Register before any command can suspend on interpreter discovery.
 export function registerNativeRepl(disposables: Disposable[]): NativeReplSession {
-    const session: NativeReplSession = { disposed: false };
+    const session: NativeReplSession = {
+        disposed: false,
+        activeCommands: 0,
+        cancellation: new CancellationTokenSource(),
+    };
     disposables.push({
         dispose: () => {
             session.disposed = true;
+            session.cancellation.cancel();
+            session.cancellation.dispose();
             session.current?.dispose();
         },
     });
     return session;
+}
+
+export async function withNativeRepl(
+    interpreter: PythonEnvironment,
+    session: NativeReplSession,
+    useRepl: (repl: NativeRepl) => Promise<void>,
+): Promise<void> {
+    if (session.disposed) {
+        return;
+    }
+    session.activeCommands += 1;
+    try {
+        const repl = await getNativeRepl(interpreter, session);
+        if (!session.disposed) {
+            await useRepl(repl);
+        }
+    } catch (error) {
+        if (!session.disposed) {
+            throw error;
+        }
+    } finally {
+        session.activeCommands -= 1;
+        session.current?.disposeIfUnused();
+    }
 }
 
 export async function getNativeRepl(interpreter: PythonEnvironment, session: NativeReplSession): Promise<NativeRepl> {

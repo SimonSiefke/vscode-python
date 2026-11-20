@@ -1,10 +1,11 @@
-import { commands, Uri, window } from 'vscode';
+import { commands, Uri } from 'vscode';
 import { Disposable } from 'vscode-jsonrpc';
 import { ICommandManager } from '../common/application/types';
 import { Commands } from '../common/constants';
 import { IInterpreterService } from '../interpreter/contracts';
 import { ICodeExecutionHelper } from '../terminals/types';
-import { getNativeRepl, NativeReplSession } from './nativeRepl';
+import { NativeReplSession, withNativeRepl } from './nativeRepl';
+import { createPythonServer } from './pythonServer';
 import {
     executeInTerminal,
     getActiveInterpreter,
@@ -31,10 +32,9 @@ export async function registerStartNativeReplCommand(
     disposables.push(
         registerCommand(Commands.Start_Native_REPL, async (uri: Uri) => {
             sendTelemetryEvent(EventName.REPL, undefined, { replType: 'Native' });
-            const interpreter = await getActiveInterpreter(uri, interpreterService);
-            if (interpreter && !session.disposed) {
-                const nativeRepl = await getNativeRepl(interpreter, session);
-                await nativeRepl.sendToNativeRepl(undefined, false);
+            const interpreter = await getActiveInterpreter(uri, interpreterService, () => !session.disposed);
+            if (interpreter) {
+                await withNativeRepl(interpreter, session, (repl) => repl.sendToNativeRepl(undefined, false));
             }
         }),
     );
@@ -58,27 +58,28 @@ export async function registerReplCommands(
                 await executeInTerminal();
                 return;
             }
-            const interpreter = await getActiveInterpreter(uri, interpreterService);
+            const editor = getActiveTextEditor();
+            if (!editor || session.disposed) {
+                return;
+            }
+            const isCurrentSource = () =>
+                !session.disposed && !editor.document.isClosed && getActiveTextEditor() === editor;
+            const code = await getSelectedTextToExecute(editor);
+            if (!code?.trim() || !isCurrentSource()) {
+                return;
+            }
+            const normalizedCode = await executionHelper.normalizeLines(
+                code,
+                ReplType.native,
+                editor.document.getText(),
+            );
+            if (!normalizedCode.trim() || !isCurrentSource()) {
+                return;
+            }
 
-            if (interpreter && !session.disposed) {
-                const nativeRepl = await getNativeRepl(interpreter, session);
-                const activeEditor = window.activeTextEditor;
-                if (activeEditor) {
-                    const code = await getSelectedTextToExecute(activeEditor);
-                    if (code) {
-                        // Smart Send
-                        let wholeFileContent = '';
-                        if (activeEditor && activeEditor.document) {
-                            wholeFileContent = activeEditor.document.getText();
-                        }
-                        const normalizedCode = await executionHelper.normalizeLines(
-                            code!,
-                            ReplType.native,
-                            wholeFileContent,
-                        );
-                        await nativeRepl.sendToNativeRepl(normalizedCode);
-                    }
-                }
+            const interpreter = await getActiveInterpreter(uri, interpreterService, isCurrentSource);
+            if (interpreter && isCurrentSource()) {
+                await withNativeRepl(interpreter, session, (repl) => repl.sendToNativeRepl(normalizedCode));
             }
         }),
     );
@@ -117,39 +118,65 @@ async function onInputEnter(
     }
     const notebookEditor = commandName === 'repl.execute' ? getActiveNotebookEditor() : undefined;
     const notebook = notebookEditor?.notebook;
-    if (
-        commandName === 'repl.execute' &&
-        (!notebook || !notebookEditor?.replOptions || getTabNameForUri(notebook.uri) !== 'Python REPL')
-    ) {
+    if (commandName === 'repl.execute' && (!notebook || !notebookEditor?.replOptions)) {
         return;
     }
+    const inputVersion = editor.document.version;
     const isCurrentInput = () =>
         !session.disposed &&
         getActiveTextEditor() === editor &&
         !editor.document.isClosed &&
+        editor.document.version === inputVersion &&
         !notebook?.isClosed &&
         (!notebookEditor || getActiveNotebookEditor() === notebookEditor);
+    if (!isCurrentInput()) {
+        return;
+    }
+    if (notebook && getTabNameForUri(notebook.uri) !== 'Python REPL') {
+        await commands.executeCommand(commandName, notebook.uri);
+        return;
+    }
 
-    const interpreter = await getActiveInterpreter(uri, interpreterService);
+    const interpreter = await getActiveInterpreter(uri, interpreterService, isCurrentInput);
     if (!interpreter || !isCurrentInput()) {
         return;
     }
 
-    const nativeRepl = await getNativeRepl(interpreter, session);
-    if ((notebook && !nativeRepl.useNotebook(notebook)) || !isCurrentInput()) {
-        return;
-    }
-    const completeCode = await nativeRepl.checkUserInputCompleteCode(editor);
-    if (!isCurrentInput()) {
-        return;
-    }
+    const finishInput = async (completeCode: boolean) => {
+        if (!isCurrentInput()) {
+            return;
+        }
+        const shouldExecute = completeCode && !isMultiLineText(editor);
+        if (!shouldExecute) {
+            insertNewLineToREPLInput(editor);
+        }
+        if (shouldExecute || editor.document.lineAt(editor.selection.active.line).text === '') {
+            if (notebook) {
+                await commands.executeCommand(commandName, notebook.uri);
+            } else {
+                await commands.executeCommand(commandName);
+            }
+        }
+    };
 
-    if (completeCode && !isMultiLineText(editor)) {
-        await commands.executeCommand(commandName);
+    if (notebook) {
+        await withNativeRepl(interpreter, session, async (repl) => {
+            if (repl.useNotebook(notebook) && isCurrentInput()) {
+                await finishInput(await repl.checkUserInputCompleteCode(editor));
+            }
+        });
     } else {
-        insertNewLineToREPLInput(editor);
-        if (editor.document.lineAt(editor.selection.active.line).text === '') {
-            await commands.executeCommand(commandName);
+        const input = editor.document.getText();
+        if (!input) {
+            await finishInput(false);
+            return;
+        }
+        // The Interactive Window needs syntax validation without owning a Native REPL.
+        const validator = createPythonServer([interpreter.path]);
+        try {
+            await finishInput(await validator.checkValidCommand(input));
+        } finally {
+            validator.dispose();
         }
     }
 }

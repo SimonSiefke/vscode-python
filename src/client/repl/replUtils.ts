@@ -68,9 +68,13 @@ export function isMultiLineText(textEditor: TextEditor): boolean {
 export async function getActiveInterpreter(
     uri: Uri | undefined,
     interpreterService: IInterpreterService,
+    isCurrent: () => boolean = () => true,
 ): Promise<PythonEnvironment | undefined> {
     const resource = uri ?? getActiveResource();
     const interpreter = await interpreterService.getActiveInterpreter(resource);
+    if (!isCurrent()) {
+        return undefined;
+    }
     if (!interpreter) {
         commands.executeCommand(Commands.TriggerEnvironmentSelection, resource).then(noop, noop);
         return undefined;

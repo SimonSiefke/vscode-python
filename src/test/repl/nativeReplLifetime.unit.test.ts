@@ -5,6 +5,7 @@ import * as assert from 'assert';
 import * as sinon from 'sinon';
 import * as TypeMoq from 'typemoq';
 import {
+    commands,
     Disposable,
     EventEmitter,
     NotebookController,
@@ -24,6 +25,7 @@ import * as envApi from '../../client/envExt/api.internal';
 import * as legacyEnvApi from '../../client/envExt/api.legacy';
 import { DidChangeEnvironmentEventArgs } from '../../client/envExt/types';
 import { EnvironmentType, PythonEnvironment } from '../../client/pythonEnvironments/info';
+import * as nativeReplModule from '../../client/repl/nativeRepl';
 import {
     getNativeRepl,
     NativeRepl,
@@ -52,6 +54,7 @@ suite('Native REPL lifetime', () => {
     let registry: Disposable[];
     let session: NativeReplSession;
     let notebook: NotebookDocument;
+    let notebookClosed: boolean;
     let notebookEditor: NotebookEditor;
     let openNotebook: sinon.SinonStub;
     let selectKernel: sinon.SinonStub;
@@ -66,6 +69,7 @@ suite('Native REPL lifetime', () => {
     let serverIdleEvents: EventEmitter<void>[];
     let busyServers: Set<pythonServer.PythonServer>;
     let createServer: sinon.SinonStub;
+    let validateCode: sinon.SinonStub;
     let createRepl: sinon.SinonSpy;
     let workspaceFolders: sinon.SinonStub;
 
@@ -74,32 +78,36 @@ suite('Native REPL lifetime', () => {
         await Promise.all(closeWork.splice(0));
     }
 
-    function createNotebookEditor(name: string): NotebookEditor {
+    function createNotebookEditor(name: string, isClosed: () => boolean = () => false): NotebookEditor {
         const document = TypeMoq.Mock.ofType<NotebookDocument>();
         document.setup((d) => d.uri).returns(() => Uri.parse(`vscode-interactive:/${name}`));
-        document.setup((d) => d.isClosed).returns(() => false);
+        document.setup((d) => d.isClosed).returns(isClosed);
         return { notebook: document.object, replOptions: { appendIndex: 0 } } as NotebookEditor;
     }
 
-    function mockReplInput() {
+    function mockReplInput(title = 'Python REPL') {
         const editor = TypeMoq.Mock.ofType<TextEditor>();
         const document = TypeMoq.Mock.ofType<TextDocument>();
         document.setup((d) => d.getText()).returns(() => 'print(1)');
         document.setup((d) => d.isClosed).returns(() => false);
         document.setup((d) => d.lineCount).returns(() => 1);
+        document.setup((d) => d.version).returns(() => 1);
         editor.setup((e) => e.document).returns(() => document.object);
         sinon.stub(windowApis, 'getActiveNotebookEditor').returns(notebookEditor);
-        sinon.stub(replUtils, 'getTabNameForUri').returns('Python REPL');
+        sinon.stub(replUtils, 'getTabNameForUri').returns(title);
         return sinon.stub(windowApis, 'getActiveTextEditor').returns(editor.object);
     }
 
-    async function registerNativeEnter(lookup: () => Promise<PythonEnvironment>) {
+    async function registerNativeEnter(
+        lookup: () => Promise<PythonEnvironment>,
+        command: string = Commands.Exec_In_REPL_Enter,
+    ) {
         const interpreterService = TypeMoq.Mock.ofType<IInterpreterService>();
         interpreterService.setup((value) => value.getActiveInterpreter(TypeMoq.It.isAny())).returns(lookup);
         const registerCommand = sinon.stub().returns({ dispose: () => undefined });
         const commandManager = ({ registerCommand } as unknown) as ICommandManager;
         await registerReplExecuteOnEnter(registry, session, interpreterService.object, commandManager);
-        return registerCommand.withArgs(Commands.Exec_In_REPL_Enter).firstCall.args[1];
+        return registerCommand.withArgs(command).firstCall.args[1];
     }
 
     setup(() => {
@@ -112,7 +120,8 @@ suite('Native REPL lifetime', () => {
         controllerDisposals = [];
         serverIdleEvents = [];
         busyServers = new Set();
-        notebookEditor = createNotebookEditor('memory-lifetime');
+        notebookClosed = false;
+        notebookEditor = createNotebookEditor('memory-lifetime', () => notebookClosed);
         notebook = notebookEditor.notebook;
         workspaceFolders = sinon.stub(workspaceApis, 'getWorkspaceFolders').returns([]);
         sinon.stub(workspaceApis, 'onDidCloseNotebookDocument').callsFake((handler) => {
@@ -129,6 +138,7 @@ suite('Native REPL lifetime', () => {
             .resolves({ notebookEditor, documentCreated: false });
         selectKernel = sinon.stub(commandHandler, 'selectNotebookKernel').resolves();
         executeCell = sinon.stub(commandHandler, 'executeNotebookCell').resolves();
+        validateCode = sinon.stub().resolves(true);
         createServer = sinon.stub(pythonServer, 'createPythonServer').callsFake(() => {
             const executed = new EventEmitter<void>();
             const idle = new EventEmitter<void>();
@@ -146,7 +156,7 @@ suite('Native REPL lifetime', () => {
                 isDisposed: false,
                 execute: async () => ({ status: true, output: '' }),
                 executeSilently: async () => ({ status: true, output: '' }),
-                checkValidCommand: async () => true,
+                checkValidCommand: validateCode,
                 interrupt: () => undefined,
                 input: () => undefined,
                 dispose,
@@ -306,11 +316,13 @@ suite('Native REPL lifetime', () => {
 
     test('Enter associates a restored Native REPL notebook so closing it releases the owner', async () => {
         mockReplInput();
+        const execute = sinon.stub(commands, 'executeCommand').resolves();
         const enter = await registerNativeEnter(() => Promise.resolve(interpreter));
         await enter(notebook.uri);
         const owner = await getNativeRepl(interpreter, session);
         sinon.assert.notCalled(openNotebook);
         sinon.assert.calledOnce(createServer);
+        sinon.assert.calledOnceWithExactly(execute, 'repl.execute', notebook.uri);
 
         await closeNotebook();
         sinon.assert.calledOnce(serverDisposals[0]);
@@ -337,6 +349,98 @@ suite('Native REPL lifetime', () => {
         sinon.assert.notCalled(insertLine);
     });
 
+    test('Enter does not execute code after focus changes during validation', async () => {
+        const activeEditor = mockReplInput();
+        const execute = sinon.stub(commands, 'executeCommand').resolves();
+        const insertLine = sinon.stub(replUtils, 'insertNewLineToREPLInput');
+        const validating = createDeferred();
+        const validation = createDeferred<boolean>();
+        validateCode.callsFake(() => {
+            validating.resolve();
+            return validation.promise;
+        });
+        const enter = await registerNativeEnter(() => Promise.resolve(interpreter));
+        const pending = enter(notebook.uri);
+        await validating.promise;
+        activeEditor.returns(TypeMoq.Mock.ofType<TextEditor>().object);
+        validation.resolve(true);
+        await pending;
+
+        sinon.assert.notCalled(execute);
+        sinon.assert.notCalled(insertLine);
+    });
+
+    test('Enter delegates another REPL to the workbench without creating a Python owner', async () => {
+        mockReplInput('Other REPL');
+        const execute = sinon.stub(commands, 'executeCommand').resolves();
+        const lookup = sinon.stub().resolves(interpreter);
+        const enter = await registerNativeEnter(lookup);
+        await enter(notebook.uri);
+
+        sinon.assert.calledOnceWithExactly(execute, 'repl.execute', notebook.uri);
+        sinon.assert.notCalled(lookup);
+        sinon.assert.notCalled(createServer);
+    });
+
+    test('Interactive Window Enter releases its syntax checker without creating a Native REPL', async () => {
+        mockReplInput();
+        const execute = sinon.stub(commands, 'executeCommand').resolves();
+        const enter = await registerNativeEnter(() => Promise.resolve(interpreter), Commands.Exec_In_IW_Enter);
+        await enter(notebook.uri);
+
+        sinon.assert.calledOnceWithExactly(execute, 'interactive.execute');
+        sinon.assert.calledOnceWithExactly(validateCode, 'print(1)');
+        sinon.assert.calledOnce(serverDisposals[0]);
+        assert.strictEqual(controllerDisposals.length, 0);
+        assert.strictEqual(listenerDisposals.length, 0);
+        assert.strictEqual(session.current, undefined);
+    });
+
+    test('a closed restored notebook does not discard Start already waiting for the same owner', async () => {
+        mockReplInput();
+        workspaceFolders.returns([
+            { uri: Uri.file('/one'), name: 'one', index: 0 },
+            { uri: Uri.file('/two'), name: 'two', index: 1 },
+        ]);
+        const selecting = createDeferred();
+        const selection = createDeferred<QuickPickItem>();
+        sinon.stub(windowApis, 'showQuickPick').callsFake(() => {
+            selecting.resolve();
+            return selection.promise;
+        });
+        const waitingForBoth = createDeferred();
+        const useNativeRepl = nativeReplModule.withNativeRepl;
+        sinon.stub(nativeReplModule, 'withNativeRepl').callsFake((...args) => {
+            const result = useNativeRepl(...args);
+            if (session.activeCommands === 2) {
+                waitingForBoth.resolve();
+            }
+            return result;
+        });
+        const interpreterService = TypeMoq.Mock.ofType<IInterpreterService>();
+        interpreterService
+            .setup((value) => value.getActiveInterpreter(TypeMoq.It.isAny()))
+            .returns(() => Promise.resolve(interpreter));
+        const registerStart = sinon.stub(commandApis, 'registerCommand').returns({ dispose: () => undefined });
+        await registerStartNativeReplCommand(registry, session, interpreterService.object);
+        const enter = await registerNativeEnter(() => Promise.resolve(interpreter));
+        const endingEnter = enter(notebook.uri);
+        await selecting.promise;
+        const start = registerStart.firstCall.args[1](Uri.file('/one/source.py'));
+        await waitingForBoth.promise;
+
+        notebookClosed = true;
+        await closeNotebook();
+        const replacement = createNotebookEditor('replacement');
+        openNotebook.resolves({ notebookEditor: replacement, documentCreated: true });
+        selection.resolve({ label: 'one', description: '/one' });
+        await Promise.all([endingEnter, start]);
+
+        sinon.assert.calledOnce(createServer);
+        sinon.assert.calledOnceWithExactly(selectKernel, replacement, 'pythonREPL', 'ms-python.python');
+        sinon.assert.notCalled(serverDisposals[0]);
+    });
+
     test('overlapping sends open one notebook and run each submission after kernel selection', async () => {
         const repl = await getNativeRepl(interpreter, session);
         const opening = createDeferred<{ notebookEditor: NotebookEditor; documentCreated: boolean }>();
@@ -360,10 +464,13 @@ suite('Native REPL lifetime', () => {
         opening.resolve({ notebookEditor, documentCreated: true });
         await Promise.all([first, second]);
 
-        assert.deepStrictEqual(openNotebook.args, [
-            [undefined, false],
-            [notebook, true],
-        ]);
+        assert.deepStrictEqual(
+            openNotebook.args.map((args) => args.slice(0, 2)),
+            [
+                [undefined, false],
+                [notebook, true],
+            ],
+        );
         sinon.assert.calledOnce(selectKernel);
         sinon.assert.callOrder(selectKernel, executeCell);
         assert.deepStrictEqual(
@@ -421,6 +528,24 @@ suite('Native REPL lifetime', () => {
         sinon.assert.notCalled(executeCell);
     });
 
+    test('the production submission guard invalidates an old edit while its document stays open', async () => {
+        const editing = createDeferred();
+        const edit = createDeferred();
+        executeCell.callsFake(async (_editor, _code, isCurrentOwner) => {
+            assert.strictEqual(isCurrentOwner(), true);
+            editing.resolve();
+            await edit.promise;
+            assert.strictEqual(isCurrentOwner(), false);
+        });
+        const repl = await getNativeRepl(interpreter, session);
+        const send = repl.sendToNativeRepl('old owner');
+        await editing.promise;
+        await disposeAll(registry);
+        assert.strictEqual(notebook.isClosed, false);
+        edit.resolve();
+        await send;
+    });
+
     test('a throwing server disposer still releases the controller and allows a new session', async () => {
         const first = await getNativeRepl(interpreter, session);
         await first.sendToNativeRepl();
@@ -453,16 +578,20 @@ suite('Native REPL lifetime', () => {
         assert.strictEqual(listenerDisposals[0].callCount, 1);
     });
 
-    test('extension shutdown disposes a session whose directory selection is pending', async () => {
+    test('extension shutdown cancels a pending directory selection', async () => {
         const selection = createDeferred<QuickPickItem | undefined>();
         workspaceFolders.returns([
             { uri: Uri.file('/one'), name: 'one', index: 0 },
             { uri: Uri.file('/two'), name: 'two', index: 1 },
         ]);
-        sinon.stub(windowApis, 'showQuickPick').returns(selection.promise);
+        const picker = sinon.stub(windowApis, 'showQuickPick').callsFake((_items, _options, token) => {
+            const subscription = token?.onCancellationRequested(() => selection.resolve(undefined));
+            return selection.promise.finally(() => subscription?.dispose());
+        });
         const pending = getNativeRepl(interpreter, session);
         registry.forEach((disposable) => disposable.dispose());
-        selection.resolve({ label: 'one', description: '/one' });
+        assert.ok(picker.firstCall.args[2]?.isCancellationRequested);
+        assert.ok(selection.resolved);
         await assert.rejects(pending, /disposed/);
         sinon.assert.notCalled(createServer);
         assert.strictEqual(controllerDisposals.length, 0);

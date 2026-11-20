@@ -11,7 +11,6 @@ import { showInputBox } from '../common/vscodeApis/windowApis';
 
 const SERVER_PATH = path.join(EXTENSION_ROOT_DIR, 'python_files', 'python_server.py');
 const SERVER_EXIT_TIMEOUT_MS = 1000;
-let serverInstance: PythonServer | undefined;
 export interface ExecutionResult {
     status: boolean;
     output: string;
@@ -171,9 +170,6 @@ class PythonServerImpl implements PythonServer, Disposable {
             return;
         }
         this.disposed = true;
-        if (serverInstance === this) {
-            serverInstance = undefined;
-        }
         this.inputCancellation.cancel();
         dispose([
             ...this.disposables.splice(0),
@@ -186,10 +182,6 @@ class PythonServerImpl implements PythonServer, Disposable {
 }
 
 export function createPythonServer(interpreter: string[], cwd?: string): PythonServer {
-    if (serverInstance && !serverInstance.isDisposed) {
-        return serverInstance;
-    }
-
     const pythonServer = ch.spawn(interpreter[0], [...interpreter.slice(1), SERVER_PATH], {
         cwd, // Launch with correct workspace directory
     });
@@ -200,6 +192,5 @@ export function createPythonServer(interpreter: string[], cwd?: string): PythonS
     // There is no partial-message listener, and the reader can retain an incomplete frame after disposal.
     reader.partialMessageTimeout = 0;
     const connection = rpc.createMessageConnection(reader, new rpc.StreamMessageWriter(pythonServer.stdin));
-    serverInstance = new PythonServerImpl(connection, pythonServer);
-    return serverInstance;
+    return new PythonServerImpl(connection, pythonServer);
 }

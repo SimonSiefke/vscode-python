@@ -25,8 +25,8 @@ suite('ReplVariablesProvider', () => {
     let getConfigurationStub: sinon.SinonStub;
     let configMock: TypeMoq.IMock<WorkspaceConfiguration>;
     let enabled: boolean;
-    const executionEventEmitter = new EventEmitter<void>();
-    const cancellationToken = new CancellationTokenSource().token;
+    let executionEventEmitter: EventEmitter<void>;
+    let cancellation: CancellationTokenSource;
 
     const objectVariable: IVariableDescription = {
         name: 'myObject',
@@ -74,7 +74,7 @@ suite('ReplVariablesProvider', () => {
 
     async function provideVariables(parent: Variable | undefined, kind = 1) {
         const results: VariablesResult[] = [];
-        for await (const result of provider.provideVariables(notebook.object, parent, kind, 0, cancellationToken)) {
+        for await (const result of provider.provideVariables(notebook.object, parent, kind, 0, cancellation.token)) {
             results.push(result);
         }
         return results;
@@ -82,6 +82,8 @@ suite('ReplVariablesProvider', () => {
 
     setup(() => {
         enabled = true;
+        executionEventEmitter = new EventEmitter<void>();
+        cancellation = new CancellationTokenSource();
         varRequester = TypeMoq.Mock.ofType<VariableRequester>();
         notebook = TypeMoq.Mock.ofType<NotebookDocument>();
         provider = new VariablesProvider(varRequester.object, () => notebook.object, executionEventEmitter.event);
@@ -97,6 +99,8 @@ suite('ReplVariablesProvider', () => {
     });
 
     teardown(() => {
+        executionEventEmitter.dispose();
+        cancellation.dispose();
         sinon.restore();
     });
 
@@ -107,8 +111,7 @@ suite('ReplVariablesProvider', () => {
 
         assert.isNotEmpty(results);
         assert.equal(results.length, 1);
-        assert.equal(results[0].variable.name, 'myObject');
-        assert.equal(results[0].variable.expression, 'myObject');
+        assert.deepEqual(results[0].variable, { ...objectVariable, expression: 'myObject' });
     });
 
     test('No variables are returned when variable provider is disabled', async () => {
@@ -163,6 +166,15 @@ suite('ReplVariablesProvider', () => {
             assert.equal(item.variable.value, `value${index}`);
             assert.equal(item.variable.expression, `myObject.myList[${index}]`);
         });
+    });
+
+    test('does not resolve children for a variable retained from an older provider', async () => {
+        setVariablesForParent(undefined, [objectVariable]);
+        const previousVariable = (await provideVariables(undefined))[0].variable;
+        const nextRequester = TypeMoq.Mock.ofType<VariableRequester>(undefined, TypeMoq.MockBehavior.Strict);
+        provider = new VariablesProvider(nextRequester.object, () => notebook.object, executionEventEmitter.event);
+
+        assert.isEmpty(await provideVariables(previousVariable));
     });
 
     test('All indexed variables should be returned when requested', async () => {

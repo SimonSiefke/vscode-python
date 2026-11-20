@@ -25,6 +25,7 @@ export function getNewReplViewColumn(tabGroups: readonly TabGroup[]): ViewColumn
 export async function openInteractiveREPL(
     notebookDocument: NotebookDocument | Uri | undefined,
     preserveFocus: boolean = true,
+    isCurrentSession: () => boolean = () => true,
 ): Promise<{ notebookEditor: NotebookEditor; documentCreated: boolean } | undefined> {
     let viewColumn = getNewReplViewColumn(window.tabGroups.all);
     let alreadyExists = false;
@@ -42,7 +43,11 @@ export async function openInteractiveREPL(
         notebookDocument = await openNotebookDocument('jupyter-notebook');
     }
 
-    const notebookEditor = await showNotebookDocument(notebookDocument!, {
+    if (!isCurrentSession() || notebookDocument.isClosed) {
+        return undefined;
+    }
+
+    const notebookEditor = await showNotebookDocument(notebookDocument, {
         viewColumn,
         asRepl: 'Python REPL',
         preserveFocus,

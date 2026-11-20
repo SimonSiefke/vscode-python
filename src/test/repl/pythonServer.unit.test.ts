@@ -101,7 +101,7 @@ suite('Native REPL Python server lifetime', () => {
         sinon.assert.calledOnceWithExactly(children[0].kill, 'SIGKILL');
         sinon.assert.notCalled(children[1].kill);
         sinon.assert.notCalled(listener);
-        assert.strictEqual(startServer(), replacement);
+        assert.strictEqual(replacement.isDisposed, false);
     });
 
     test('a closed transport still releases the server and preserves the forced shutdown', () => {

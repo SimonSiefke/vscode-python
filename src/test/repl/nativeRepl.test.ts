@@ -19,6 +19,8 @@ import * as replController from '../../client/repl/replController';
 import * as replCommandHandler from '../../client/repl/replCommandHandler';
 import * as workspaceApis from '../../client/common/vscodeApis/workspaceApis';
 import * as commandApis from '../../client/common/vscodeApis/commandApis';
+import * as windowApis from '../../client/common/vscodeApis/windowApis';
+import * as replUtils from '../../client/repl/replUtils';
 
 suite('REPL - Native REPL', () => {
     let interpreterService: TypeMoq.IMock<IInterpreterService>;
@@ -241,5 +243,33 @@ suite('REPL - cell submission', () => {
 
         await replCommandHandler.executeNotebookCell(editor, 'print(2)', () => true);
         sinon.assert.calledOnce(executeCommand);
+    });
+});
+
+suite('REPL - notebook opening', () => {
+    teardown(() => sinon.restore());
+
+    test('opening a document after owner shutdown cannot show its old REPL tab', async () => {
+        const opened = createDeferred<vscode.NotebookDocument>();
+        const notebook = {
+            uri: vscode.Uri.parse('untitled:repl-test.ipynb'),
+            isClosed: false,
+        } as vscode.NotebookDocument;
+        const editor = { notebook } as vscode.NotebookEditor;
+        const openDocument = sinon.stub(workspaceApis, 'openNotebookDocument').returns(opened.promise);
+        const showDocument = sinon.stub(windowApis, 'showNotebookDocument').resolves(editor);
+        sinon.stub(replUtils, 'getTabNameForUri').returns('Python REPL');
+
+        let isCurrent = true;
+        const abandonedOpen = replCommandHandler.openInteractiveREPL(undefined, false, () => isCurrent);
+        sinon.assert.calledOnceWithExactly(openDocument, 'jupyter-notebook');
+        isCurrent = false;
+        opened.resolve(notebook);
+        expect(await abandonedOpen).to.be.undefined;
+        sinon.assert.notCalled(showDocument);
+
+        const liveOpen = await replCommandHandler.openInteractiveREPL(undefined, false, () => true);
+        expect(liveOpen?.notebookEditor).to.equal(editor);
+        sinon.assert.calledOnce(showDocument);
     });
 });
