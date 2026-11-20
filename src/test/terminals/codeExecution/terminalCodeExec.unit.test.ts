@@ -662,9 +662,13 @@ suite('Terminal - Code Execution', () => {
                             return sends[index].promise;
                         });
 
+                    const givePrompt = () =>
+                        output.fire({ terminal: TypeMoq.Mock.ofType<Terminal>().object, data: '>>>' });
                     const canceled = rejects(executor.execute('first selection'), CancellationError);
                     await started[0].promise;
-                    if (!promptBeforeDispatch) {
+                    if (promptBeforeDispatch) {
+                        givePrompt();
+                    } else {
                         sends[0].resolve();
                         await new Promise<void>((resolve) => setImmediate(resolve));
                     }
@@ -672,16 +676,13 @@ suite('Terminal - Code Execution', () => {
                     const replacement = executor.execute('replacement selection');
                     await started[1].promise;
 
-                    if (promptBeforeDispatch) {
-                        sends[0].reject(new CancellationError());
-                    }
                     await canceled;
                     sinon.assert.calledOnce(disposedPromptListener);
                     sinon.assert.calledOnce(disposedCloseListener);
 
-                    const givePrompt = () =>
-                        output.fire({ terminal: TypeMoq.Mock.ofType<Terminal>().object, data: '>>>' });
                     if (promptBeforeDispatch) {
+                        expect(sends[0].completed).to.equal(false);
+                        sends[0].reject(new CancellationError());
                         givePrompt();
                         sinon.assert.calledTwice(disposedPromptListener);
                     } else {

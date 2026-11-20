@@ -8,11 +8,13 @@ import * as sinon from 'sinon';
 import * as TypeMoq from 'typemoq';
 import {
     CancellationError,
+    CancellationTokenSource,
     Disposable,
     EventEmitter,
     TerminalShellExecution,
     TerminalShellExecutionEndEvent,
     TerminalShellIntegration,
+    TerminalShellIntegrationChangeEvent,
     ThemeIcon,
     Uri,
     Terminal as VSCodeTerminal,
@@ -20,6 +22,7 @@ import {
     TerminalDataWriteEvent,
 } from 'vscode';
 import { IApplicationShell, ITerminalManager, IWorkspaceService } from '../../../client/common/application/types';
+import { CancellationError as CommandCancellationError } from '../../../client/common/cancellation';
 import { EXTENSION_ROOT_DIR } from '../../../client/common/constants';
 import { IPlatformService } from '../../../client/common/platform/types';
 import { TerminalService } from '../../../client/common/terminal/service';
@@ -669,6 +672,68 @@ suite('Terminal Service', () => {
 
         terminalShellIntegration.verify((shell) => shell.executeCommand('old command'), TypeMoq.Times.never());
         terminalShellIntegration.verify((shell) => shell.executeCommand('replacement command'), TypeMoq.Times.once());
+    });
+
+    test('Canceling during activation keeps the command off the terminal', async () => {
+        sinon.stub(asyncUtils, 'sleep').resolves(100);
+        terminalManager.setup((manager) => manager.createTerminal(TypeMoq.It.isAny())).returns(() => terminal.object);
+        const active = asyncUtils.createDeferred<void>();
+        const activation = asyncUtils.createDeferred<boolean>();
+        terminalActivator
+            .setup((activator) => activator.activateEnvironmentInTerminal(TypeMoq.It.isAny(), TypeMoq.It.isAny()))
+            .returns(() => {
+                active.resolve();
+                return activation.promise;
+            });
+        service = new TerminalService(mockServiceContainer.object);
+        const cancellation = new CancellationTokenSource();
+        try {
+            const canceled = rejects(service.sendCommand('install', [], cancellation.token), CommandCancellationError);
+            await active.promise;
+            cancellation.cancel();
+            activation.resolve(true);
+            await canceled;
+            terminalShellIntegration.verify((shell) => shell.executeCommand(TypeMoq.It.isAny()), TypeMoq.Times.never());
+            terminal.verify((value) => value.sendText(TypeMoq.It.isAny()), TypeMoq.Times.never());
+        } finally {
+            cancellation.dispose();
+        }
+    });
+
+    test('Canceling during the shell integration wait keeps the command off the terminal', async () => {
+        sinon.stub(asyncUtils, 'sleep').resolves(100);
+        const unintegrated = TypeMoq.Mock.ofType<VSCodeTerminal>();
+        unintegrated.setup((value) => value.shellIntegration).returns(() => undefined);
+        terminalManager
+            .setup((manager) => manager.createTerminal(TypeMoq.It.isAny()))
+            .returns(() => unintegrated.object);
+        terminalHelper
+            .setup((helper) =>
+                helper.buildCommandForTerminal(TypeMoq.It.isAny(), TypeMoq.It.isAny(), TypeMoq.It.isAny()),
+            )
+            .returns((_shell, command) => command);
+        const integration = new EventEmitter<TerminalShellIntegrationChangeEvent>();
+        disposables.push(integration);
+        const waiting = asyncUtils.createDeferred<void>();
+        terminalManager
+            .setup((manager) => manager.onDidChangeTerminalShellIntegration(TypeMoq.It.isAny()))
+            .returns((listener) => {
+                waiting.resolve();
+                return integration.event(listener);
+            });
+        service = new TerminalService(mockServiceContainer.object);
+        const cancellation = new CancellationTokenSource();
+        try {
+            const canceled = rejects(service.sendCommand('install', [], cancellation.token), CommandCancellationError);
+            await Promise.race([waiting.promise, canceled]);
+            expect(waiting.completed).to.equal(true);
+            cancellation.cancel();
+            integration.fire({ terminal: unintegrated.object, shellIntegration: terminalShellIntegration.object });
+            await canceled;
+            unintegrated.verify((value) => value.sendText('install'), TypeMoq.Times.never());
+        } finally {
+            cancellation.dispose();
+        }
     });
 
     test('Ensure close event is not fired when terminal is closed', async () => {

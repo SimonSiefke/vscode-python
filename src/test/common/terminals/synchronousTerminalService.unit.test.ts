@@ -6,16 +6,17 @@ import { rejects } from 'node:assert/strict';
 import * as path from 'path';
 import * as sinon from 'sinon';
 import { anything, deepEqual, instance, mock, verify, when } from 'ts-mockito';
-import { CancellationTokenSource, Disposable, EventEmitter } from 'vscode';
+import { CancellationToken, CancellationTokenSource, Disposable, EventEmitter } from 'vscode';
 import { CancellationError } from '../../../client/common/cancellation';
 import { FileSystem } from '../../../client/common/platform/fileSystem';
-import { IFileSystem } from '../../../client/common/platform/types';
+import { IFileSystem, TemporaryFile } from '../../../client/common/platform/types';
 import { TerminalService } from '../../../client/common/terminal/service';
 import { SynchronousTerminalService } from '../../../client/common/terminal/syncTerminalService';
 import { createDeferred, createDeferredFrom } from '../../../client/common/utils/async';
 import { EXTENSION_ROOT_DIR } from '../../../client/constants';
 import { IInterpreterService } from '../../../client/interpreter/contracts';
 import { InterpreterService } from '../../../client/interpreter/interpreterService';
+import { PythonEnvironment } from '../../../client/pythonEnvironments/info';
 import { noop, sleep } from '../../core';
 
 suite('Terminal Service (synchronous)', () => {
@@ -82,7 +83,7 @@ suite('Terminal Service (synchronous)', () => {
         test('run sendCommand in terminalService should be cancelled', async () => {
             const cancel = new CancellationTokenSource();
             const tmpFile = { filePath: 'tmp with spaces', dispose: noop };
-            when(terminalService.sendCommand(anything(), anything())).thenResolve();
+            when(terminalService.sendCommand(anything(), anything(), anything())).thenResolve();
             when(interpreterService.getActiveInterpreter(undefined)).thenResolve(undefined);
             when(fs.createTemporaryFile('.log')).thenResolve(tmpFile);
             when(fs.readFile(anything())).thenResolve('');
@@ -112,13 +113,14 @@ suite('Terminal Service (synchronous)', () => {
                 terminalService.sendCommand(
                     'python',
                     deepEqual([shellExecFile, 'cmd', '1', '2', tmpFile.filePath.fileToCommandArgumentForPythonExt()]),
+                    anything(),
                 ),
             ).once();
         }).timeout(1_000);
         test('run sendCommand in terminalService should complete when command completes', async () => {
             const cancel = new CancellationTokenSource();
             const tmpFile = { filePath: 'tmp with spaces', dispose: noop };
-            when(terminalService.sendCommand(anything(), anything())).thenResolve();
+            when(terminalService.sendCommand(anything(), anything(), anything())).thenResolve();
             when(interpreterService.getActiveInterpreter(undefined)).thenResolve(undefined);
             when(fs.createTemporaryFile('.log')).thenResolve(tmpFile);
             when(fs.readFile(anything())).thenResolve('');
@@ -148,6 +150,7 @@ suite('Terminal Service (synchronous)', () => {
                 terminalService.sendCommand(
                     'python',
                     deepEqual([shellExecFile, 'cmd', '1', '2', tmpFile.filePath.fileToCommandArgumentForPythonExt()]),
+                    anything(),
                 ),
             ).once();
         }).timeout(2_000);
@@ -162,17 +165,17 @@ suite('Terminal Service (synchronous)', () => {
             let sends = 0;
             const disposedCloseListener = sinon.spy();
             const disposedCancelListener = sinon.spy();
-            const cancellation = {
+            const cancellation: CancellationToken = {
                 get isCancellationRequested() {
                     return token.token.isCancellationRequested;
                 },
-                onCancellationRequested: ((listener) => {
+                onCancellationRequested: (listener) => {
                     const subscription = token.token.onCancellationRequested(listener);
                     return new Disposable(() => {
                         subscription.dispose();
                         disposedCancelListener();
                     });
-                }) as typeof token.token.onCancellationRequested,
+                },
             };
             when(terminalService.onDidCloseTerminal).thenReturn((listener) => {
                 const subscription = closed.event(listener);
@@ -181,13 +184,16 @@ suite('Terminal Service (synchronous)', () => {
                     disposedCloseListener();
                 });
             });
-            when(terminalService.sendCommand(anything(), anything())).thenCall(async () => {
+            when(terminalService.sendCommand(anything(), anything(), anything())).thenCall(async () => {
                 dispatched[sends++].resolve();
             });
             when(interpreterService.getActiveInterpreter(undefined)).thenResolve(undefined);
             when(fs.createTemporaryFile('.log')).thenResolve(firstFile, secondFile);
             when(fs.readFile(firstFile.filePath)).thenReturn(read.promise);
             when(fs.readFile(secondFile.filePath)).thenResolve('END');
+            const unhandled: unknown[] = [];
+            const capture = (error: unknown) => unhandled.push(error);
+            process.on('unhandledRejection', capture);
             try {
                 const canceled = rejects(service.sendCommand('first', [], cancellation), CancellationError);
                 await dispatched[0].promise;
@@ -203,7 +209,9 @@ suite('Terminal Service (synchronous)', () => {
 
                 read.reject(new Error('Lock file was removed'));
                 await clock.tickAsync(400);
+                await new Promise<void>((resolve) => setImmediate(resolve));
                 verify(fs.readFile(firstFile.filePath)).once();
+                assert.deepEqual(unhandled, []);
 
                 const replacement = service.sendCommand('second', [], cancellation);
                 await dispatched[1].promise;
@@ -214,10 +222,96 @@ suite('Terminal Service (synchronous)', () => {
                 sinon.assert.calledTwice(disposedCloseListener);
                 sinon.assert.calledTwice(disposedCancelListener);
             } finally {
+                process.off('unhandledRejection', capture);
                 token.cancel();
                 token.dispose();
                 clock.restore();
             }
         }).timeout(2_000);
+
+        for (const closeTerminal of [false, true]) {
+            const reason = closeTerminal ? 'terminal closure' : 'caller cancellation';
+            test(`Ending a pending dispatch through ${reason} releases its lock and signals the terminal`, async () => {
+                const source = new CancellationTokenSource();
+                const lock = { filePath: 'lock file', dispose: sinon.spy() };
+                const started = createDeferred<CancellationToken>();
+                const dispatch = createDeferred<void>();
+                when(interpreterService.getActiveInterpreter(undefined)).thenResolve(undefined);
+                when(fs.createTemporaryFile('.log')).thenResolve(lock);
+                when(fs.readFile(lock.filePath)).thenResolve('');
+                when(terminalService.sendCommand(anything(), anything(), anything())).thenCall(
+                    (_command, _args, token) => {
+                        started.resolve(token);
+                        return dispatch.promise;
+                    },
+                );
+                try {
+                    const canceled = rejects(service.sendCommand('install', [], source.token), CancellationError);
+                    const terminalToken = await started.promise;
+                    if (closeTerminal) {
+                        closed.fire();
+                    } else {
+                        source.cancel();
+                    }
+                    await canceled;
+                    assert.equal(Boolean(source.token.isCancellationRequested), !closeTerminal);
+                    assert.isTrue(terminalToken.isCancellationRequested);
+                    sinon.assert.calledOnce(lock.dispose);
+                    assert.isFalse(dispatch.completed);
+                } finally {
+                    dispatch.resolve();
+                    source.dispose();
+                }
+            });
+        }
+
+        test('Canceling a pending lock allocation disposes the file when it arrives', async () => {
+            const source = new CancellationTokenSource();
+            const starting = createDeferred<void>();
+            const allocation = createDeferred<TemporaryFile>();
+            const file = { filePath: 'late lock file', dispose: sinon.spy() };
+            when(interpreterService.getActiveInterpreter(undefined)).thenResolve(undefined);
+            when(fs.createTemporaryFile('.log')).thenCall(() => {
+                starting.resolve();
+                return allocation.promise;
+            });
+            try {
+                const canceled = rejects(service.sendCommand('install', [], source.token), CancellationError);
+                await starting.promise;
+                source.cancel();
+                await canceled;
+                allocation.resolve(file);
+                await new Promise<void>((resolve) => setImmediate(resolve));
+                sinon.assert.calledOnce(file.dispose);
+                verify(terminalService.sendCommand(anything(), anything(), anything())).never();
+            } finally {
+                allocation.resolve(file);
+                source.dispose();
+            }
+        });
+
+        test('Canceling interpreter lookup returns before allocating a lock or opening the terminal', async () => {
+            const source = new CancellationTokenSource();
+            const checking = createDeferred<void>();
+            const interpreter = createDeferred<PythonEnvironment | undefined>();
+            when(interpreterService.getActiveInterpreter(undefined)).thenCall(() => {
+                checking.resolve();
+                return interpreter.promise;
+            });
+            try {
+                const canceled = rejects(service.sendCommand('install', [], source.token), CancellationError);
+                await checking.promise;
+                source.cancel();
+                await canceled;
+                assert.isFalse(interpreter.completed);
+                interpreter.resolve(undefined);
+                await new Promise<void>((resolve) => setImmediate(resolve));
+                verify(fs.createTemporaryFile('.log')).never();
+                verify(terminalService.sendCommand(anything(), anything(), anything())).never();
+            } finally {
+                interpreter.resolve(undefined);
+                source.dispose();
+            }
+        });
     });
 });

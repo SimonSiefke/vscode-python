@@ -138,31 +138,45 @@ export class SynchronousTerminalService implements ITerminalService, Disposable 
         if (!cancel) {
             return this.terminalService.sendCommand(command, args);
         }
-        const lockFile = await this.createLockFile();
-        const state = new ExecutionState(lockFile.filePath, this.fs, [command, ...args]);
+        Cancellation.throwIfCanceled(cancel);
         const completionCancellation = new CancellationTokenSource();
+        const executionToken = completionCancellation.token;
+        let lockFile: TemporaryFile | undefined;
+        let state: ExecutionState | undefined;
         let closeListener: Disposable | undefined;
         let cancelListener: Disposable | undefined;
         try {
-            const pythonExec = this.pythonInterpreter || (await this.interpreter.getActiveInterpreter(undefined));
-            const sendArgs = internalScripts.shell_exec(command, lockFile.filePath, args);
-            closeListener = this.terminalService.onDidCloseTerminal(() => completionCancellation.cancel());
-            await Cancellation.race(
-                () => this.terminalService.sendCommand(pythonExec?.path || 'python', sendArgs),
-                completionCancellation.token,
-            );
             cancelListener = cancel.onCancellationRequested(() => completionCancellation.cancel());
             if (cancel.isCancellationRequested) {
                 completionCancellation.cancel();
             }
+            const pythonExec =
+                this.pythonInterpreter ||
+                (await Cancellation.race(() => this.interpreter.getActiveInterpreter(undefined), executionToken));
+            const file = await Cancellation.race(async () => {
+                const allocated = await this.createLockFile();
+                if (executionToken.isCancellationRequested) {
+                    allocated.dispose();
+                } else {
+                    lockFile = allocated;
+                }
+                return allocated;
+            }, executionToken);
+            state = new ExecutionState(file.filePath, this.fs, [command, ...args]);
+            const sendArgs = internalScripts.shell_exec(command, file.filePath, args);
+            closeListener = this.terminalService.onDidCloseTerminal(() => completionCancellation.cancel());
+            await Cancellation.race(
+                () => this.terminalService.sendCommand(pythonExec?.path || 'python', sendArgs, executionToken),
+                executionToken,
+            );
             const promise = swallowExceptions ? state.completed : state.completed.catch(noop);
-            await Cancellation.race(() => promise, completionCancellation.token);
+            await Cancellation.race(() => promise, executionToken);
         } finally {
             closeListener?.dispose();
             cancelListener?.dispose();
             completionCancellation.dispose();
-            state.dispose();
-            lockFile.dispose();
+            state?.dispose();
+            lockFile?.dispose();
         }
     }
     /** @deprecated */

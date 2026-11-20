@@ -18,6 +18,7 @@ import { captureTelemetry } from '../../telemetry';
 import { EventName } from '../../telemetry/constants';
 import { ITerminalAutoActivation } from '../../terminals/types';
 import { IApplicationShell, ITerminalManager } from '../application/types';
+import { Cancellation } from '../cancellation';
 import { _SCRIPTS_DIR } from '../process/internal/scripts/constants';
 import { IConfigurationService, IDisposableRegistry } from '../types';
 import {
@@ -75,14 +76,16 @@ export class TerminalService implements ITerminalService, Disposable {
             });
         }
     }
-    public async sendCommand(command: string, args: string[], _?: CancellationToken): Promise<void> {
+    public async sendCommand(command: string, args: string[], cancel?: CancellationToken): Promise<void> {
+        Cancellation.throwIfCanceled(cancel);
         await this.ensureTerminal();
+        Cancellation.throwIfCanceled(cancel);
         const text = this.terminalHelper.buildCommandForTerminal(this.terminalShellType, command, args);
         if (!this.options?.hideFromUser) {
             this.terminal!.show(true);
         }
 
-        await this.executeCommand(text, false);
+        await this.executeCommandInternal(text, cancel);
     }
     /** @deprecated */
     public async sendText(text: string): Promise<void> {
@@ -179,7 +182,10 @@ export class TerminalService implements ITerminalService, Disposable {
         }
     }
 
-    private async executeCommandInternal(commandLine: string): Promise<TerminalShellExecution | undefined> {
+    private async executeCommandInternal(
+        commandLine: string,
+        cancel?: CancellationToken,
+    ): Promise<TerminalShellExecution | undefined> {
         const terminal = this.terminal;
         if (!terminal) {
             traceVerbose('Terminal not available, cannot execute command');
@@ -209,6 +215,7 @@ export class TerminalService implements ITerminalService, Disposable {
             await promise;
         }
 
+        Cancellation.throwIfCanceled(cancel);
         if (terminal.shellIntegration) {
             const execution = terminal.shellIntegration.executeCommand(commandLine);
             traceVerbose(`Shell Integration is enabled, executeCommand: ${commandLine}`);
