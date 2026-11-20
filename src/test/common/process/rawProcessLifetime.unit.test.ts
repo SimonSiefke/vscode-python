@@ -362,26 +362,32 @@ suite('Completed process handle lifetime', () => {
             });
         }
 
-        test('plain cancellation preserves a native timeout signal and shutdown can retry', async () => {
+        test('plain cancellation preserves a native stop signal and shutdown can retry', async () => {
             const service = new ProcessService();
             const cancellation = new CancellationTokenSource();
+            const ready = createDeferred<void>();
             const survived = createDeferred<void>();
             const outputChannel = {
                 append(text: string) {
+                    if (text === 'ready') ready.resolve();
                     if (text === 'survived') survived.resolve();
                 },
             } as OutputChannel;
             const spawn = spy(childProcess, 'spawn');
-            const result = service.exec(process.execPath, ['-e', `${ignoreFirstSignal} ${exitIfNotStopped}`], {
-                timeout: 1500,
-                token: cancellation.token,
-                outputChannel,
-            });
+            const result = service.exec(
+                process.execPath,
+                ['-e', `${ignoreFirstSignal} process.stdout.write("ready"); ${exitIfNotStopped}`],
+                { token: cancellation.token, outputChannel },
+            );
             const proc = spawn.firstCall?.returnValue;
             spawn.restore();
             assert.ok(proc);
             const kill = spy(process, 'kill');
             try {
+                await Promise.race([ready.promise, result]);
+                assert.ok(ready.completed);
+                // The spawn timeout also uses ChildProcess.kill() to send its signal.
+                assert.strictEqual(proc.kill(), true);
                 await Promise.race([survived.promise, result]);
                 assert.ok(survived.completed);
                 assert.strictEqual(proc.killed, true);
@@ -390,7 +396,7 @@ suite('Completed process handle lifetime', () => {
                 assert.strictEqual(kill.withArgs(proc.pid).callCount, 0);
                 service.dispose();
                 assert.strictEqual(kill.withArgs(proc.pid).callCount, 1);
-                assert.strictEqual((await result).stdout, 'survived');
+                assert.strictEqual((await result).stdout, 'readysurvived');
             } finally {
                 kill.restore();
                 cancellation.dispose();
