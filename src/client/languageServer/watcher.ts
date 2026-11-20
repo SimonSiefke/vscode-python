@@ -294,14 +294,21 @@ export class LanguageServerWatcher implements IExtensionActivationService, ILang
     ): Promise<void> {
         // Prevent reentrant acquisition or retirement before the shutdown promise is assigned.
         await Promise.resolve();
+        let stopped = false;
         try {
             await languageServer.stopLanguageServer();
+            stopped = true;
         } finally {
-            this.activeLanguageServers.delete(languageServer);
-            if (this.workspaceLanguageServers.get(lifetime.key) === languageServer) {
-                this.workspaceLanguageServers.delete(lifetime.key);
+            if (stopped || this.shutdown) {
+                this.activeLanguageServers.delete(languageServer);
+                if (this.workspaceLanguageServers.get(lifetime.key) === languageServer) {
+                    this.workspaceLanguageServers.delete(lifetime.key);
+                }
+                languageServer.dispose();
+            } else {
+                // Keep the live manager reachable so a later refresh or command can retry the stop.
+                lifetime.shutdown = undefined;
             }
-            languageServer.dispose();
         }
     }
 

@@ -154,10 +154,19 @@ export class NodeLanguageServerProxy implements ILanguageServerProxy {
         }
     }
 
-    public close(): Promise<void> {
+    public get usesPylanceClientApi(): boolean {
+        return this.pylanceApi !== undefined;
+    }
+
+    public async close(): Promise<void> {
         this.closed = true;
         this.startingClient?.cancelStartup();
-        return this.stop();
+        try {
+            await this.stop();
+        } catch (error) {
+            this.closed = false;
+            throw error;
+        }
     }
 
     public stop(): Promise<void> {
@@ -174,9 +183,8 @@ export class NodeLanguageServerProxy implements ILanguageServerProxy {
     @traceDecoratorVerbose('Stopping language server')
     private async stopClient(): Promise<void> {
         if (this.pylanceApi) {
-            const api = this.pylanceApi;
+            await this.pylanceApi.client!.stop();
             this.pylanceApi = undefined;
-            await api.client!.stop();
         }
 
         while (this.disposables.length > 0) {

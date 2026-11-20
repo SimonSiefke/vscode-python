@@ -52,7 +52,13 @@ export class NodeLanguageServerManager implements ILanguageServerManager {
         }
         NodeLanguageServerManager.commandDispose = commandManager.registerCommand(Commands.RestartLS, () => {
             sendTelemetryEvent(EventName.LANGUAGE_SERVER_RESTART, undefined, { reason: 'command' });
-            if (!this.closed && this.replaceStartingServer && (this.initialStartup || this.restarting)) {
+            // The companion queues subsequent operations behind its current startup.
+            if (
+                !this.closed &&
+                this.replaceStartingServer &&
+                (this.initialStartup || this.restarting) &&
+                !this.languageServerProxy.usesPylanceClientApi
+            ) {
                 this.replaceStartingServer().ignoreErrors();
             } else {
                 this.restartLanguageServer().ignoreErrors();
@@ -99,10 +105,19 @@ export class NodeLanguageServerManager implements ILanguageServerManager {
         this.started = !this.closed;
     }
 
-    public stop(): Promise<void> {
+    public async stop(): Promise<void> {
         this.closed = true;
+        const wasConnected = this.connected;
         this.disconnect();
-        return this.languageServerProxy.close();
+        try {
+            await this.languageServerProxy.close();
+        } catch (error) {
+            this.closed = false;
+            if (wasConnected) {
+                this.connect();
+            }
+            throw error;
+        }
     }
 
     public connect(): void {

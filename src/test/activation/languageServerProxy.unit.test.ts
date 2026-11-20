@@ -51,6 +51,45 @@ const proxyTypes = [
 
 for (const { name, create } of proxyTypes) {
     suite(`${name} language server proxy`, () => {
+        test('Closing disposes a client acquired later without starting it or registering handlers', async () => {
+            const factoryEntered = createDeferred();
+            const releaseFactory = createDeferred();
+            const client = {
+                onNotification: sinon.spy(),
+                onTelemetry: sinon.spy(),
+                onRequest: sinon.stub().returns({ dispose: () => {} }),
+                dispose: sinon.stub().resolves(),
+                start: sinon.stub().resolves(),
+            };
+            const factory = {
+                createLanguageClient: async () => {
+                    factoryEntered.resolve();
+                    await releaseFactory.promise;
+                    return (client as unknown) as LanguageServerClient;
+                },
+            };
+            const { proxy, getClient } = create(factory);
+            const startup = proxy.start(undefined, undefined, {});
+            try {
+                await Promise.race([factoryEntered.promise, startup]);
+                assert.ok(factoryEntered.completed);
+                await proxy.close();
+                assert.strictEqual(releaseFactory.completed, false);
+
+                releaseFactory.resolve();
+                await startup;
+                sinon.assert.calledOnce(client.dispose);
+                sinon.assert.notCalled(client.start);
+                sinon.assert.notCalled(client.onNotification);
+                sinon.assert.notCalled(client.onTelemetry);
+                sinon.assert.notCalled(client.onRequest);
+                assert.strictEqual(getClient(), undefined);
+            } finally {
+                releaseFactory.resolve();
+                await Promise.all([startup, proxy.close()]);
+            }
+        });
+
         test('Closing cancels initialization and disposes the client after a late start', async () => {
             const initializing = createDeferred();
             const finishStartup = createDeferred();

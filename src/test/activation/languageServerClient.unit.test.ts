@@ -10,19 +10,27 @@ import { LanguageServerClient } from '../../client/activation/common/languageSer
 import { createDeferred, raceTimeout } from '../../client/common/utils/async';
 
 suite('Native language server client', () => {
-    test('Cancellation during transport acquisition releases diagnostics through the connection close handler', async () => {
+    async function cancelAndCheckDiagnostics(transportAlreadyOpen: boolean): Promise<void> {
         const sandbox = sinon.createSandbox();
         const transportRequested = createDeferred();
         const releaseTransport = createDeferred();
         const disposedDiagnostics = createDeferred();
+        const initializeSent = createDeferred();
         const disposeDiagnostics = sandbox.spy(() => disposedDiagnostics.resolve());
         const input = new PassThrough();
         const output = new PassThrough();
+        const requests = new StreamMessageReader(output);
+        const subscription = requests.listen((message) => {
+            if ('method' in message && message.method === 'initialize') {
+                initializeSent.resolve();
+            }
+        });
         const version = Object.getOwnPropertyDescriptor(vscode, 'version');
         const kill = sandbox.spy((_signal: NodeJS.Signals) => {
             input.destroy();
             return true;
         });
+        let client: LanguageServerClient | undefined;
         let startup: Promise<void> | undefined;
         try {
             Object.defineProperty(vscode, 'version', { configurable: true, value: '1.95.0' });
@@ -38,11 +46,11 @@ suite('Native language server client', () => {
                         if (property === 'getConfiguration') {
                             return () => ({ get: () => undefined });
                         }
-                        return Reflect.get(target, property);
+                        return target[property as keyof typeof target];
                     },
                 }),
             );
-            const client = new LanguageServerClient(
+            client = new LanguageServerClient(
                 'test-client',
                 'Test client',
                 async () => {
@@ -57,10 +65,21 @@ suite('Native language server client', () => {
             startup = client.start();
             await Promise.race([transportRequested.promise, startup]);
             assert.ok(transportRequested.completed);
+            if (transportAlreadyOpen) {
+                releaseTransport.resolve();
+                assert.strictEqual(
+                    await raceTimeout(
+                        1_000,
+                        initializeSent.promise.then(() => true),
+                    ),
+                    true,
+                    'The client should send initialize before cancellation',
+                );
+            }
+
             client.cancelStartup();
             sinon.assert.notCalled(kill);
             sinon.assert.notCalled(disposeDiagnostics);
-
             releaseTransport.resolve();
             assert.strictEqual(
                 await raceTimeout(
@@ -82,10 +101,13 @@ suite('Native language server client', () => {
             sinon.assert.calledOnceWithExactly(kill, 'SIGKILL');
             sinon.assert.calledOnce(disposeDiagnostics);
         } finally {
+            client?.cancelStartup();
             releaseTransport.resolve();
             input.destroy();
             output.destroy();
             await startup?.catch(() => undefined);
+            subscription.dispose();
+            requests.dispose();
             sandbox.restore();
             if (version) {
                 Object.defineProperty(vscode, 'version', version);
@@ -93,5 +115,11 @@ suite('Native language server client', () => {
                 Reflect.deleteProperty(vscode, 'version');
             }
         }
-    });
+    }
+
+    test('Cancellation during transport acquisition releases diagnostics through the connection close handler', () =>
+        cancelAndCheckDiagnostics(false));
+
+    test('Cancellation after sending initialize terminates the stalled client and releases diagnostics', () =>
+        cancelAndCheckDiagnostics(true));
 });
