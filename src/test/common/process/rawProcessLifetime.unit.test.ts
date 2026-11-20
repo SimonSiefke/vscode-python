@@ -2,7 +2,7 @@
 // Licensed under the MIT License.
 
 import * as assert from 'assert';
-import { ChildProcess } from 'child_process';
+import childProcess from 'child_process';
 import { randomUUID } from 'crypto';
 import { errorMonitor, once } from 'events';
 import { tmpdir } from 'os';
@@ -11,6 +11,7 @@ import { Readable } from 'stream';
 import { spy } from 'sinon';
 import { CancellationTokenSource, OutputChannel } from 'vscode';
 import { CancellationTokenSource as ReplayingCancellationTokenSource } from 'vscode-jsonrpc/node';
+import { ProcessService } from '../../../client/common/process/proc';
 import { execObservable, plainExec, shellExec } from '../../../client/common/process/rawProcessApis';
 import { IDisposable } from '../../../client/common/types';
 import { createDeferred } from '../../../client/common/utils/async';
@@ -21,7 +22,7 @@ const ignoreFirstSignal = 'process.once("SIGTERM", () => process.stdout.write("s
 // The remaining close listener belongs to the test's completion probe.
 const detachedOwnership = { handles: 0, exitListeners: 0, closeListeners: 1, errorMonitors: 0 };
 
-function processOwnership(proc: ChildProcess, handles: Set<IDisposable>) {
+function processOwnership(proc: childProcess.ChildProcess, handles: Set<IDisposable>) {
     return {
         handles: handles.size,
         exitListeners: proc.listenerCount('exit'),
@@ -198,6 +199,43 @@ suite('Completed process handle lifetime', () => {
     });
 
     if (process.platform !== 'win32') {
+        test('shell abort does not signal a child again while it handles SIGTERM', async () => {
+            const service = new ProcessService();
+            const controller = new AbortController();
+            const exec = spy(childProcess, 'exec');
+            const result = service
+                .shellExec('exec "$TEST_NODE" -e "$TEST_SCRIPT"', {
+                    signal: controller.signal,
+                    env: {
+                        ...process.env,
+                        TEST_NODE: process.execPath,
+                        TEST_SCRIPT: `process.once("SIGTERM", () => {}); process.stdout.write("ready"); setTimeout(() => process.exit(${fallbackExitCode}), 5000);`,
+                    },
+                })
+                .catch((error: unknown) => error);
+            const proc = exec.firstCall?.returnValue;
+            exec.restore();
+            assert.ok(proc?.stdout);
+
+            const closed = new Promise<void>((resolve) => proc.once('close', () => resolve()));
+            const kill = spy(process, 'kill');
+            try {
+                assert.strictEqual(await nextOutput(proc.stdout, closed), 'ready');
+                controller.abort();
+                const error = await result;
+                assert.ok(error instanceof Error);
+                assert.strictEqual(error.name, 'AbortError');
+                assert.strictEqual(proc.killed, true);
+                assert.strictEqual(kill.withArgs(proc.pid).callCount, 0);
+            } finally {
+                kill.restore();
+                controller.abort();
+                if (proc.exitCode === null && proc.signalCode === null) proc.kill('SIGKILL');
+                await closed;
+                service.dispose();
+            }
+        });
+
         for (const stop of ['observable disposal', 'raw child kill']) {
             test(`shutdown retries after a child handles the first ${stop} signal`, async () => {
                 const handles = new Set<IDisposable>();

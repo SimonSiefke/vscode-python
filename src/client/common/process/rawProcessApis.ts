@@ -107,7 +107,18 @@ export function shellExec(
             }
         };
         const proc = exec(command, shellOptions, callback); // NOSONAR
-        trackProcess(proc, { dispose: () => stopProcess(proc) }, disposables);
+        trackProcess(
+            proc,
+            {
+                dispose: () => {
+                    // exec may have already signaled the child before rejecting.
+                    if (!proc.killed) {
+                        stopProcess(proc);
+                    }
+                },
+            },
+            disposables,
+        );
     });
 }
 
