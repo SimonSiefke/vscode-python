@@ -28,7 +28,7 @@ import { ensureTerminalLegacy } from '../../envExt/api.legacy';
 export class TerminalService implements ITerminalService, Disposable {
     private terminal?: Terminal;
     private terminalShellType!: TerminalShellType;
-    private terminalClosed = new EventEmitter<void>();
+    private readonly terminalClosed = new EventEmitter<void>();
     private terminalManager: ITerminalManager;
     private terminalHelper: ITerminalHelper;
     private terminalActivator: ITerminalActivator;
@@ -40,9 +40,7 @@ export class TerminalService implements ITerminalService, Disposable {
     private isReplReady: boolean = false;
     private replPromptListener?: Disposable;
     private replShellTypeListener?: Disposable;
-    public get onDidCloseTerminal(): Event<void> {
-        return this.terminalClosed.event.bind(this.terminalClosed);
-    }
+    public readonly onDidCloseTerminal: Event<void> = this.terminalClosed.event.bind(this.terminalClosed);
 
     constructor(
         @inject(IServiceContainer) private serviceContainer: IServiceContainer,

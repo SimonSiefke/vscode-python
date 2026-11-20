@@ -132,6 +132,7 @@ suite('Terminal Service Factory', () => {
 
         const terminalsAreSameForWorkspaceA = terminalForFile1A.terminalService === terminalForFile2A.terminalService;
         expect(terminalsAreSameForWorkspaceA).to.equal(true, 'Instances are not the same for Workspace A');
+        expect(terminalForFile1A.onDidCloseTerminal).to.equal(terminalForFile2A.onDidCloseTerminal);
 
         const terminalsForWorkspaceABAreDifferent =
             terminalForFile1A.terminalService === terminalForFileB.terminalService;
@@ -139,6 +140,7 @@ suite('Terminal Service Factory', () => {
             false,
             'Instances should be different for different workspaces',
         );
+        expect(terminalForFile1A.onDidCloseTerminal).to.not.equal(terminalForFileB.onDidCloseTerminal);
     });
 
     test('When `newTerminalPerFile` is true, ensure different terminal is returned when using different resources from the same workspace', () => {

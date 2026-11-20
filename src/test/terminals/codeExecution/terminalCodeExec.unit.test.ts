@@ -5,7 +5,7 @@ import { expect } from 'chai';
 import * as path from 'path';
 import { SemVer } from 'semver';
 import * as TypeMoq from 'typemoq';
-import { Disposable, EventEmitter, Terminal, ThemeIcon, Uri, WorkspaceFolder } from 'vscode';
+import { Disposable, Event, EventEmitter, Terminal, ThemeIcon, Uri, WorkspaceFolder } from 'vscode';
 import {
     IApplicationShell,
     ICommandManager,
@@ -23,6 +23,7 @@ import {
     TerminalCreationOptions,
 } from '../../../client/common/terminal/types';
 import { IConfigurationService, IPythonSettings, ITerminalSettings } from '../../../client/common/types';
+import { createDeferred } from '../../../client/common/utils/async';
 import { noop } from '../../../client/common/utils/misc';
 import { Conda, CONDA_RUN_VERSION } from '../../../client/pythonEnvironments/common/environmentManagers/conda';
 import { DjangoShellCodeExecutionProvider } from '../../../client/terminals/codeExecution/djangoShellCodeExecution';
@@ -47,31 +48,50 @@ suite('Terminal - REPL lifetime', () => {
 
     function createExecutor() {
         const sandbox = sinon.createSandbox();
-        const closeListeners = new Set<() => void>();
         const disposables: Disposable[] = [];
         const dataWritten = new EventEmitter<TerminalDataWriteEvent>();
         const terminal = TypeMoq.Mock.ofType<Terminal>();
-        const service = TypeMoq.Mock.ofType<ITerminalService>();
-        const factory = TypeMoq.Mock.ofType<ITerminalServiceFactory>();
+        const services = new Map<string | undefined, ITerminalService>();
+        const factory: ITerminalServiceFactory = {
+            getTerminalService: ({ resource }) => ({ ...services.get(resource?.fsPath)! }),
+            createTerminalService: () => {
+                throw new Error('Expected a cached terminal service');
+            },
+        };
         const applicationShell = TypeMoq.Mock.ofType<IApplicationShell>();
-        factory.setup((f) => f.getTerminalService(TypeMoq.It.isAny())).returns(() => service.object);
         applicationShell.setup((s) => s.onDidWriteTerminalData).returns(() => dataWritten.event);
-        service
-            .setup((s) => s.onDidCloseTerminal(TypeMoq.It.isAny()))
-            .returns((listener: () => void) => {
-                closeListeners.add(listener);
-                return new Disposable(() => closeListeners.delete(listener));
-            });
-        const sendCommand = sandbox.spy(async () => {
+
+        function firePrompt() {
             dataWritten.fire({ terminal: terminal.object, data: '>>> ' });
-        });
-        service.setup((s) => s.sendCommand(TypeMoq.It.isAny(), TypeMoq.It.isAny())).returns(sendCommand);
+        }
+
+        function createTerminalOwner(resource?: Uri) {
+            const closeListeners = new Map<() => void, sinon.SinonSpy>();
+            const onDidCloseTerminal: Event<void> = (listener) => {
+                const disposable = new Disposable(() => closeListeners.delete(listener));
+                closeListeners.set(listener, sandbox.spy(disposable, 'dispose'));
+                return disposable;
+            };
+            const sendCommand = sandbox.stub().callsFake(async () => firePrompt());
+            const show = sandbox.spy(async () => undefined);
+            services.set(resource?.fsPath, {
+                onDidCloseTerminal,
+                sendCommand,
+                show,
+                sendText: async () => undefined,
+                executeCommand: async () => undefined,
+                dispose: noop,
+            });
+            return { closeListeners, sendCommand, show };
+        }
+
+        const first = createTerminalOwner();
         const executor = new (class extends TerminalCodeExecutionProvider {
             public async getExecutableInfo() {
                 return buildPythonExecInfo(PYTHON_PATH);
             }
         })(
-            factory.object,
+            factory,
             TypeMoq.Mock.ofType<IConfigurationService>().object,
             TypeMoq.Mock.ofType<IWorkspaceService>().object,
             disposables,
@@ -88,19 +108,20 @@ suite('Terminal - REPL lifetime', () => {
                 sandbox.restore();
             }
         };
-        sandbox.useFakeTimers();
-        return { executor, sendCommand, closeListeners, disposables };
+        const clock = sandbox.useFakeTimers();
+        return { executor, first, disposables, createTerminalOwner, firePrompt, clock };
     }
 
     test('Reusing and closing a REPL keeps its close listener until close', async () => {
-        const { executor, sendCommand, closeListeners, disposables } = createExecutor();
+        const { executor, first, disposables } = createExecutor();
+        const { closeListeners, sendCommand } = first;
         await executor.initializeRepl(undefined);
         const registeredDisposables = disposables.length;
         expect(closeListeners.size).to.equal(1);
-        const [closeListener] = closeListeners;
+        const [[closeListener, disposeListener]] = closeListeners;
 
         await executor.initializeRepl(undefined);
-        expect([...closeListeners]).to.deep.equal([closeListener]);
+        expect([...closeListeners.keys()]).to.deep.equal([closeListener]);
         expect(sendCommand.callCount).to.equal(1);
 
         closeListener();
@@ -108,23 +129,88 @@ suite('Terminal - REPL lifetime', () => {
 
         await executor.initializeRepl(undefined);
         expect(closeListeners.size).to.equal(1);
+        expect(disposeListener.callCount).to.equal(1);
         expect(sendCommand.callCount).to.equal(2);
         expect(disposables.length).to.equal(registeredDisposables);
-        [...closeListeners].forEach((listener) => listener());
+        const [replacementListener] = closeListeners.keys();
+        replacementListener();
         expect(closeListeners.size).to.equal(0);
     });
 
     test('Session disposal releases the close listener of a reopened REPL', async () => {
-        const { executor, closeListeners, disposables } = createExecutor();
+        const { executor, first, disposables } = createExecutor();
+        const { closeListeners } = first;
         await executor.initializeRepl(undefined);
         expect(closeListeners.size).to.equal(1);
-        [...closeListeners].forEach((listener) => listener());
+        const [closeListener] = closeListeners.keys();
+        closeListener();
         expect(closeListeners.size).to.equal(0);
 
         await executor.initializeRepl(undefined);
         expect(closeListeners.size).to.equal(1);
         disposables.forEach((disposable) => disposable.dispose());
         expect(closeListeners.size).to.equal(0);
+    });
+
+    test('Closing before the first prompt releases the listener while a replacement starts', async () => {
+        const { executor, first, disposables, firePrompt, clock } = createExecutor();
+        const { closeListeners, sendCommand, show } = first;
+        const firstLaunch = createDeferred();
+        const replacementLaunch = createDeferred();
+        sendCommand.onFirstCall().callsFake(async () => firstLaunch.resolve());
+        sendCommand.onSecondCall().callsFake(async () => replacementLaunch.resolve());
+
+        const initialStartup = executor.initializeRepl(undefined);
+        await firstLaunch.promise;
+        expect(closeListeners.size).to.equal(1);
+        const [[closeListener, disposeListener]] = closeListeners;
+        closeListener();
+        expect(closeListeners.size).to.equal(0);
+        expect(disposeListener.callCount).to.equal(1);
+
+        const replacementStartup = executor.initializeRepl(undefined);
+        await replacementLaunch.promise;
+        expect(closeListeners.size).to.equal(1);
+        const [replacementListener] = closeListeners.keys();
+        const reuse = executor.initializeRepl(undefined);
+        firePrompt();
+        await clock.runAllAsync();
+        await Promise.all([initialStartup, replacementStartup, reuse]);
+
+        expect([...closeListeners.keys()]).to.deep.equal([replacementListener]);
+        expect(sendCommand.callCount).to.equal(2);
+        expect(show.callCount).to.equal(1);
+        disposables.forEach((disposable) => disposable.dispose());
+        expect(closeListeners.size).to.equal(0);
+        expect(disposeListener.callCount).to.equal(1);
+    });
+
+    test('REPL readiness and close listeners are independent for different terminal owners', async () => {
+        const { executor, first, disposables, createTerminalOwner } = createExecutor();
+        const resource = Uri.file('second.py');
+        const second = createTerminalOwner(resource);
+
+        await Promise.all([executor.initializeRepl(undefined), executor.initializeRepl(resource)]);
+        expect(first.sendCommand.callCount).to.equal(1);
+        expect(second.sendCommand.callCount).to.equal(1);
+        expect(first.closeListeners.size).to.equal(1);
+        expect(second.closeListeners.size).to.equal(1);
+
+        const [closeFirst] = first.closeListeners.keys();
+        const [closeSecond] = second.closeListeners.keys();
+        closeFirst();
+        await executor.initializeRepl(resource);
+        expect(first.closeListeners.size).to.equal(0);
+        expect([...second.closeListeners.keys()]).to.deep.equal([closeSecond]);
+        expect(second.sendCommand.callCount).to.equal(1);
+        expect(second.show.callCount).to.equal(1);
+
+        await executor.initializeRepl(undefined);
+        expect(first.sendCommand.callCount).to.equal(2);
+        expect(first.closeListeners.size).to.equal(1);
+        disposables.forEach((disposable) => disposable.dispose());
+        expect(first.closeListeners.size).to.equal(0);
+        expect(second.closeListeners.size).to.equal(0);
     });
 });
 
@@ -163,6 +249,8 @@ suite('Terminal - Code Execution', () => {
             terminalFactory = TypeMoq.Mock.ofType<ITerminalServiceFactory>();
             terminalSettings = TypeMoq.Mock.ofType<ITerminalSettings>();
             terminalService = TypeMoq.Mock.ofType<ITerminalService>();
+            const onDidCloseTerminal: Event<void> = () => new Disposable(noop);
+            terminalService.setup((s) => s.onDidCloseTerminal).returns(() => onDidCloseTerminal);
             const configService = TypeMoq.Mock.ofType<IConfigurationService>();
             workspace = TypeMoq.Mock.ofType<IWorkspaceService>();
             platform = TypeMoq.Mock.ofType<IPlatformService>();
