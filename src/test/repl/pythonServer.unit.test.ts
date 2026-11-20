@@ -7,9 +7,11 @@ import { EventEmitter } from 'events';
 import { PassThrough } from 'stream';
 import * as sinon from 'sinon';
 import * as rpc from 'vscode-jsonrpc/node';
+import { NotebookCell, NotebookController, NotebookDocument, notebooks } from 'vscode';
 import * as windowApis from '../../client/common/vscodeApis/windowApis';
 import { createDeferred } from '../../client/common/utils/async';
 import { createPythonServer, ExecutionResult, PythonServer } from '../../client/repl/pythonServer';
+import { createReplController } from '../../client/repl/replController';
 
 suite('Native REPL Python server lifetime', () => {
     const createRealConnection = rpc.createMessageConnection;
@@ -173,7 +175,7 @@ suite('Native REPL Python server lifetime', () => {
         sinon.assert.calledOnce(idle);
     });
 
-    test('idle is reported after all cells in an execution batch', async () => {
+    test('the controller keeps the server busy until both cells in a batch finish', async () => {
         const first = createDeferred<ExecutionResult>();
         const second = createDeferred<ExecutionResult>();
         const secondStarted = createDeferred();
@@ -185,18 +187,33 @@ suite('Native REPL Python server lifetime', () => {
         const server = startServer();
         const idle = sinon.spy();
         server.onDidBecomeIdle(idle);
-
-        const batch = server.runWhileBusy(async () => {
-            await server.execute('first');
-            await server.execute('second');
+        const end = sinon.spy();
+        const createCellExecution = sinon.stub().returns({
+            start: () => undefined,
+            replaceOutput: () => Promise.resolve(),
+            end,
         });
+        const vscodeController = ({
+            createNotebookCellExecution: createCellExecution,
+        } as unknown) as NotebookController;
+        sinon.stub(notebooks, 'createNotebookController').returns(vscodeController);
+        const controller = createReplController(server);
+        const notebook = {} as NotebookDocument;
+        const cells = ['first', 'second'].map(
+            (code) => ({ notebook, document: { getText: () => code } } as NotebookCell),
+        );
+
+        const batch = controller.executeHandler(cells, notebook, controller);
         first.resolve({ status: true, output: 'first' });
         await secondStarted.promise;
+        sinon.assert.calledOnce(end);
         sinon.assert.notCalled(idle);
 
         second.resolve({ status: true, output: 'second' });
         await batch;
+        sinon.assert.calledTwice(end);
         assert.strictEqual(server.isExecuting, false);
         sinon.assert.calledOnce(idle);
+        assert.strictEqual(end.secondCall.calledBefore(idle.firstCall), true);
     });
 });

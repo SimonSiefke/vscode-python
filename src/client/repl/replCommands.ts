@@ -69,22 +69,24 @@ export async function registerReplCommands(
             if (!editor || session.disposed) {
                 return;
             }
-            const isCurrentSource = () =>
-                !session.disposed && !editor.document.isClosed && getActiveTextEditor() === editor;
+            const { document, selection } = editor;
+            const sourceVersion = document.version;
+            const isCurrentDocument = () =>
+                !session.disposed &&
+                !document.isClosed &&
+                document.version === sourceVersion &&
+                getActiveTextEditor() === editor;
+            const isCurrentSelection = () => isCurrentDocument() && editor.selection.isEqual(selection);
             const code = await getSelectedTextToExecute(editor);
-            if (!code?.trim() || !isCurrentSource()) {
+            if (!code?.trim() || !isCurrentSelection()) {
                 return;
             }
-            const interpreter = await getActiveInterpreter(uri, interpreterService, isCurrentSource);
-            if (!interpreter || !isCurrentSource()) {
+            const interpreter = await getActiveInterpreter(uri, interpreterService, isCurrentSelection);
+            if (!interpreter || !isCurrentSelection()) {
                 return;
             }
-            const normalizedCode = await executionHelper.normalizeLines(
-                code,
-                ReplType.native,
-                editor.document.getText(),
-            );
-            if (!normalizedCode.trim() || !isCurrentSource()) {
+            const normalizedCode = await executionHelper.normalizeLines(code, ReplType.native, document.getText());
+            if (!normalizedCode.trim() || !isCurrentDocument()) {
                 return;
             }
 

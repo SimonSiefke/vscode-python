@@ -1,6 +1,6 @@
 // Create test suite and test cases for the `replUtils` module
 import * as TypeMoq from 'typemoq';
-import { commands, Disposable, TextDocument, TextEditor, Uri } from 'vscode';
+import { commands, Disposable, Selection, TextDocument, TextEditor, Uri } from 'vscode';
 import * as sinon from 'sinon';
 import { expect } from 'chai';
 import { IInterpreterService } from '../../client/interpreter/contracts';
@@ -12,6 +12,7 @@ import * as nativeRepl from '../../client/repl/nativeRepl';
 import * as windowApis from '../../client/common/vscodeApis/windowApis';
 import { Commands } from '../../client/common/constants';
 import { PythonEnvironment } from '../../client/pythonEnvironments/info';
+import { createDeferred } from '../../client/common/utils/async';
 
 suite('REPL - register native repl command', () => {
     let interpreterService: TypeMoq.IMock<IInterpreterService>;
@@ -165,14 +166,21 @@ suite('REPL - register native repl command', () => {
     function mockSelection(code: string, normalizedCode?: string) {
         const editor = TypeMoq.Mock.ofType<TextEditor>();
         const document = TypeMoq.Mock.ofType<TextDocument>();
+        let version = 1;
+        const selection = new Selection(0, 0, 0, 0);
         document.setup((d) => d.isClosed).returns(() => false);
         document.setup((d) => d.getText()).returns(() => code);
+        document.setup((d) => d.version).returns(() => version);
         editor.setup((e) => e.document).returns(() => document.object);
+        editor.setup((e) => e.selection).returns(() => selection);
         sinon.stub(windowApis, 'getActiveTextEditor').returns(editor.object);
         sinon.stub(replUtils, 'getSelectedTextToExecute').resolves(code);
         executionHelper
             .setup((helper) => helper.normalizeLines(code, TypeMoq.It.isAny(), code))
             .returns(() => Promise.resolve(normalizedCode ?? code));
+        return () => {
+            version += 1;
+        };
     }
 
     test('does not acquire a Native REPL without an editor', async () => {
@@ -223,6 +231,32 @@ suite('REPL - register native repl command', () => {
         await commandHandler(uri);
 
         sinon.assert.calledOnceWithExactly(executeCommand, Commands.TriggerEnvironmentSelection, uri);
+        executionHelper.verify(
+            (helper) => helper.normalizeLines(TypeMoq.It.isAny(), TypeMoq.It.isAny(), TypeMoq.It.isAny()),
+            TypeMoq.Times.never(),
+        );
+        sinon.assert.notCalled(useRepl);
+    });
+
+    test('does not normalize or send stale code after editing the same source during interpreter lookup', async () => {
+        const interpreter = { path: '/python' } as PythonEnvironment;
+        const findingInterpreter = createDeferred();
+        const interpreterResult = createDeferred<PythonEnvironment>();
+        interpreterService
+            .setup((i) => i.getActiveInterpreter(TypeMoq.It.isAny()))
+            .returns(() => {
+                findingInterpreter.resolve();
+                return interpreterResult.promise;
+            });
+        const changeDocument = mockSelection('print("old")');
+        const { commandHandler, useRepl } = await registerShiftEnter();
+
+        const pending = commandHandler(Uri.file('/workspace/source.py'));
+        await findingInterpreter.promise;
+        changeDocument();
+        interpreterResult.resolve(interpreter);
+        await pending;
+
         executionHelper.verify(
             (helper) => helper.normalizeLines(TypeMoq.It.isAny(), TypeMoq.It.isAny(), TypeMoq.It.isAny()),
             TypeMoq.Times.never(),
