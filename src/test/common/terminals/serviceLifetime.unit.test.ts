@@ -27,6 +27,7 @@ suite('Terminal service lifetime', () => {
     let terminals: Terminal[];
     let terminalDisposals: sinon.SinonStub[];
     let terminalShows: sinon.SinonSpy[];
+    let terminalWrites: sinon.SinonSpy[];
     let listenerDisposals: sinon.SinonSpy[];
     let useEnvExtension: sinon.SinonStub;
     let activate: sinon.SinonStub;
@@ -36,10 +37,12 @@ suite('Terminal service lifetime', () => {
     function createTerminal(exitStatus?: Terminal['exitStatus']): Terminal {
         const dispose = sinon.stub();
         const show = sinon.spy();
-        const terminal = ({ dispose, show, exitStatus } as unknown) as Terminal;
+        const sendText = sinon.spy();
+        const terminal = ({ dispose, show, sendText, exitStatus } as unknown) as Terminal;
         terminals.push(terminal);
         terminalDisposals.push(dispose);
         terminalShows.push(show);
+        terminalWrites.push(sendText);
         return terminal;
     }
 
@@ -48,6 +51,7 @@ suite('Terminal service lifetime', () => {
         terminals = [];
         terminalDisposals = [];
         terminalShows = [];
+        terminalWrites = [];
         listenerDisposals = [];
         closed = new EventEmitter<Terminal>();
         useEnvExtension = sinon.stub(envApi, 'useEnvExtension').returns(false);
@@ -240,6 +244,44 @@ suite('Terminal service lifetime', () => {
         assert.deepStrictEqual(activate.args, [[terminals[0]], [terminals[1]]]);
         assert.strictEqual(terminalShows[0].callCount, 0);
         assert.strictEqual(terminalShows[1].callCount, replacementShows);
+    });
+
+    test('closing a terminal during startup skips environment activation', async () => {
+        const service = factory.createTerminalService();
+        const serviceDispose = sinon.spy(service, 'dispose');
+        const opening = assert.rejects(service.show(), /closed/);
+        assert.strictEqual(terminals.length, 1);
+        closed.fire(terminals[0]);
+        await opening;
+
+        sinon.assert.notCalled(activate);
+        sinon.assert.calledOnce(listenerDisposals[0]);
+        const disposalCallsBeforeShutdown = serviceDispose.callCount;
+        await disposeAll(registry);
+        assert.strictEqual(serviceDispose.callCount, disposalCallsBeforeShutdown);
+    });
+
+    test('a second cached caller sends text after environment activation', async () => {
+        const activationStarted = createDeferred<void>();
+        const finishActivation = createDeferred<void>();
+        const activationComplete = sinon.spy();
+        activate.callsFake(async () => {
+            activationStarted.resolve();
+            await finishActivation.promise;
+            activationComplete();
+            return false;
+        });
+
+        const opening = factory.getTerminalService({}).show();
+        await activationStarted.promise;
+        const writing = factory.getTerminalService({}).sendText('print(1)');
+        finishActivation.resolve();
+        await Promise.all([opening, writing]);
+
+        assert.strictEqual(terminals.length, 1);
+        sinon.assert.calledOnce(activate);
+        sinon.assert.calledOnceWithExactly(terminalWrites[0], 'print(1)');
+        sinon.assert.callOrder(activationComplete, terminalWrites[0]);
     });
 
     test('a late REPL command cannot attach listeners to a disposed service', async () => {
