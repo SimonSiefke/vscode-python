@@ -6,33 +6,35 @@
 import * as TypeMoq from 'typemoq';
 import * as sinon from 'sinon';
 import * as vscode from 'vscode';
-import { Disposable, EventEmitter, NotebookDocument, Uri } from 'vscode';
+import { Disposable } from 'vscode';
 import { expect } from 'chai';
+import { createDeferred } from '../../client/common/utils/async';
 
 import { IInterpreterService } from '../../client/interpreter/contracts';
 import { PythonEnvironment } from '../../client/pythonEnvironments/info';
 import * as NativeReplModule from '../../client/repl/nativeRepl';
 import * as persistentState from '../../client/common/persistentState';
 import * as PythonServer from '../../client/repl/pythonServer';
-import * as vscodeWorkspaceApis from '../../client/common/vscodeApis/workspaceApis';
 import * as replController from '../../client/repl/replController';
-import { executeCommand } from '../../client/common/vscodeApis/commandApis';
+import * as replCommandHandler from '../../client/repl/replCommandHandler';
+import * as workspaceApis from '../../client/common/vscodeApis/workspaceApis';
+import * as commandApis from '../../client/common/vscodeApis/commandApis';
+import * as windowApis from '../../client/common/vscodeApis/windowApis';
+import * as replUtils from '../../client/repl/replUtils';
 
 suite('REPL - Native REPL', () => {
     let interpreterService: TypeMoq.IMock<IInterpreterService>;
 
     let disposable: TypeMoq.IMock<Disposable>;
     let disposableArray: Disposable[] = [];
+    let session: NativeReplModule.NativeReplSession;
     let setReplDirectoryStub: sinon.SinonStub;
-    let setReplControllerSpy: sinon.SinonSpy;
     let getWorkspaceStateValueStub: sinon.SinonStub;
     let updateWorkspaceStateValueStub: sinon.SinonStub;
     let createReplControllerStub: sinon.SinonStub;
     let mockNotebookController: any;
 
     setup(() => {
-        (NativeReplModule as any).nativeRepl = undefined;
-
         mockNotebookController = {
             id: 'mockController',
             dispose: sinon.stub(),
@@ -47,14 +49,23 @@ suite('REPL - Native REPL', () => {
             .returns(() => Promise.resolve(({ path: 'ps' } as unknown) as PythonEnvironment));
         disposable = TypeMoq.Mock.ofType<Disposable>();
         disposableArray = [disposable.object];
+        session = NativeReplModule.registerNativeRepl(disposableArray);
 
         createReplControllerStub = sinon.stub(replController, 'createReplController').returns(mockNotebookController);
+        sinon.stub(replCommandHandler, 'openInteractiveREPL').resolves(undefined);
         setReplDirectoryStub = sinon.stub(NativeReplModule.NativeRepl.prototype as any, 'setReplDirectory').resolves();
-        setReplControllerSpy = sinon.spy(NativeReplModule.NativeRepl.prototype, 'setReplController');
+        sinon.stub(PythonServer, 'createPythonServer').callsFake(
+            () =>
+                (({
+                    onCodeExecuted: () => ({ dispose: () => undefined }),
+                    onDidBecomeIdle: () => ({ dispose: () => undefined }),
+                    dispose: () => undefined,
+                } as unknown) as PythonServer.PythonServer),
+        );
         updateWorkspaceStateValueStub = sinon.stub(persistentState, 'updateWorkspaceStateValue').resolves();
     });
 
-    teardown(async () => {
+    teardown(() => {
         disposableArray.forEach((d) => {
             if (d) {
                 d.dispose();
@@ -62,16 +73,14 @@ suite('REPL - Native REPL', () => {
         });
         disposableArray = [];
         sinon.restore();
-        executeCommand('workbench.action.closeActiveEditor');
     });
 
     test('getNativeRepl should call create constructor', async () => {
-        const createMethodStub = sinon.stub(NativeReplModule.NativeRepl, 'create');
-        interpreterService
-            .setup((i) => i.getActiveInterpreter(TypeMoq.It.isAny()))
-            .returns(() => Promise.resolve(({ path: 'ps' } as unknown) as PythonEnvironment));
         const interpreter = await interpreterService.object.getActiveInterpreter();
-        await NativeReplModule.getNativeRepl(interpreter as PythonEnvironment, disposableArray);
+        const instance = await NativeReplModule.NativeRepl.create(interpreter as PythonEnvironment);
+        disposableArray.push(instance);
+        const createMethodStub = sinon.stub(NativeReplModule.NativeRepl, 'create').resolves(instance);
+        await NativeReplModule.getNativeRepl(interpreter as PythonEnvironment, session);
 
         expect(createMethodStub.calledOnce).to.be.true;
     });
@@ -82,9 +91,9 @@ suite('REPL - Native REPL', () => {
             .setup((i) => i.getActiveInterpreter(TypeMoq.It.isAny()))
             .returns(() => Promise.resolve(({ path: 'ps' } as unknown) as PythonEnvironment));
         const interpreter = await interpreterService.object.getActiveInterpreter();
-        const nativeRepl = await NativeReplModule.getNativeRepl(interpreter as PythonEnvironment, disposableArray);
+        const nativeRepl = await NativeReplModule.getNativeRepl(interpreter as PythonEnvironment, session);
 
-        nativeRepl.sendToNativeRepl(undefined, false);
+        await nativeRepl.sendToNativeRepl(undefined, false);
 
         expect(getWorkspaceStateValueStub.calledOnce).to.be.true;
     });
@@ -95,33 +104,33 @@ suite('REPL - Native REPL', () => {
             .setup((i) => i.getActiveInterpreter(TypeMoq.It.isAny()))
             .returns(() => Promise.resolve(({ path: 'ps' } as unknown) as PythonEnvironment));
         const interpreter = await interpreterService.object.getActiveInterpreter();
-        const nativeRepl = await NativeReplModule.getNativeRepl(interpreter as PythonEnvironment, disposableArray);
+        const nativeRepl = await NativeReplModule.getNativeRepl(interpreter as PythonEnvironment, session);
 
-        nativeRepl.sendToNativeRepl(undefined, false);
+        await nativeRepl.sendToNativeRepl(undefined, false);
 
         expect(updateWorkspaceStateValueStub.calledOnce).to.be.true;
     });
 
-    test('create should call setReplDirectory, setReplController', async () => {
+    test('create should set the directory and create the controller', async () => {
         const interpreter = await interpreterService.object.getActiveInterpreter();
         interpreterService
             .setup((i) => i.getActiveInterpreter(TypeMoq.It.isAny()))
             .returns(() => Promise.resolve(({ path: 'ps' } as unknown) as PythonEnvironment));
 
-        await NativeReplModule.NativeRepl.create(interpreter as PythonEnvironment);
+        disposableArray.push(await NativeReplModule.NativeRepl.create(interpreter as PythonEnvironment));
 
         expect(setReplDirectoryStub.calledOnce).to.be.true;
-        expect(setReplControllerSpy.calledOnce).to.be.true;
         expect(createReplControllerStub.calledOnce).to.be.true;
     });
 
     test('createReplController should publish stdout notebook output for REPL execution', async () => {
+        const runWhileBusy = sinon.spy((run: () => Promise<void>) => run());
         const mockServer = {
             interrupt: sinon.stub(),
             execute: sinon.stub().resolves({ status: true, output: 'hello\nworld' }),
+            runWhileBusy,
             dispose: sinon.stub(),
         } as any;
-        const createPythonServerStub = sinon.stub(PythonServer, 'createPythonServer').returns(mockServer as any);
 
         const replaceOutputStub = sinon.stub();
         const execStub = {
@@ -145,15 +154,13 @@ suite('REPL - Native REPL', () => {
         sinon.stub(vscode.notebooks, 'createNotebookController').returns(mockNotebookController);
         createReplControllerStub.restore();
 
-        const disposables: Disposable[] = [];
+        const controller = replController.createReplController(mockServer);
         try {
-            const controller = replController.createReplController('python', disposables, '/cwd');
-
             const mockTextDocument = { getText: sinon.stub().returns('print("hi")') } as any;
             const mockCell = { document: mockTextDocument } as any;
             await (controller.executeHandler as any)([mockCell]);
 
-            expect(createPythonServerStub.calledOnce).to.be.true;
+            sinon.assert.calledOnce(runWhileBusy);
             expect(mockServer.execute.calledOnceWithExactly('print("hi")')).to.be.true;
             expect(createNotebookCellExecutionStub.calledOnce).to.be.true;
             expect(replaceOutputStub.calledOnce).to.be.true;
@@ -168,80 +175,104 @@ suite('REPL - Native REPL', () => {
             const outputText = Buffer.from((output.items[0] as any).data).toString();
             expect(outputText).to.equal('hello\nworld');
         } finally {
-            disposables.forEach((disposable) => disposable.dispose());
+            controller.dispose();
         }
     });
+});
 
-    test('watchNotebookClosed should clean up resources when notebook is closed', async () => {
-        const notebookCloseEmitter = new EventEmitter<NotebookDocument>();
-        sinon.stub(vscodeWorkspaceApis, 'onDidCloseNotebookDocument').callsFake((handler) => {
-            const disposable = notebookCloseEmitter.event(handler);
-            return disposable;
+suite('REPL - cell submission', () => {
+    let closed: boolean;
+    let editor: vscode.NotebookEditor;
+    let applyEdit: sinon.SinonStub;
+    let executeCommand: sinon.SinonStub;
+
+    setup(() => {
+        closed = false;
+        const notebook = TypeMoq.Mock.ofType<vscode.NotebookDocument>();
+        notebook.setup((d) => d.uri).returns(() => vscode.Uri.parse('untitled:repl-test.ipynb'));
+        notebook.setup((d) => d.isClosed).returns(() => closed);
+        notebook.setup((d) => d.cellCount).returns(() => 0);
+        const notebookEditor = TypeMoq.Mock.ofType<vscode.NotebookEditor>();
+        notebookEditor.setup((e) => e.notebook).returns(() => notebook.object);
+        editor = notebookEditor.object;
+
+        applyEdit = sinon.stub(workspaceApis, 'applyEdit');
+        executeCommand = sinon.stub(commandApis, 'executeCommand').resolves();
+    });
+
+    teardown(() => sinon.restore());
+
+    test('executes the inserted cell in the live notebook', async () => {
+        applyEdit.resolves(true);
+        await replCommandHandler.executeNotebookCell(editor, 'print(1)');
+
+        sinon.assert.calledOnce(applyEdit);
+        sinon.assert.calledOnceWithExactly(executeCommand, 'notebook.cell.execute', {
+            document: editor.notebook.uri,
+            ranges: [{ start: 0, end: 1 }],
         });
+    });
 
-        const mockPythonServer = {
-            onCodeExecuted: new EventEmitter<void>().event,
-            execute: sinon.stub().resolves({ status: true, output: 'test output' }),
-            executeSilently: sinon.stub().resolves({ status: true, output: 'test output' }),
-            interrupt: sinon.stub(),
-            input: sinon.stub(),
-            checkValidCommand: sinon.stub().resolves(true),
-            dispose: sinon.stub(),
-            isExecuting: false,
-            isDisposed: false,
-        };
+    test('does not execute a cell when the workspace edit was rejected', async () => {
+        applyEdit.resolves(false);
+        await replCommandHandler.executeNotebookCell(editor, 'print(1)');
 
-        // Track the number of times createPythonServer was called
-        let createPythonServerCallCount = 0;
-        sinon.stub(PythonServer, 'createPythonServer').callsFake(() => {
-            // eslint-disable-next-line no-plusplus
-            createPythonServerCallCount++;
-            return mockPythonServer;
-        });
+        sinon.assert.calledOnce(applyEdit);
+        sinon.assert.notCalled(executeCommand);
+    });
 
-        const interpreter = await interpreterService.object.getActiveInterpreter();
+    test('does not dispatch to a notebook that closed during the workspace edit', async () => {
+        const applied = createDeferred<boolean>();
+        applyEdit.returns(applied.promise);
+        const sending = replCommandHandler.executeNotebookCell(editor, 'print(1)');
+        sinon.assert.calledOnce(applyEdit);
+        closed = true;
+        applied.resolve(true);
+        await sending;
 
-        // Create NativeRepl directly to have more control over its state, go around private constructor.
-        const nativeRepl = new (NativeReplModule.NativeRepl as any)();
-        nativeRepl.interpreter = interpreter as PythonEnvironment;
-        nativeRepl.cwd = '/helloJustMockedCwd/cwd';
-        nativeRepl.pythonServer = mockPythonServer;
-        nativeRepl.replController = mockNotebookController;
-        nativeRepl.disposables = [];
+        sinon.assert.notCalled(executeCommand);
+    });
 
-        // Make the singleton point to our instance for testing
-        // Otherwise, it gets mixed with Native Repl from .create from test above.
-        (NativeReplModule as any).nativeRepl = nativeRepl;
+    test('does not execute an old edit when the REPL owner changed and the notebook stayed open', async () => {
+        const applied = createDeferred<boolean>();
+        applyEdit.returns(applied.promise);
+        let originalOwner = true;
+        const sending = replCommandHandler.executeNotebookCell(editor, 'print(1)', () => originalOwner);
+        sinon.assert.calledOnce(applyEdit);
+        originalOwner = false;
+        applied.resolve(true);
+        await sending;
+        sinon.assert.notCalled(executeCommand);
 
-        // Reset call count after initial setup
-        createPythonServerCallCount = 0;
+        await replCommandHandler.executeNotebookCell(editor, 'print(2)', () => true);
+        sinon.assert.calledOnce(executeCommand);
+    });
+});
 
-        // Set notebookDocument to a mock document
-        const mockReplUri = Uri.parse('untitled:Untitled-999.ipynb?jupyter-notebook');
-        const mockNotebookDocument = ({
-            uri: mockReplUri,
-            toString: () => mockReplUri.toString(),
-        } as unknown) as NotebookDocument;
+suite('REPL - notebook opening', () => {
+    teardown(() => sinon.restore());
 
-        nativeRepl.notebookDocument = mockNotebookDocument;
+    test('opening a document after owner shutdown cannot show its old REPL tab', async () => {
+        const opened = createDeferred<vscode.NotebookDocument>();
+        const notebook = {
+            uri: vscode.Uri.parse('untitled:repl-test.ipynb'),
+            isClosed: false,
+        } as vscode.NotebookDocument;
+        const editor = { notebook } as vscode.NotebookEditor;
+        const openDocument = sinon.stub(workspaceApis, 'openNotebookDocument').returns(opened.promise);
+        const showDocument = sinon.stub(windowApis, 'showNotebookDocument').resolves(editor);
+        sinon.stub(replUtils, 'getTabNameForUri').returns('Python REPL');
 
-        // Create a mock notebook document for closing event with same URI
-        const closingNotebookDocument = ({
-            uri: mockReplUri,
-            toString: () => mockReplUri.toString(),
-        } as unknown) as NotebookDocument;
+        let isCurrent = true;
+        const abandonedOpen = replCommandHandler.openInteractiveREPL(undefined, false, () => isCurrent);
+        sinon.assert.calledOnceWithExactly(openDocument, 'jupyter-notebook');
+        isCurrent = false;
+        opened.resolve(notebook);
+        expect(await abandonedOpen).to.be.undefined;
+        sinon.assert.notCalled(showDocument);
 
-        notebookCloseEmitter.fire(closingNotebookDocument);
-        await new Promise((resolve) => setTimeout(resolve, 50));
-
-        expect(
-            updateWorkspaceStateValueStub.calledWith(NativeReplModule.NATIVE_REPL_URI_MEMENTO, undefined),
-            'updateWorkspaceStateValue should be called with NATIVE_REPL_URI_MEMENTO and undefined',
-        ).to.be.true;
-        expect(mockPythonServer.dispose.calledOnce, 'pythonServer.dispose() should be called once').to.be.true;
-        expect(createPythonServerCallCount, 'createPythonServer should be called to create a new server').to.equal(1);
-        expect(nativeRepl.notebookDocument, 'notebookDocument should be undefined after closing').to.be.undefined;
-        expect(nativeRepl.newReplSession, 'newReplSession should be set to true after closing').to.be.true;
-        expect(mockNotebookController.dispose.calledOnce, 'replController.dispose() should be called once').to.be.true;
+        const liveOpen = await replCommandHandler.openInteractiveREPL(undefined, false, () => true);
+        expect(liveOpen?.notebookEditor).to.equal(editor);
+        sinon.assert.calledOnce(showDocument);
     });
 });

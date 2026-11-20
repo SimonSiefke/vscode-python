@@ -44,6 +44,7 @@ import { initializePersistentStateForTriggers } from './common/persistentState';
 import { DebuggerTypeName } from './debugger/constants';
 import { StopWatch } from './common/utils/stopWatch';
 import { registerReplCommands, registerReplExecuteOnEnter, registerStartNativeReplCommand } from './repl/replCommands';
+import { registerNativeRepl } from './repl/nativeRepl';
 import { registerTriggerForTerminalREPL } from './terminals/codeExecution/terminalReplWatcher';
 import { registerPythonStartup } from './terminals/pythonStartup';
 import { registerPixiFeatures } from './pythonEnvironments/common/environmentManagers/pixi';
@@ -104,9 +105,10 @@ export function activateFeatures(ext: ExtensionState, _components: Components): 
     const executionHelper = ext.legacyIOC.serviceContainer.get<ICodeExecutionHelper>(ICodeExecutionHelper);
     const commandManager = ext.legacyIOC.serviceContainer.get<ICommandManager>(ICommandManager);
     registerTriggerForTerminalREPL(ext.disposables);
-    registerStartNativeReplCommand(ext.disposables, interpreterService);
-    registerReplCommands(ext.disposables, interpreterService, executionHelper, commandManager);
-    registerReplExecuteOnEnter(ext.disposables, interpreterService, commandManager);
+    const replSession = registerNativeRepl(ext.disposables);
+    registerStartNativeReplCommand(ext.disposables, replSession, interpreterService);
+    registerReplCommands(ext.disposables, replSession, interpreterService, executionHelper, commandManager);
+    registerReplExecuteOnEnter(ext.disposables, replSession, interpreterService, commandManager);
     registerCustomTerminalLinkProvider(ext.disposables);
 }
 

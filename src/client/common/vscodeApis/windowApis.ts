@@ -25,6 +25,7 @@ import {
     NotebookDocument,
     NotebookEditor,
     NotebookDocumentShowOptions,
+    InputBoxOptions,
     Terminal,
 } from 'vscode';
 import { createDeferred, Deferred } from '../utils/async';
@@ -33,6 +34,10 @@ import { getWorkspaceFolders } from './workspaceApis';
 
 export function showTextDocument(uri: Uri): Thenable<TextEditor> {
     return window.showTextDocument(uri);
+}
+
+export function showInputBox(options: InputBoxOptions, token: CancellationToken): Thenable<string | undefined> {
+    return window.showInputBox(options, token);
 }
 
 export function showNotebookDocument(
@@ -115,6 +120,10 @@ export function withProgress<R>(
 export function getActiveTextEditor(): TextEditor | undefined {
     const { activeTextEditor } = window;
     return activeTextEditor;
+}
+
+export function getActiveNotebookEditor(): NotebookEditor | undefined {
+    return window.activeNotebookEditor;
 }
 
 export function onDidChangeActiveTextEditor(handler: (e: TextEditor | undefined) => void): Disposable {

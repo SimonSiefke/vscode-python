@@ -1,14 +1,16 @@
 import * as path from 'path';
 import * as ch from 'child_process';
 import * as rpc from 'vscode-jsonrpc/node';
-import { Disposable, Event, EventEmitter, window } from 'vscode';
+import { CancellationTokenSource, Disposable, Event, EventEmitter } from 'vscode';
 import { EXTENSION_ROOT_DIR } from '../constants';
 import { traceError, traceLog } from '../logging';
 import { captureTelemetry } from '../telemetry';
 import { EventName } from '../telemetry/constants';
+import { dispose } from '../common/utils/resourceLifecycle';
+import { showInputBox } from '../common/vscodeApis/windowApis';
 
 const SERVER_PATH = path.join(EXTENSION_ROOT_DIR, 'python_files', 'python_server.py');
-let serverInstance: PythonServer | undefined;
+const SERVER_EXIT_TIMEOUT_MS = 1000;
 export interface ExecutionResult {
     status: boolean;
     output: string;
@@ -16,8 +18,10 @@ export interface ExecutionResult {
 
 export interface PythonServer extends Disposable {
     onCodeExecuted: Event<void>;
+    onDidBecomeIdle: Event<void>;
     readonly isExecuting: boolean;
     readonly isDisposed: boolean;
+    runWhileBusy<T>(request: () => Promise<T>): Promise<T>;
     execute(code: string): Promise<ExecutionResult | undefined>;
     executeSilently(code: string): Promise<ExecutionResult | undefined>;
     interrupt(): void;
@@ -31,6 +35,12 @@ class PythonServerImpl implements PythonServer, Disposable {
     private readonly _onCodeExecuted = new EventEmitter<void>();
 
     onCodeExecuted = this._onCodeExecuted.event;
+
+    private readonly _onDidBecomeIdle = new EventEmitter<void>();
+
+    onDidBecomeIdle = this._onDidBecomeIdle.event;
+
+    private readonly inputCancellation = new CancellationTokenSource();
 
     private inFlightRequests = 0;
 
@@ -55,9 +65,11 @@ class PythonServerImpl implements PythonServer, Disposable {
                 traceLog('Log:', message);
             }),
         );
-        this.pythonServer.on('exit', (code) => {
-            traceError(`Python server exited with code ${code}`);
-            this.markDisposed();
+        this.pythonServer.once('exit', (code) => {
+            if (!this.disposed) {
+                traceError(`Python server exited with code ${code}`);
+                this.markDisposed();
+            }
         });
         this.pythonServer.on('error', (err) => {
             traceError(err);
@@ -68,44 +80,43 @@ class PythonServerImpl implements PythonServer, Disposable {
 
     public input(): void {
         // Register input request handler
-        this.connection.onRequest('input', async (request) => {
-            // Ask for user input via popup quick input, send it back to Python
-            let userPrompt = 'Enter your input here: ';
-            if (request && request.prompt) {
-                userPrompt = request.prompt;
-            }
-            const input = await window.showInputBox({
-                title: 'Input Request',
-                prompt: userPrompt,
-                ignoreFocusOut: true,
-            });
-            return { userInput: input };
-        });
+        this.disposables.push(
+            this.connection.onRequest('input', async (request) => {
+                const input = await showInputBox(
+                    {
+                        title: 'Input Request',
+                        prompt: request?.prompt || 'Enter your input here: ',
+                        ignoreFocusOut: true,
+                    },
+                    this.inputCancellation.token,
+                );
+                return { userInput: input };
+            }),
+        );
     }
 
     @captureTelemetry(EventName.EXECUTION_CODE, { scope: 'selection' }, false)
     public async execute(code: string): Promise<ExecutionResult | undefined> {
-        const result = await this.executeCode(code);
-        if (result?.status) {
-            this._onCodeExecuted.fire();
-        }
-        return result;
+        return this.runWhileBusy(async () => {
+            const result = await this.executeCode(code);
+            if (result?.status) {
+                this._onCodeExecuted.fire();
+            }
+            return result;
+        });
     }
 
     public executeSilently(code: string): Promise<ExecutionResult | undefined> {
-        return this.executeCode(code);
+        return this.runWhileBusy(() => this.executeCode(code));
     }
 
     private async executeCode(code: string): Promise<ExecutionResult | undefined> {
-        this.inFlightRequests += 1;
         try {
             const result = await this.connection.sendRequest('execute', code);
             return result as ExecutionResult;
         } catch (err) {
             const error = err as Error;
             traceError(`Error getting response from REPL server:`, error);
-        } finally {
-            this.inFlightRequests -= 1;
         }
         return undefined;
     }
@@ -118,12 +129,21 @@ class PythonServerImpl implements PythonServer, Disposable {
     }
 
     public async checkValidCommand(code: string): Promise<boolean> {
+        return this.runWhileBusy(async () => {
+            const result: ExecutionResult = await this.connection.sendRequest('check_valid_command', code);
+            return result.output === 'True';
+        });
+    }
+
+    public async runWhileBusy<T>(request: () => Promise<T>): Promise<T> {
         this.inFlightRequests += 1;
         try {
-            const completeCode: ExecutionResult = await this.connection.sendRequest('check_valid_command', code);
-            return completeCode.output === 'True';
+            return await request();
         } finally {
             this.inFlightRequests -= 1;
+            if (!this.disposed && this.inFlightRequests === 0) {
+                this._onDidBecomeIdle.fire();
+            }
         }
     }
 
@@ -131,11 +151,19 @@ class PythonServerImpl implements PythonServer, Disposable {
         if (this.disposed) {
             return;
         }
-        this.disposed = true;
-        this.connection.sendNotification('exit');
-        this.disposables.forEach((d) => d.dispose());
-        this.connection.dispose();
-        serverInstance = undefined;
+        // Python can only handle the exit request after running user code returns.
+        const child = this.pythonServer;
+        const killTimer = setTimeout(() => child.kill('SIGKILL'), SERVER_EXIT_TIMEOUT_MS);
+        killTimer.unref();
+        child.once('exit', () => clearTimeout(killTimer));
+
+        try {
+            this.connection.sendNotification('exit').catch((error) => traceLog('Python REPL shutdown:', error));
+        } catch (error) {
+            traceLog('Python REPL shutdown:', error);
+        } finally {
+            this.markDisposed();
+        }
     }
 
     private markDisposed(): void {
@@ -143,26 +171,27 @@ class PythonServerImpl implements PythonServer, Disposable {
             return;
         }
         this.disposed = true;
-        this.connection.dispose();
-        serverInstance = undefined;
+        this.inputCancellation.cancel();
+        dispose([
+            ...this.disposables.splice(0),
+            this.inputCancellation,
+            this.connection,
+            this._onCodeExecuted,
+            this._onDidBecomeIdle,
+        ]);
     }
 }
 
 export function createPythonServer(interpreter: string[], cwd?: string): PythonServer {
-    if (serverInstance && !serverInstance.isDisposed) {
-        return serverInstance;
-    }
-
     const pythonServer = ch.spawn(interpreter[0], [...interpreter.slice(1), SERVER_PATH], {
         cwd, // Launch with correct workspace directory
     });
     pythonServer.stderr.on('data', (data) => {
         traceError(data.toString());
     });
-    const connection = rpc.createMessageConnection(
-        new rpc.StreamMessageReader(pythonServer.stdout),
-        new rpc.StreamMessageWriter(pythonServer.stdin),
-    );
-    serverInstance = new PythonServerImpl(connection, pythonServer);
-    return serverInstance;
+    const reader = new rpc.StreamMessageReader(pythonServer.stdout);
+    // There is no partial-message listener, and the reader can retain an incomplete frame after disposal.
+    reader.partialMessageTimeout = 0;
+    const connection = rpc.createMessageConnection(reader, new rpc.StreamMessageWriter(pythonServer.stdin));
+    return new PythonServerImpl(connection, pythonServer);
 }

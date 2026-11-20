@@ -1,14 +1,7 @@
 import * as vscode from 'vscode';
-import { createPythonServer } from './pythonServer';
+import { PythonServer } from './pythonServer';
 
-export function createReplController(
-    interpreterPath: string,
-    disposables: vscode.Disposable[],
-    cwd?: string,
-): vscode.NotebookController {
-    const server = createPythonServer([interpreterPath], cwd);
-    disposables.push(server);
-
+export function createReplController(server: PythonServer): vscode.NotebookController {
     const controller = vscode.notebooks.createNotebookController('pythonREPL', 'jupyter-notebook', 'Python REPL');
     controller.supportedLanguages = ['python'];
 
@@ -18,24 +11,27 @@ export function createReplController(
         server.interrupt();
     };
 
-    controller.executeHandler = async (cells) => {
-        for (const cell of cells) {
-            const exec = controller.createNotebookCellExecution(cell);
-            exec.start(Date.now());
+    controller.executeHandler = (cells) =>
+        server.runWhileBusy(async () => {
+            for (const cell of cells) {
+                if (server.isDisposed) {
+                    break;
+                }
+                const exec = controller.createNotebookCellExecution(cell);
+                exec.start(Date.now());
 
-            const code = cell.document.getText();
-            const result = await server.execute(code);
+                const code = cell.document.getText();
+                const result = await server.execute(code);
 
-            if (result?.output) {
-                const stdoutItem = vscode.NotebookCellOutputItem.stdout(result.output);
-                const output = new vscode.NotebookCellOutput([stdoutItem], {});
-                exec.replaceOutput([output]);
-                // TODO: Properly update via NotebookCellOutputItem.error later.
+                if (result?.output) {
+                    const stdoutItem = vscode.NotebookCellOutputItem.stdout(result.output);
+                    const output = new vscode.NotebookCellOutput([stdoutItem], {});
+                    exec.replaceOutput([output]);
+                    // TODO: Properly update via NotebookCellOutputItem.error later.
+                }
+
+                exec.end(result?.status);
             }
-
-            exec.end(result?.status);
-        }
-    };
-    disposables.push(controller);
+        });
     return controller;
 }

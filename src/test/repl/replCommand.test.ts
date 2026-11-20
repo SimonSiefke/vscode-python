@@ -1,6 +1,6 @@
 // Create test suite and test cases for the `replUtils` module
 import * as TypeMoq from 'typemoq';
-import { commands, Disposable, Uri, window } from 'vscode';
+import { commands, Disposable, Selection, TextDocument, TextEditor, Uri } from 'vscode';
 import * as sinon from 'sinon';
 import { expect } from 'chai';
 import { IInterpreterService } from '../../client/interpreter/contracts';
@@ -12,6 +12,7 @@ import * as nativeRepl from '../../client/repl/nativeRepl';
 import * as windowApis from '../../client/common/vscodeApis/windowApis';
 import { Commands } from '../../client/common/constants';
 import { PythonEnvironment } from '../../client/pythonEnvironments/info';
+import { createDeferred } from '../../client/common/utils/async';
 
 suite('REPL - register native repl command', () => {
     let interpreterService: TypeMoq.IMock<IInterpreterService>;
@@ -22,9 +23,9 @@ suite('REPL - register native repl command', () => {
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
     let registerCommandSpy: sinon.SinonSpy;
     let executeInTerminalStub: sinon.SinonStub;
-    let getNativeReplStub: sinon.SinonStub;
     let disposable: TypeMoq.IMock<Disposable>;
     let disposableArray: Disposable[] = [];
+    let session: nativeRepl.NativeReplSession;
 
     setup(() => {
         interpreterService = TypeMoq.Mock.ofType<IInterpreterService>();
@@ -41,6 +42,7 @@ suite('REPL - register native repl command', () => {
         registerCommandSpy = sinon.spy(commandManager.object, 'registerCommand');
         disposable = TypeMoq.Mock.ofType<Disposable>();
         disposableArray = [disposable.object];
+        session = nativeRepl.registerNativeRepl(disposableArray);
     });
 
     teardown(() => {
@@ -61,6 +63,7 @@ suite('REPL - register native repl command', () => {
 
         await replCommands.registerReplCommands(
             disposableArray,
+            session,
             interpreterService.object,
             executionHelper.object,
             commandManager.object,
@@ -91,6 +94,7 @@ suite('REPL - register native repl command', () => {
             });
         replCommands.registerReplCommands(
             disposableArray,
+            session,
             interpreterService.object,
             executionHelper.object,
             commandManager.object,
@@ -123,6 +127,7 @@ suite('REPL - register native repl command', () => {
             });
         replCommands.registerReplCommands(
             disposableArray,
+            session,
             interpreterService.object,
             executionHelper.object,
             commandManager.object,
@@ -135,74 +140,128 @@ suite('REPL - register native repl command', () => {
         sinon.assert.calledOnce(executeInTerminalStub);
     });
 
-    test('Ensure we call getNativeREPL() when interpreter exist', async () => {
-        interpreterService
-            .setup((i) => i.getActiveInterpreter(TypeMoq.It.isAny()))
-            .returns(() => Promise.resolve(({ path: 'ps' } as unknown) as PythonEnvironment));
-        getSendToNativeREPLSettingStub.returns(true);
-        getNativeReplStub = sinon.stub(nativeRepl, 'getNativeRepl');
-
-        let commandHandler: undefined | ((uri: string) => Promise<void>);
+    async function registerShiftEnter() {
+        let commandHandler: ((uri: Uri) => Promise<void>) | undefined;
         commandManager
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            .setup((c) => c.registerCommand as any)
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            .returns(() => (command: string, callback: (...args: any[]) => any, _thisArg?: any) => {
+            .setup((c) => c.registerCommand)
+            .returns(() => (command, callback) => {
                 if (command === Commands.Exec_In_REPL) {
-                    commandHandler = callback;
+                    commandHandler = callback as (uri: Uri) => Promise<void>;
                 }
-                // eslint-disable-next-line no-void
-                return { dispose: () => void 0 };
+                return { dispose: () => undefined };
             });
-        replCommands.registerReplCommands(
+        getSendToNativeREPLSettingStub.returns(true);
+        const useRepl = sinon.stub(nativeRepl, 'withNativeRepl').resolves();
+        await replCommands.registerReplCommands(
             disposableArray,
+            session,
             interpreterService.object,
             executionHelper.object,
             commandManager.object,
         );
+        expect(commandHandler).not.to.be.undefined;
+        return { commandHandler: commandHandler!, useRepl };
+    }
 
-        expect(commandHandler).not.to.be.an('undefined', 'Command handler not initialized');
+    function mockSelection(code: string, normalizedCode?: string) {
+        const editor = TypeMoq.Mock.ofType<TextEditor>();
+        const document = TypeMoq.Mock.ofType<TextDocument>();
+        let version = 1;
+        const selection = new Selection(0, 0, 0, 0);
+        document.setup((d) => d.isClosed).returns(() => false);
+        document.setup((d) => d.getText()).returns(() => code);
+        document.setup((d) => d.version).returns(() => version);
+        editor.setup((e) => e.document).returns(() => document.object);
+        editor.setup((e) => e.selection).returns(() => selection);
+        sinon.stub(windowApis, 'getActiveTextEditor').returns(editor.object);
+        sinon.stub(replUtils, 'getSelectedTextToExecute').resolves(code);
+        executionHelper
+            .setup((helper) => helper.normalizeLines(code, TypeMoq.It.isAny(), code))
+            .returns(() => Promise.resolve(normalizedCode ?? code));
+        return () => {
+            version += 1;
+        };
+    }
 
-        sinon.stub(window, 'activeTextEditor').get(() => undefined);
-        await commandHandler!('uri');
-        sinon.assert.calledOnce(getNativeReplStub);
+    test('does not acquire a Native REPL without an editor', async () => {
+        sinon.stub(windowApis, 'getActiveTextEditor').returns(undefined);
+        const { commandHandler, useRepl } = await registerShiftEnter();
+
+        await commandHandler(Uri.file('/workspace/source.py'));
+
+        sinon.assert.notCalled(useRepl);
     });
 
-    test('Ensure we do not call getNativeREPL() when interpreter does not exist', async () => {
-        getNativeReplStub = sinon.stub(nativeRepl, 'getNativeRepl');
-        getSendToNativeREPLSettingStub.returns(true);
+    test('does not acquire a Native REPL for a blank selection', async () => {
+        mockSelection(' ');
+        const { commandHandler, useRepl } = await registerShiftEnter();
 
+        await commandHandler(Uri.file('/workspace/source.py'));
+
+        sinon.assert.notCalled(useRepl);
+    });
+
+    test('sends normalized code to a Native REPL when an interpreter is available', async () => {
+        const interpreter = { path: '/python' } as PythonEnvironment;
         interpreterService
             .setup((i) => i.getActiveInterpreter(TypeMoq.It.isAny()))
-            .returns(() => Promise.resolve(undefined));
-
-        let commandHandler: undefined | ((uri: string) => Promise<void>);
-        commandManager
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            .setup((c) => c.registerCommand as any)
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            .returns(() => (command: string, callback: (...args: any[]) => any, _thisArg?: any) => {
-                if (command === Commands.Exec_In_REPL) {
-                    commandHandler = callback;
-                }
-                // eslint-disable-next-line no-void
-                return { dispose: () => void 0 };
-            });
-        interpreterService
-            .setup((i) => i.getActiveInterpreter(TypeMoq.It.isAny()))
-            .returns(() => Promise.resolve(undefined));
-
-        replCommands.registerReplCommands(
-            disposableArray,
-            interpreterService.object,
-            executionHelper.object,
-            commandManager.object,
+            .returns(() => Promise.resolve(interpreter));
+        mockSelection('    print(1)', 'print(1)');
+        const { commandHandler, useRepl } = await registerShiftEnter();
+        const send = sinon.stub().resolves();
+        useRepl.callsFake((_interpreter, _session, run) =>
+            run(({ sendToNativeRepl: send } as unknown) as nativeRepl.NativeRepl),
         );
 
-        expect(commandHandler).not.to.be.an('undefined', 'Command handler not initialized');
+        await commandHandler(Uri.file('/workspace/source.py'));
 
-        await commandHandler!('uri');
-        sinon.assert.notCalled(getNativeReplStub);
+        sinon.assert.calledOnceWithExactly(useRepl, interpreter, session, sinon.match.func);
+        sinon.assert.calledOnceWithExactly(send, 'print(1)');
+    });
+
+    test('does not acquire a Native REPL without an interpreter', async () => {
+        interpreterService
+            .setup((i) => i.getActiveInterpreter(TypeMoq.It.isAny()))
+            .returns(() => Promise.resolve(undefined));
+        mockSelection('print(1)');
+        const { commandHandler, useRepl } = await registerShiftEnter();
+        const executeCommand = sinon.stub(commands, 'executeCommand').resolves();
+        const uri = Uri.file('/workspace/source.py');
+
+        await commandHandler(uri);
+
+        sinon.assert.calledOnceWithExactly(executeCommand, Commands.TriggerEnvironmentSelection, uri);
+        executionHelper.verify(
+            (helper) => helper.normalizeLines(TypeMoq.It.isAny(), TypeMoq.It.isAny(), TypeMoq.It.isAny()),
+            TypeMoq.Times.never(),
+        );
+        sinon.assert.notCalled(useRepl);
+    });
+
+    test('does not normalize or send stale code after editing the same source during interpreter lookup', async () => {
+        const interpreter = { path: '/python' } as PythonEnvironment;
+        const findingInterpreter = createDeferred();
+        const interpreterResult = createDeferred<PythonEnvironment>();
+        interpreterService
+            .setup((i) => i.getActiveInterpreter(TypeMoq.It.isAny()))
+            .returns(() => {
+                findingInterpreter.resolve();
+                return interpreterResult.promise;
+            });
+        const changeDocument = mockSelection('print("old")');
+        const { commandHandler, useRepl } = await registerShiftEnter();
+
+        const pending = commandHandler(Uri.file('/workspace/source.py'));
+        await findingInterpreter.promise;
+        changeDocument();
+        interpreterResult.resolve(interpreter);
+        await pending;
+
+        executionHelper.verify(
+            (helper) => helper.normalizeLines(TypeMoq.It.isAny(), TypeMoq.It.isAny(), TypeMoq.It.isAny()),
+            TypeMoq.Times.never(),
+        );
+        sinon.assert.notCalled(useRepl);
     });
 });
 
