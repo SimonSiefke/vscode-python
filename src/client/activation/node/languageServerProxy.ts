@@ -7,6 +7,7 @@ import {
     Disposable,
     LanguageClient,
     LanguageClientOptions,
+    State,
 } from 'vscode-languageclient/node';
 
 import { Extension } from 'vscode';
@@ -17,6 +18,7 @@ import { captureTelemetry, sendTelemetryEvent } from '../../telemetry';
 import { EventName } from '../../telemetry/constants';
 import { FileBasedCancellationStrategy } from '../common/cancellationUtils';
 import { ProgressReporting } from '../progress';
+import { LanguageServerClient } from '../common/languageServerClient';
 import { ILanguageClientFactory, ILanguageServerProxy } from '../types';
 import { traceDecoratorError, traceDecoratorVerbose, traceError } from '../../logging';
 import { IWorkspaceService } from '../../common/application/types';
@@ -50,9 +52,15 @@ namespace GetExperimentValue {
 }
 
 export class NodeLanguageServerProxy implements ILanguageServerProxy {
-    public languageClient: LanguageClient | undefined;
+    public languageClient: LanguageServerClient | undefined;
 
     private cancellationStrategy: FileBasedCancellationStrategy | undefined;
+
+    private startingClient?: LanguageServerClient;
+
+    private stopping?: Promise<void>;
+
+    private closed = false;
 
     private readonly disposables: Disposable[] = [];
 
@@ -77,7 +85,7 @@ export class NodeLanguageServerProxy implements ILanguageServerProxy {
 
     @traceDecoratorVerbose('Disposing language server')
     public dispose(): void {
-        this.stop().ignoreErrors();
+        this.close().ignoreErrors();
     }
 
     @traceDecoratorError('Failed to start language server')
@@ -94,12 +102,21 @@ export class NodeLanguageServerProxy implements ILanguageServerProxy {
         options: LanguageClientOptions,
     ): Promise<void> {
         const extension = await this.getPylanceExtension();
+        if (this.closed) {
+            return;
+        }
         this.lsVersion = extension?.packageJSON.version || '0';
 
         const api = extension?.exports;
         if (api && api.client && api.client.isEnabled()) {
             this.pylanceApi = api;
-            await api.client.start();
+            try {
+                await api.client.start();
+            } catch (error) {
+                if (!this.closed) {
+                    throw error;
+                }
+            }
             return;
         }
 
@@ -107,6 +124,10 @@ export class NodeLanguageServerProxy implements ILanguageServerProxy {
         options.connectionOptions = { cancellationStrategy: this.cancellationStrategy };
 
         const client = await this.factory.createLanguageClient(resource, interpreter, options);
+        if (this.closed) {
+            await client.dispose();
+            return;
+        }
         this.registerHandlers(client, resource);
 
         this.disposables.push(
@@ -115,13 +136,43 @@ export class NodeLanguageServerProxy implements ILanguageServerProxy {
             }),
         );
 
-        await client.start();
-
-        this.languageClient = client;
+        this.startingClient = client;
+        try {
+            await client.start();
+            if (!this.closed) {
+                this.languageClient = client;
+            }
+        } catch (error) {
+            if (!this.closed) {
+                throw error;
+            }
+        } finally {
+            this.startingClient = undefined;
+            if (this.closed) {
+                await client.dispose().catch(() => undefined);
+            }
+        }
     }
 
-    @traceDecoratorVerbose('Disposing language server')
-    public async stop(): Promise<void> {
+    public close(): Promise<void> {
+        this.closed = true;
+        this.startingClient?.cancelStartup();
+        return this.stop();
+    }
+
+    public stop(): Promise<void> {
+        if (!this.stopping) {
+            this.stopping = Promise.resolve()
+                .then(() => this.stopClient())
+                .finally(() => {
+                    this.stopping = undefined;
+                });
+        }
+        return this.stopping;
+    }
+
+    @traceDecoratorVerbose('Stopping language server')
+    private async stopClient(): Promise<void> {
         if (this.pylanceApi) {
             const api = this.pylanceApi;
             this.pylanceApi = undefined;
@@ -137,11 +188,15 @@ export class NodeLanguageServerProxy implements ILanguageServerProxy {
             const client = this.languageClient;
             this.languageClient = undefined;
 
-            try {
-                await client.stop();
-                await client.dispose();
-            } catch (ex) {
-                traceError('Stopping language client failed', ex);
+            if (client.state === State.Starting) {
+                client.cancelStartup();
+            } else {
+                try {
+                    await client.stop();
+                    await client.dispose();
+                } catch (ex) {
+                    traceError('Stopping language client failed', ex);
+                }
             }
         }
 

@@ -48,6 +48,7 @@ export class PylanceLSExtensionManager implements IDisposable, ILanguageServerEx
         fileSystem: IFileSystem,
         private readonly extensions: IExtensions,
         readonly applicationShell: IApplicationShell,
+        replaceStartingServer?: () => Promise<void>,
     ) {
         this.analysisOptions = new NodeLanguageServerAnalysisOptions(outputChannel, workspaceService);
         this.clientFactory = new NodeLanguageClientFactory(fileSystem, extensions);
@@ -65,6 +66,7 @@ export class PylanceLSExtensionManager implements IDisposable, ILanguageServerEx
             this.serverProxy,
             commandManager,
             extensions,
+            replaceStartingServer,
         );
     }
 
@@ -81,8 +83,7 @@ export class PylanceLSExtensionManager implements IDisposable, ILanguageServerEx
     }
 
     async stopLanguageServer(): Promise<void> {
-        this.serverManager.disconnect();
-        await this.serverProxy.stop();
+        await this.serverManager.stop();
     }
 
     canStartLanguageServer(): boolean {

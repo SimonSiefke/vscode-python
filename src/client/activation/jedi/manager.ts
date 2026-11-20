@@ -31,6 +31,12 @@ export class JediLanguageServerManager implements ILanguageServerManager {
 
     private connected = false;
 
+    private closed = false;
+
+    private initialStartup?: Promise<void>;
+
+    private restarting?: Promise<void>;
+
     private lsVersion: string | undefined;
 
     constructor(
@@ -38,12 +44,17 @@ export class JediLanguageServerManager implements ILanguageServerManager {
         private readonly analysisOptions: ILanguageServerAnalysisOptions,
         private readonly languageServerProxy: ILanguageServerProxy,
         commandManager: ICommandManager,
+        private readonly replaceStartingServer?: () => Promise<void>,
     ) {
         if (JediLanguageServerManager.commandDispose) {
             JediLanguageServerManager.commandDispose.dispose();
         }
         JediLanguageServerManager.commandDispose = commandManager.registerCommand(Commands.RestartLS, () => {
-            this.restartLanguageServer().ignoreErrors();
+            if (!this.closed && this.replaceStartingServer && (this.initialStartup || this.restarting)) {
+                this.replaceStartingServer().ignoreErrors();
+            } else {
+                this.restartLanguageServer().ignoreErrors();
+            }
         });
     }
 
@@ -54,13 +65,22 @@ export class JediLanguageServerManager implements ILanguageServerManager {
     }
 
     public dispose(): void {
-        this.stopLanguageServer().ignoreErrors();
-        JediLanguageServerManager.commandDispose.dispose();
+        this.stop().ignoreErrors();
+        JediLanguageServerManager.commandDispose?.dispose();
         this.disposables.forEach((d) => d.dispose());
     }
 
     @traceDecoratorError('Failed to start language server')
     public async start(resource: Resource, interpreter: PythonEnvironment | undefined): Promise<void> {
+        this.initialStartup = this.startInitialClient(resource, interpreter);
+        try {
+            await this.initialStartup;
+        } finally {
+            this.initialStartup = undefined;
+        }
+    }
+
+    private async startInitialClient(resource: Resource, interpreter: PythonEnvironment | undefined): Promise<void> {
         this.resource = resource;
         this.interpreter = interpreter;
         this.analysisOptions.onDidChange(this.restartLanguageServerDebounced, this, this.disposables);
@@ -83,12 +103,21 @@ export class JediLanguageServerManager implements ILanguageServerManager {
             traceVerbose('Failed to get jedi-language-server version: ', ex);
         }
 
+        if (this.closed) {
+            return;
+        }
         await this.analysisOptions.initialize(resource, interpreter);
         await this.startLanguageServer();
     }
 
+    public stop(): Promise<void> {
+        this.closed = true;
+        this.disconnect();
+        return this.languageServerProxy.close();
+    }
+
     public connect(): void {
-        if (!this.connected) {
+        if (!this.closed && !this.connected) {
             this.connected = true;
             this.middleware?.connect();
         }
@@ -109,8 +138,26 @@ export class JediLanguageServerManager implements ILanguageServerManager {
     @traceDecoratorError('Failed to restart language server')
     @traceDecoratorVerbose('Restarting language server')
     protected async restartLanguageServer(): Promise<void> {
-        await this.stopLanguageServer();
-        await this.startLanguageServer();
+        if (this.closed) {
+            return;
+        }
+        if (!this.restarting) {
+            this.restarting = this.restartClient().finally(() => {
+                this.restarting = undefined;
+            });
+        }
+        await this.restarting;
+    }
+
+    private async restartClient(): Promise<void> {
+        await this.initialStartup?.catch(() => undefined);
+        if (this.closed) {
+            return;
+        }
+        await this.languageServerProxy.stop();
+        if (!this.closed) {
+            await this.startLanguageServer();
+        }
     }
 
     @captureTelemetry(
@@ -122,7 +169,13 @@ export class JediLanguageServerManager implements ILanguageServerManager {
     )
     @traceDecoratorVerbose('Starting language server')
     protected async startLanguageServer(): Promise<void> {
+        if (this.closed) {
+            return;
+        }
         const options = await this.analysisOptions.getAnalysisOptions();
+        if (this.closed) {
+            return;
+        }
         this.middleware = new JediLanguageClientMiddleware(this.serviceContainer, this.lsVersion);
         options.middleware = this.middleware;
 
@@ -133,12 +186,5 @@ export class JediLanguageServerManager implements ILanguageServerManager {
 
         // Then use this middleware to start a new language client.
         await this.languageServerProxy.start(this.resource, this.interpreter, options);
-    }
-
-    @traceDecoratorVerbose('Stopping language server')
-    protected async stopLanguageServer(): Promise<void> {
-        if (this.languageServerProxy) {
-            await this.languageServerProxy.stop();
-        }
     }
 }

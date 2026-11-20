@@ -2,13 +2,14 @@
 // Licensed under the MIT License.
 
 import * as path from 'path';
-import { LanguageClient, LanguageClientOptions, ServerOptions, TransportKind } from 'vscode-languageclient/node';
+import { LanguageClientOptions, ServerOptions, TransportKind } from 'vscode-languageclient/node';
 
 import { PYLANCE_EXTENSION_ID, PYTHON_LANGUAGE } from '../../common/constants';
 import { IFileSystem } from '../../common/platform/types';
 import { IExtensions, Resource } from '../../common/types';
 import { PythonEnvironment } from '../../pythonEnvironments/info';
 import { FileBasedCancellationStrategy } from '../common/cancellationUtils';
+import { LanguageServerClient } from '../common/languageServerClient';
 import { ILanguageClientFactory } from '../types';
 
 export const PYLANCE_NAME = 'Pylance';
@@ -20,7 +21,7 @@ export class NodeLanguageClientFactory implements ILanguageClientFactory {
         _resource: Resource,
         _interpreter: PythonEnvironment | undefined,
         clientOptions: LanguageClientOptions,
-    ): Promise<LanguageClient> {
+    ): Promise<LanguageServerClient> {
         // this must exist for node language client
         const commandArgs = (clientOptions.connectionOptions
             ?.cancellationStrategy as FileBasedCancellationStrategy).getCommandLineArguments();
@@ -50,6 +51,6 @@ export class NodeLanguageClientFactory implements ILanguageClientFactory {
             },
         };
 
-        return new LanguageClient(PYTHON_LANGUAGE, PYLANCE_NAME, serverOptions, clientOptions);
+        return new LanguageServerClient(PYTHON_LANGUAGE, PYLANCE_NAME, serverOptions, clientOptions);
     }
 }

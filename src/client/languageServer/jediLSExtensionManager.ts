@@ -40,6 +40,7 @@ export class JediLSExtensionManager implements IDisposable, ILanguageServerExten
         interpreterService: IInterpreterService,
         environmentService: IEnvironmentVariablesProvider,
         commandManager: ICommandManager,
+        replaceStartingServer?: () => Promise<void>,
     ) {
         this.analysisOptions = new JediLanguageServerAnalysisOptions(
             environmentService,
@@ -54,6 +55,7 @@ export class JediLSExtensionManager implements IDisposable, ILanguageServerExten
             this.analysisOptions,
             this.serverProxy,
             commandManager,
+            replaceStartingServer,
         );
     }
 
@@ -70,8 +72,7 @@ export class JediLSExtensionManager implements IDisposable, ILanguageServerExten
     }
 
     async stopLanguageServer(): Promise<void> {
-        this.serverManager.disconnect();
-        await this.serverProxy.stop();
+        await this.serverManager.stop();
     }
 
     // eslint-disable-next-line class-methods-use-this
