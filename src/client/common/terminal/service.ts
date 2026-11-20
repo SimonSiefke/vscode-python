@@ -10,6 +10,7 @@ import {
     EventEmitter,
     Terminal,
     TerminalShellExecution,
+    TerminalShellExecutionEndEvent,
 } from 'vscode';
 import '../../common/extensions';
 import { IInterpreterService } from '../../interpreter/contracts';
@@ -76,7 +77,16 @@ export class TerminalService implements ITerminalService, Disposable {
             });
         }
     }
-    public async sendCommand(command: string, args: string[], cancel?: CancellationToken): Promise<void> {
+    public sendCommand(command: string, args: string[], cancel?: CancellationToken): Promise<void> {
+        return this.sendCommandWithExecution(command, args, cancel);
+    }
+
+    public async sendCommandWithExecution(
+        command: string,
+        args: string[],
+        cancel?: CancellationToken,
+        onExecution?: (execution: TerminalShellExecution) => void,
+    ): Promise<void> {
         Cancellation.throwIfCanceled(cancel);
         await this.ensureTerminal();
         Cancellation.throwIfCanceled(cancel);
@@ -85,7 +95,11 @@ export class TerminalService implements ITerminalService, Disposable {
             this.terminal!.show(true);
         }
 
-        await this.executeCommandInternal(text, cancel);
+        await this.executeCommandInternal(text, cancel, onExecution);
+    }
+
+    public onDidEndTerminalShellExecution(listener: (event: TerminalShellExecutionEndEvent) => void): Disposable {
+        return this.terminalManager.onDidEndTerminalShellExecution(listener);
     }
     /** @deprecated */
     public async sendText(text: string): Promise<void> {
@@ -185,6 +199,7 @@ export class TerminalService implements ITerminalService, Disposable {
     private async executeCommandInternal(
         commandLine: string,
         cancel?: CancellationToken,
+        onExecution?: (execution: TerminalShellExecution) => void,
     ): Promise<TerminalShellExecution | undefined> {
         const terminal = this.terminal;
         if (!terminal) {
@@ -218,6 +233,7 @@ export class TerminalService implements ITerminalService, Disposable {
         Cancellation.throwIfCanceled(cancel);
         if (terminal.shellIntegration) {
             const execution = terminal.shellIntegration.executeCommand(commandLine);
+            onExecution?.(execution);
             traceVerbose(`Shell Integration is enabled, executeCommand: ${commandLine}`);
             return execution;
         } else {

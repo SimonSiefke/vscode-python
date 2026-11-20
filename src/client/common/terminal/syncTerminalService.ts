@@ -31,6 +31,17 @@ class ExecutionState implements Disposable {
     public get completed(): Promise<void> {
         return this._completed.promise;
     }
+    public async completeFromShell(exitCode: number): Promise<void> {
+        if (!this._completed.completed) {
+            await this.updateState();
+        }
+        if (this._completed.completed) {
+            return this.completed;
+        }
+        throw new Error(
+            `Terminal command exited with code ${exitCode} before reporting completion: ${this.command.join(' ')}`,
+        );
+    }
     public dispose() {
         if (this.disposable) {
             this.disposable.dispose();
@@ -128,6 +139,7 @@ export class SynchronousTerminalService implements ITerminalService, Disposable 
         let state: ExecutionState | undefined;
         let closeListener: Disposable | undefined;
         let cancelListener: Disposable | undefined;
+        let shellEndListener: Disposable | undefined;
         try {
             cancelListener = cancel.onCancellationRequested(() => completionCancellation.cancel());
             if (cancel.isCancellationRequested) {
@@ -145,16 +157,37 @@ export class SynchronousTerminalService implements ITerminalService, Disposable 
                 }
                 return allocated;
             }, executionToken);
-            state = new ExecutionState(file.filePath, this.fs, [command, ...args]);
+            const executionState = new ExecutionState(file.filePath, this.fs, [command, ...args]);
+            state = executionState;
             const sendArgs = internalScripts.shell_exec(command, file.filePath, args);
             closeListener = this.terminalService.onDidCloseTerminal(() => completionCancellation.cancel());
+            const shellEnd = createDeferred<number>();
             await Cancellation.race(
-                () => this.terminalService.sendCommand(pythonExec?.path || 'python', sendArgs, executionToken),
+                () =>
+                    this.terminalService.sendCommandWithExecution(
+                        pythonExec?.path || 'python',
+                        sendArgs,
+                        executionToken,
+                        (execution) => {
+                            shellEndListener = this.terminalService.onDidEndTerminalShellExecution((event) => {
+                                // An event without an exit code can be an intermediate shell transition.
+                                if (event.execution === execution && event.exitCode !== undefined) {
+                                    shellEnd.resolve(event.exitCode);
+                                }
+                            });
+                        },
+                    ),
                 executionToken,
             );
-            const promise = swallowExceptions ? state.completed : state.completed.catch(noop);
-            await Cancellation.race(() => promise, executionToken);
+            await Cancellation.race(() => {
+                const completion = Promise.race([
+                    executionState.completed,
+                    shellEnd.promise.then((exitCode) => executionState.completeFromShell(exitCode)),
+                ]);
+                return swallowExceptions ? completion : completion.catch(noop);
+            }, executionToken);
         } finally {
+            shellEndListener?.dispose();
             closeListener?.dispose();
             cancelListener?.dispose();
             completionCancellation.dispose();

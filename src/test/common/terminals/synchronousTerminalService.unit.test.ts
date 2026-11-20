@@ -6,13 +6,22 @@ import { rejects } from 'node:assert/strict';
 import * as path from 'path';
 import * as sinon from 'sinon';
 import { anything, deepEqual, instance, mock, verify, when } from 'ts-mockito';
-import { CancellationToken, CancellationTokenSource, Disposable, EventEmitter } from 'vscode';
+import {
+    CancellationToken,
+    CancellationTokenSource,
+    Disposable,
+    EventEmitter,
+    Terminal,
+    TerminalShellExecution,
+    TerminalShellExecutionEndEvent,
+    TerminalShellIntegration,
+} from 'vscode';
 import { CancellationError } from '../../../client/common/cancellation';
 import { FileSystem } from '../../../client/common/platform/fileSystem';
 import { IFileSystem, TemporaryFile } from '../../../client/common/platform/types';
 import { TerminalService } from '../../../client/common/terminal/service';
 import { SynchronousTerminalService } from '../../../client/common/terminal/syncTerminalService';
-import { createDeferred, createDeferredFrom } from '../../../client/common/utils/async';
+import { createDeferred, createDeferredFrom, Deferred } from '../../../client/common/utils/async';
 import { EXTENSION_ROOT_DIR } from '../../../client/constants';
 import { IInterpreterService } from '../../../client/interpreter/contracts';
 import { InterpreterService } from '../../../client/interpreter/interpreterService';
@@ -83,7 +92,9 @@ suite('Terminal Service (synchronous)', () => {
         test('run sendCommand in terminalService should be cancelled', async () => {
             const cancel = new CancellationTokenSource();
             const tmpFile = { filePath: 'tmp with spaces', dispose: noop };
-            when(terminalService.sendCommand(anything(), anything(), anything())).thenResolve();
+            when(
+                terminalService.sendCommandWithExecution(anything(), anything(), anything(), anything()),
+            ).thenResolve();
             when(interpreterService.getActiveInterpreter(undefined)).thenResolve(undefined);
             when(fs.createTemporaryFile('.log')).thenResolve(tmpFile);
             when(fs.readFile(anything())).thenResolve('');
@@ -110,9 +121,10 @@ suite('Terminal Service (synchronous)', () => {
             verify(fs.createTemporaryFile('.log')).once();
             verify(fs.readFile(tmpFile.filePath)).atLeast(1);
             verify(
-                terminalService.sendCommand(
+                terminalService.sendCommandWithExecution(
                     'python',
                     deepEqual([shellExecFile, 'cmd', '1', '2', tmpFile.filePath.fileToCommandArgumentForPythonExt()]),
+                    anything(),
                     anything(),
                 ),
             ).once();
@@ -120,7 +132,9 @@ suite('Terminal Service (synchronous)', () => {
         test('run sendCommand in terminalService should complete when command completes', async () => {
             const cancel = new CancellationTokenSource();
             const tmpFile = { filePath: 'tmp with spaces', dispose: noop };
-            when(terminalService.sendCommand(anything(), anything(), anything())).thenResolve();
+            when(
+                terminalService.sendCommandWithExecution(anything(), anything(), anything(), anything()),
+            ).thenResolve();
             when(interpreterService.getActiveInterpreter(undefined)).thenResolve(undefined);
             when(fs.createTemporaryFile('.log')).thenResolve(tmpFile);
             when(fs.readFile(anything())).thenResolve('');
@@ -147,9 +161,10 @@ suite('Terminal Service (synchronous)', () => {
             verify(fs.createTemporaryFile('.log')).once();
             verify(fs.readFile(tmpFile.filePath)).atLeast(1);
             verify(
-                terminalService.sendCommand(
+                terminalService.sendCommandWithExecution(
                     'python',
                     deepEqual([shellExecFile, 'cmd', '1', '2', tmpFile.filePath.fileToCommandArgumentForPythonExt()]),
+                    anything(),
                     anything(),
                 ),
             ).once();
@@ -184,9 +199,11 @@ suite('Terminal Service (synchronous)', () => {
                     disposedCloseListener();
                 });
             });
-            when(terminalService.sendCommand(anything(), anything(), anything())).thenCall(async () => {
-                dispatched[sends++].resolve();
-            });
+            when(terminalService.sendCommandWithExecution(anything(), anything(), anything(), anything())).thenCall(
+                async () => {
+                    dispatched[sends++].resolve();
+                },
+            );
             when(interpreterService.getActiveInterpreter(undefined)).thenResolve(undefined);
             when(fs.createTemporaryFile('.log')).thenResolve(firstFile, secondFile);
             when(fs.readFile(firstFile.filePath)).thenReturn(read.promise);
@@ -239,7 +256,7 @@ suite('Terminal Service (synchronous)', () => {
                 when(interpreterService.getActiveInterpreter(undefined)).thenResolve(undefined);
                 when(fs.createTemporaryFile('.log')).thenResolve(lock);
                 when(fs.readFile(lock.filePath)).thenResolve('');
-                when(terminalService.sendCommand(anything(), anything(), anything())).thenCall(
+                when(terminalService.sendCommandWithExecution(anything(), anything(), anything(), anything())).thenCall(
                     (_command, _args, token) => {
                         started.resolve(token);
                         return dispatch.promise;
@@ -283,7 +300,9 @@ suite('Terminal Service (synchronous)', () => {
                 allocation.resolve(file);
                 await new Promise<void>((resolve) => setImmediate(resolve));
                 sinon.assert.calledOnce(file.dispose);
-                verify(terminalService.sendCommand(anything(), anything(), anything())).never();
+                verify(
+                    terminalService.sendCommandWithExecution(anything(), anything(), anything(), anything()),
+                ).never();
             } finally {
                 allocation.resolve(file);
                 source.dispose();
@@ -307,7 +326,9 @@ suite('Terminal Service (synchronous)', () => {
                 interpreter.resolve(undefined);
                 await new Promise<void>((resolve) => setImmediate(resolve));
                 verify(fs.createTemporaryFile('.log')).never();
-                verify(terminalService.sendCommand(anything(), anything(), anything())).never();
+                verify(
+                    terminalService.sendCommandWithExecution(anything(), anything(), anything(), anything()),
+                ).never();
             } finally {
                 interpreter.resolve(undefined);
                 source.dispose();
@@ -330,9 +351,11 @@ suite('Terminal Service (synchronous)', () => {
                 when(interpreterService.getActiveInterpreter(undefined)).thenResolve(undefined);
                 when(fs.createTemporaryFile('.log')).thenResolve(lock);
                 when(fs.readFile(lock.filePath)).thenResolve(marker);
-                when(terminalService.sendCommand(anything(), anything(), anything())).thenCall(async () => {
-                    dispatched.resolve();
-                });
+                when(terminalService.sendCommandWithExecution(anything(), anything(), anything(), anything())).thenCall(
+                    async () => {
+                        dispatched.resolve();
+                    },
+                );
                 try {
                     const rejected = rejects(service.sendCommand('install', [], source.token), expected);
                     await dispatched.promise;
@@ -357,9 +380,11 @@ suite('Terminal Service (synchronous)', () => {
             when(interpreterService.getActiveInterpreter(undefined)).thenResolve(undefined);
             when(fs.createTemporaryFile('.log')).thenResolve(lock);
             when(fs.deleteFile(lock.filePath)).thenReject(sharingError).thenResolve();
-            when(terminalService.sendCommand(anything(), anything(), anything())).thenCall(async () => {
-                dispatched.resolve();
-            });
+            when(terminalService.sendCommandWithExecution(anything(), anything(), anything(), anything())).thenCall(
+                async () => {
+                    dispatched.resolve();
+                },
+            );
             try {
                 const canceled = rejects(service.sendCommand('install', [], source.token), CancellationError);
                 await dispatched.promise;
@@ -372,6 +397,114 @@ suite('Terminal Service (synchronous)', () => {
                 source.dispose();
                 clock.restore();
             }
+        });
+    });
+
+    suite('integrated shell completion', () => {
+        let ended: EventEmitter<TerminalShellExecutionEndEvent>;
+        let terminal: Terminal;
+        let shellIntegration: TerminalShellIntegration;
+        let execution: TerminalShellExecution;
+        let accepted: Deferred<void>;
+        let dispatch: Deferred<void>;
+        let source: CancellationTokenSource;
+        let clock: sinon.SinonFakeTimers;
+        let disposeEndListener: sinon.SinonSpy;
+        const filePath = 'integration marker';
+
+        setup(() => {
+            clock = sinon.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+            ended = new EventEmitter<TerminalShellExecutionEndEvent>();
+            terminal = instance(mock<Terminal>());
+            shellIntegration = instance(mock<TerminalShellIntegration>());
+            execution = instance(mock<TerminalShellExecution>());
+            accepted = createDeferred();
+            dispatch = createDeferred();
+            source = new CancellationTokenSource();
+            disposeEndListener = sinon.spy();
+            when(interpreterService.getActiveInterpreter(undefined)).thenResolve(undefined);
+            when(fs.createTemporaryFile('.log')).thenResolve({ filePath, dispose: noop });
+            when(terminalService.onDidEndTerminalShellExecution(anything())).thenCall((listener) => {
+                const subscription = ended.event(listener);
+                return new Disposable(() => {
+                    subscription.dispose();
+                    disposeEndListener();
+                });
+            });
+            when(terminalService.sendCommandWithExecution(anything(), anything(), anything(), anything())).thenCall(
+                (_command, _args, _cancel, onExecution) => {
+                    onExecution(execution);
+                    accepted.resolve();
+                    return dispatch.promise;
+                },
+            );
+        });
+
+        teardown(() => {
+            source.cancel();
+            source.dispose();
+            dispatch.resolve();
+            ended.dispose();
+            clock.restore();
+        });
+
+        test('Only a matching definitive exit settles a markerless install', async () => {
+            when(fs.readFile(filePath)).thenResolve('');
+            const completed = createDeferredFrom(service.sendCommand('install', [], source.token));
+            completed.promise.ignoreErrors();
+            await accepted.promise;
+            ended.fire({
+                terminal,
+                shellIntegration,
+                execution: instance(mock<TerminalShellExecution>()),
+                exitCode: 1,
+            });
+            ended.fire({ terminal, shellIntegration, execution, exitCode: undefined });
+            dispatch.resolve();
+            await new Promise<void>((resolve) => setImmediate(resolve));
+            assert.isFalse(completed.completed);
+            verify(fs.readFile(filePath)).never();
+
+            ended.fire({ terminal, shellIntegration, execution, exitCode: 1 });
+            await assert.isRejected(
+                completed.promise,
+                'Terminal command exited with code 1 before reporting completion',
+            );
+            verify(fs.readFile(filePath)).once();
+            sinon.assert.calledOnce(disposeEndListener);
+        });
+
+        test('An early shell end preserves a completed marker even before dispatch settles', async () => {
+            when(fs.readFile(filePath)).thenResolve('END\n');
+            const completed = createDeferredFrom(service.sendCommand('install', [], source.token));
+            completed.promise.ignoreErrors();
+            await accepted.promise;
+            ended.fire({ terminal, shellIntegration, execution, exitCode: 1 });
+            dispatch.resolve();
+            await new Promise<void>((resolve) => setImmediate(resolve));
+            assert.isTrue(completed.resolved);
+            await completed.promise;
+            verify(fs.readFile(filePath)).once();
+            sinon.assert.calledOnce(disposeEndListener);
+        });
+
+        test('Cancellation does not wait for an in-flight final marker read', async () => {
+            const reading = createDeferred<void>();
+            const contents = createDeferred<string>();
+            when(fs.readFile(filePath)).thenCall(() => {
+                reading.resolve();
+                return contents.promise;
+            });
+            const canceled = rejects(service.sendCommand('install', [], source.token), CancellationError);
+            await accepted.promise;
+            dispatch.resolve();
+            ended.fire({ terminal, shellIntegration, execution, exitCode: 1 });
+            await reading.promise;
+            source.cancel();
+            await canceled;
+            assert.isFalse(contents.completed);
+            sinon.assert.calledOnce(disposeEndListener);
+            contents.resolve('END\n');
         });
     });
 });
