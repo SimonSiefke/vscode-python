@@ -24,8 +24,9 @@ import {
 import { IApplicationShell, ITerminalManager, IWorkspaceService } from '../../../client/common/application/types';
 import { CancellationError as CommandCancellationError } from '../../../client/common/cancellation';
 import { EXTENSION_ROOT_DIR } from '../../../client/common/constants';
-import { IPlatformService } from '../../../client/common/platform/types';
+import { IFileSystem, IPlatformService } from '../../../client/common/platform/types';
 import { TerminalService } from '../../../client/common/terminal/service';
+import { SynchronousTerminalService } from '../../../client/common/terminal/syncTerminalService';
 import {
     ITerminalActivator,
     ITerminalHelper,
@@ -733,6 +734,61 @@ suite('Terminal Service', () => {
             unintegrated.verify((value) => value.sendText('install'), TypeMoq.Times.never());
         } finally {
             cancellation.dispose();
+        }
+    });
+
+    test('A shell exit reaches the installer through real dispatch before a marker is written', async () => {
+        sinon.stub(asyncUtils, 'sleep').resolves(100);
+        const ended = new EventEmitter<TerminalShellExecutionEndEvent>();
+        const launched = asyncUtils.createDeferred<void>();
+        const disposeEndListener = sinon.spy();
+        disposables.push(ended);
+        terminalManager.reset();
+        terminalManager.setup((manager) => manager.createTerminal(TypeMoq.It.isAny())).returns(() => terminal.object);
+        terminalManager
+            .setup((manager) => manager.onDidEndTerminalShellExecution(TypeMoq.It.isAny()))
+            .returns((listener) => {
+                const subscription = ended.event(listener);
+                return new Disposable(() => {
+                    subscription.dispose();
+                    disposeEndListener();
+                });
+            });
+        terminalHelper
+            .setup((helper) =>
+                helper.buildCommandForTerminal(TypeMoq.It.isAny(), TypeMoq.It.isAny(), TypeMoq.It.isAny()),
+            )
+            .returns((_shell, command) => command);
+        terminalShellIntegration.reset();
+        terminalShellIntegration
+            .setup((shell) => shell.executeCommand(TypeMoq.It.isAny()))
+            .returns(() => {
+                queueMicrotask(() => {
+                    ended.fire({ ...event, execution: { ...event.execution }, exitCode: 0 });
+                    ended.fire({ ...event, exitCode: 1 });
+                });
+                launched.resolve();
+                return event.execution;
+            });
+        const marker = { filePath: 'installer status marker', dispose: sinon.spy() };
+        const fs = TypeMoq.Mock.ofType<IFileSystem>();
+        fs.setup((system) => system.createTemporaryFile('.log')).returns(async () => marker);
+        fs.setup((system) => system.readFile(marker.filePath)).returns(async () => '');
+        service = new TerminalService(mockServiceContainer.object);
+        const installer = new SynchronousTerminalService(fs.object, interpreterService.object, service);
+        const source = new CancellationTokenSource();
+        try {
+            const completion = asyncUtils.createDeferredFrom(installer.sendCommand('install', [], source.token));
+            completion.promise.ignoreErrors();
+            await launched.promise;
+            await new Promise<void>((resolve) => setImmediate(resolve));
+            expect(completion.rejected).to.equal(true);
+            await rejects(completion.promise, /Terminal command exited with code 1 before reporting completion/);
+            sinon.assert.calledOnce(marker.dispose);
+            sinon.assert.calledOnce(disposeEndListener);
+        } finally {
+            source.cancel();
+            source.dispose();
         }
     });
 
