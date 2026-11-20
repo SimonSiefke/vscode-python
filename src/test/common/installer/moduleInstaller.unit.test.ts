@@ -5,13 +5,21 @@
 'use strict';
 
 import { assert } from 'chai';
+import { rejects } from 'node:assert/strict';
 import * as path from 'path';
 import rewiremock from 'rewiremock';
 import { SemVer } from 'semver';
 import * as sinon from 'sinon';
 import { anything, instance, mock, when } from 'ts-mockito';
 import * as TypeMoq from 'typemoq';
-import { CancellationTokenSource, Disposable, ProgressLocation, Uri, WorkspaceConfiguration } from 'vscode';
+import {
+    CancellationError,
+    CancellationTokenSource,
+    Disposable,
+    ProgressLocation,
+    Uri,
+    WorkspaceConfiguration,
+} from 'vscode';
 import { IApplicationShell, IWorkspaceService } from '../../../client/common/application/types';
 import { CondaInstaller } from '../../../client/common/installer/condaInstaller';
 import { ModuleInstaller } from '../../../client/common/installer/moduleInstaller';
@@ -92,6 +100,28 @@ suite('Module Installer', () => {
 
     let appShell: TypeMoq.IMock<IApplicationShell>;
     let serviceContainer: TypeMoq.IMock<IServiceContainer>;
+
+    test('The module installation caller receives terminal startup cancellation', async () => {
+        const container = TypeMoq.Mock.ofType<IServiceContainer>();
+        const factory = TypeMoq.Mock.ofType<ITerminalServiceFactory>();
+        const terminal = TypeMoq.Mock.ofType<ITerminalService>();
+        container.setup((c) => c.get(ITerminalServiceFactory)).returns(() => factory.object);
+        factory.setup((f) => f.getTerminalService(TypeMoq.It.isAny())).returns(() => terminal.object);
+        const installer = new (class extends TestModuleInstaller {
+            public getExecutionInfo(): Promise<ExecutionInfo> {
+                return Promise.resolve({ execPath: 'fixture-installer', args: [] });
+            }
+        })(container.object);
+        const canceled = Promise.reject(new CancellationError());
+        canceled.catch(noop);
+        terminal
+            .setup((t) => t.sendCommand('fixture-installer', TypeMoq.It.isAny(), undefined))
+            .returns(() => canceled)
+            .verifiable(TypeMoq.Times.once());
+
+        await rejects(installer.installModule('fixture-module'), CancellationError);
+        terminal.verifyAll();
+    });
 
     suite('Method _elevatedInstall()', async () => {
         let traceLogStub: sinon.SinonStub;

@@ -10,7 +10,8 @@ import { IApplicationShell, ICommandManager, IWorkspaceService } from '../../com
 import '../../common/extensions';
 import { IPlatformService } from '../../common/platform/types';
 import { ITerminalService, ITerminalServiceFactory } from '../../common/terminal/types';
-import { IConfigurationService, IDisposable, IDisposableRegistry, Resource } from '../../common/types';
+import { IConfigurationService, IDisposableRegistry, Resource } from '../../common/types';
+import { createDeferred } from '../../common/utils/async';
 import { Diagnostics, Repl } from '../../common/utils/localize';
 import { showWarningMessage } from '../../common/vscodeApis/windowApis';
 import { IInterpreterService } from '../../interpreter/contracts';
@@ -25,7 +26,8 @@ export class TerminalCodeExecutionProvider implements ICodeExecutionService {
     private hasRanOutsideCurrentDrive = false;
     protected terminalTitle!: string;
     protected terminalIcon?: TerminalOptions['iconPath'];
-    private replActive?: Promise<boolean>;
+    private replActive?: Promise<void>;
+    private terminalCloseListener?: Disposable;
 
     constructor(
         @inject(ITerminalServiceFactory) protected readonly terminalServiceFactory: ITerminalServiceFactory,
@@ -36,7 +38,9 @@ export class TerminalCodeExecutionProvider implements ICodeExecutionService {
         @inject(IInterpreterService) protected readonly interpreterService: IInterpreterService,
         @inject(ICommandManager) protected readonly commandManager: ICommandManager,
         @inject(IApplicationShell) protected readonly applicationShell: IApplicationShell,
-    ) {}
+    ) {
+        this.disposables.push(new Disposable(() => this.resetRepl()));
+    }
 
     public async executeFile(file: Uri, options?: { newTerminalPerFile: boolean }) {
         await this.setCwdForFileExecution(file, options);
@@ -66,50 +70,62 @@ export class TerminalCodeExecutionProvider implements ICodeExecutionService {
 
     public async initializeRepl(resource: Resource) {
         const terminalService = this.getTerminalService(resource);
-        if (this.replActive && (await this.replActive)) {
+        if (this.replActive) {
+            await this.replActive;
             await terminalService.show();
             return;
         }
         sendTelemetryEvent(EventName.REPL, undefined, { replType: 'Terminal' });
-        this.replActive = new Promise<boolean>(async (resolve) => {
-            const replCommandArgs = await this.getExecutableInfo(resource);
-            let listener: IDisposable;
-            Promise.race([
-                new Promise<boolean>((resolve) => setTimeout(() => resolve(true), 3000)),
-                new Promise<boolean>((resolve) => {
-                    let count = 0;
-                    const terminalDataTimeout = setTimeout(() => {
-                        resolve(true); // Fall back for test case scenarios.
-                    }, 3000);
-                    // Watch TerminalData to see if REPL launched.
-                    listener = this.applicationShell.onDidWriteTerminalData((e) => {
-                        for (let i = 0; i < e.data.length; i++) {
-                            if (e.data[i] === '>') {
-                                count++;
-                                if (count === 3) {
-                                    clearTimeout(terminalDataTimeout);
-                                    resolve(true);
-                                }
-                            }
+        const startup = this.startRepl(terminalService, resource);
+        this.replActive = startup;
+        const resetStartup = () => {
+            if (this.replActive === startup) {
+                this.resetRepl();
+            }
+        };
+        this.terminalCloseListener = terminalService.onDidCloseTerminal(resetStartup);
+        try {
+            await startup;
+        } catch (error) {
+            resetStartup();
+            throw error;
+        }
+    }
+
+    private resetRepl() {
+        this.replActive = undefined;
+        this.terminalCloseListener?.dispose();
+        this.terminalCloseListener = undefined;
+    }
+
+    private async startRepl(terminalService: ITerminalService, resource: Resource): Promise<void> {
+        const { command, args } = await this.getExecutableInfo(resource);
+        const prompt = createDeferred<void>();
+        let listener: Disposable | undefined;
+        let timeout: NodeJS.Timeout | undefined;
+        let count = 0;
+        const stopWaitingForPrompt = () => {
+            clearTimeout(timeout);
+            listener?.dispose();
+            listener = undefined;
+            prompt.resolve();
+        };
+        try {
+            listener = this.applicationShell.onDidWriteTerminalData((event) => {
+                for (const character of event.data) {
+                    if (character === '>') {
+                        count++;
+                        if (count === 3) {
+                            stopWaitingForPrompt();
                         }
-                    });
-                }),
-            ]).then(() => {
-                if (listener) {
-                    listener.dispose();
+                    }
                 }
-                resolve(true);
             });
-
-            await terminalService.sendCommand(replCommandArgs.command, replCommandArgs.args);
-        });
-        this.disposables.push(
-            terminalService.onDidCloseTerminal(() => {
-                this.replActive = undefined;
-            }),
-        );
-
-        await this.replActive;
+            timeout = setTimeout(stopWaitingForPrompt, 3000);
+            await Promise.all([terminalService.sendCommand(command, args), prompt.promise]);
+        } finally {
+            stopWaitingForPrompt();
+        }
     }
 
     public async getExecutableInfo(resource?: Uri, args: string[] = []): Promise<PythonExecInfo> {

@@ -579,44 +579,56 @@ suite('Terminal Service', () => {
         expect(eventFired).to.be.equal(false, 'Event fired');
     });
 
-    test('Closing a terminal during startup cancels its activation and lets a replacement activate', async () => {
-        const firstDelay = asyncUtils.createDeferred<number>();
-        const replacementDelay = asyncUtils.createDeferred<number>();
-        const sleep = sinon.stub(asyncUtils, 'sleep');
-        sleep.onFirstCall().returns(firstDelay.promise);
-        sleep.onSecondCall().returns(replacementDelay.promise);
+    for (const [replacementTiming, reopenBeforeCancellation] of [
+        ['after cancellation', false],
+        ['before cancellation', true],
+    ] as const) {
+        test(`Closing a terminal during startup cancels its activation with a replacement ${replacementTiming}`, async () => {
+            const firstDelay = asyncUtils.createDeferred<number>();
+            const replacementDelay = asyncUtils.createDeferred<number>();
+            const sleep = sinon.stub(asyncUtils, 'sleep');
+            sleep.onFirstCall().returns(firstDelay.promise);
+            sleep.onSecondCall().returns(replacementDelay.promise);
 
-        const closed = new EventEmitter<VSCodeTerminal>();
-        disposables.push(closed);
-        terminalManager
-            .setup((manager) => manager.onDidCloseTerminal(TypeMoq.It.isAny(), TypeMoq.It.isAny(), TypeMoq.It.isAny()))
-            .returns((listener) => closed.event((value) => listener.call(service, value)));
-        const replacement = TypeMoq.Mock.ofType<VSCodeTerminal>();
-        let nextTerminal = terminal.object;
-        terminalManager.setup((manager) => manager.createTerminal(TypeMoq.It.isAny())).returns(() => nextTerminal);
-        service = new TerminalService(mockServiceContainer.object);
+            const closed = new EventEmitter<VSCodeTerminal>();
+            disposables.push(closed);
+            terminalManager
+                .setup((manager) =>
+                    manager.onDidCloseTerminal(TypeMoq.It.isAny(), TypeMoq.It.isAny(), TypeMoq.It.isAny()),
+                )
+                .returns((listener) => closed.event((value) => listener.call(service, value)));
+            const replacement = TypeMoq.Mock.ofType<VSCodeTerminal>();
+            let nextTerminal = terminal.object;
+            terminalManager.setup((manager) => manager.createTerminal(TypeMoq.It.isAny())).returns(() => nextTerminal);
+            service = new TerminalService(mockServiceContainer.object);
 
-        const canceled = rejects(service.ensureTerminal(), CancellationError);
-        closed.fire(terminal.object);
-        nextTerminal = replacement.object;
-        const reopened = service.ensureTerminal();
-        sinon.assert.calledTwice(sleep);
+            const canceled = rejects(service.ensureTerminal(), CancellationError);
+            closed.fire(terminal.object);
+            const reopen = () => {
+                nextTerminal = replacement.object;
+                return service.ensureTerminal();
+            };
+            const reopened = reopenBeforeCancellation ? reopen() : undefined;
+            sinon.assert.callCount(sleep, reopenBeforeCancellation ? 2 : 1);
 
-        firstDelay.resolve(100);
-        await canceled;
-        terminalActivator.verify(
-            (activator) => activator.activateEnvironmentInTerminal(TypeMoq.It.isAny(), TypeMoq.It.isAny()),
-            TypeMoq.Times.never(),
-        );
+            firstDelay.resolve(100);
+            await canceled;
+            terminalActivator.verify(
+                (activator) => activator.activateEnvironmentInTerminal(TypeMoq.It.isAny(), TypeMoq.It.isAny()),
+                TypeMoq.Times.never(),
+            );
 
-        replacementDelay.resolve(100);
-        await reopened;
-        terminalActivator.verify(
-            (activator) => activator.activateEnvironmentInTerminal(replacement.object, TypeMoq.It.isAny()),
-            TypeMoq.Times.once(),
-        );
-        replacement.verify((value) => value.show(true), TypeMoq.Times.once());
-    });
+            const replacementStarted = reopened ?? reopen();
+            sinon.assert.calledTwice(sleep);
+            replacementDelay.resolve(100);
+            await replacementStarted;
+            terminalActivator.verify(
+                (activator) => activator.activateEnvironmentInTerminal(replacement.object, TypeMoq.It.isAny()),
+                TypeMoq.Times.once(),
+            );
+            replacement.verify((value) => value.show(true), TypeMoq.Times.once());
+        });
+    }
 
     test('Ensure close event is not fired when terminal is closed', async () => {
         terminalHelper
