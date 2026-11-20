@@ -1,3 +1,5 @@
+/// <reference lib="es2021.weakref" />
+
 'use strict';
 
 // eslint-disable-next-line camelcase
@@ -11,10 +13,14 @@ import {
     EventEmitter,
     Uri,
     WorkspaceConfiguration,
+    WorkspaceFolder,
+    WorkspaceFoldersChangeEvent,
 } from 'vscode';
 import { LanguageServerType } from '../activation/types';
 import './extensions';
 import { IInterpreterAutoSelectionProxyService } from '../interpreter/autoSelection/types';
+import type { IServiceContainer } from '../ioc/types';
+import { traceError } from '../logging';
 import { sendTelemetryEvent } from '../telemetry';
 import { EventName } from '../telemetry/constants';
 import { sendSettingTelemetry } from '../telemetry/envFileTelemetry';
@@ -39,11 +45,12 @@ import { SystemVariables } from './variables/systemVariables';
 import { getOSType, OSType, isWindows } from './utils/platform';
 import { untildify } from './helpers';
 
-export class PythonSettings implements IPythonSettings {
-    private get onDidChange(): Event<ConfigurationChangeEvent | undefined> {
-        return this.changed.event;
-    }
+interface FolderSettingsOwner {
+    readonly settings: WeakRef<PythonSettings>;
+    folder: WeakRef<WorkspaceFolder>;
+}
 
+export class PythonSettings implements IPythonSettings {
     // eslint-disable-next-line class-methods-use-this
     public static onConfigChange(): Event<ConfigurationChangeEvent | undefined> {
         return PythonSettings.configChanged.event;
@@ -83,7 +90,28 @@ export class PythonSettings implements IPythonSettings {
         }
     }
 
-    private static pythonSettings: Map<string, PythonSettings> = new Map<string, PythonSettings>();
+    // VS Code can expose an optimistic folder even at startup and roll back without an event.
+    // Neither a synchronous lookup nor the lifetime of a WorkspaceFolder proves it was confirmed.
+    private static readonly ownersByUri = new Map<string, FolderSettingsOwner>();
+
+    private static readonly collectedOwners = new FinalizationRegistry<{ key: string; owner: FolderSettingsOwner }>(
+        ({ key, owner }) => {
+            if (PythonSettings.ownersByUri.get(key) === owner) {
+                PythonSettings.ownersByUri.delete(key);
+            }
+        },
+    );
+
+    private static globalSettings: PythonSettings | undefined;
+
+    private static activeServiceContainer: IServiceContainer | undefined;
+
+    // Keep the telemetry marker with the host's folder if its weak settings value is collected.
+    private static reportedFolderFormatOnType = new WeakSet<WorkspaceFolder>();
+
+    private static reportedGlobalFormatOnType = false;
+
+    private static subscriptions: Disposable[] | undefined;
 
     public envFile = '';
 
@@ -121,13 +149,11 @@ export class PythonSettings implements IPythonSettings {
 
     public languageServerIsDefault = true;
 
-    protected readonly changed = new EventEmitter<ConfigurationChangeEvent | undefined>();
-
     private static readonly configChanged = new EventEmitter<ConfigurationChangeEvent | undefined>();
 
-    private workspaceRoot: Resource;
+    private readonly workspaceRoot: Resource;
 
-    private disposables: Disposable[] = [];
+    private disposed = false;
 
     private _pythonPath = 'python';
 
@@ -155,31 +181,81 @@ export class PythonSettings implements IPythonSettings {
         interpreterPathService: IInterpreterPathService,
         defaultLS: IDefaultLanguageServer | undefined,
         extensions: IExtensions,
+        serviceContainer?: IServiceContainer,
     ): PythonSettings {
         workspace = workspace || new WorkspaceService();
-        const workspaceFolderUri = PythonSettings.getSettingsUriAndTarget(resource, workspace).uri;
-        const workspaceFolderKey = workspaceFolderUri ? workspaceFolderUri.fsPath : '';
-
-        if (!PythonSettings.pythonSettings.has(workspaceFolderKey)) {
-            const settings = new PythonSettings(
-                workspaceFolderUri,
-                interpreterAutoSelectionService,
-                workspace,
-                interpreterPathService,
-                defaultLS,
-                extensions,
-            );
-            PythonSettings.pythonSettings.set(workspaceFolderKey, settings);
-            settings.onDidChange((event) => PythonSettings.debounceConfigChangeNotification(event));
-            // Pass null to avoid VSC from complaining about not passing in a value.
-
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            const config = workspace.getConfiguration('editor', resource || (null as any));
-            const formatOnType = config ? config.get('formatOnType', false) : false;
-            sendTelemetryEvent(EventName.FORMAT_ON_TYPE, undefined, { enabled: formatOnType });
+        const folder = PythonSettings.getWorkspaceFolder(resource, workspace);
+        const canOwnSettings = !serviceContainer || serviceContainer === PythonSettings.activeServiceContainer;
+        const key = folder?.uri.toString() ?? '';
+        if (canOwnSettings) {
+            const cached = folder
+                ? PythonSettings.ownersByUri.get(key)?.settings.deref()
+                : PythonSettings.globalSettings;
+            if (cached) {
+                return cached;
+            }
         }
 
-        return PythonSettings.pythonSettings.get(workspaceFolderKey)!;
+        const settings = new PythonSettings(
+            folder?.uri,
+            interpreterAutoSelectionService,
+            workspace,
+            interpreterPathService,
+            defaultLS,
+            extensions,
+        );
+        // An extension can still hold the API from before workspace trust reactivated Python.
+        if (!canOwnSettings) {
+            return settings;
+        }
+
+        PythonSettings.subscribe(workspace, interpreterAutoSelectionService, interpreterPathService);
+        if (folder) {
+            PythonSettings.disposeFolderSettings(key);
+            const owner = { settings: new WeakRef(settings), folder: new WeakRef(folder) };
+            PythonSettings.ownersByUri.set(key, owner);
+            PythonSettings.collectedOwners.register(settings, { key, owner }, owner);
+        } else {
+            PythonSettings.globalSettings = settings;
+        }
+        PythonSettings.reportFormatOnType(workspace, resource, folder);
+        return settings;
+    }
+
+    public static activateFor(serviceContainer: IServiceContainer): void {
+        PythonSettings.reset();
+        PythonSettings.activeServiceContainer = serviceContainer;
+    }
+
+    public static deactivateFor(serviceContainer: IServiceContainer): void {
+        if (PythonSettings.activeServiceContainer === serviceContainer) {
+            PythonSettings.activeServiceContainer = undefined;
+            PythonSettings.reset();
+        }
+    }
+
+    private static reportFormatOnType(
+        workspace: IWorkspaceService,
+        resource: Resource,
+        folder?: WorkspaceFolder,
+    ): void {
+        if (folder) {
+            if (PythonSettings.reportedFolderFormatOnType.has(folder)) {
+                return;
+            }
+            PythonSettings.reportedFolderFormatOnType.add(folder);
+        } else {
+            if (PythonSettings.reportedGlobalFormatOnType) {
+                return;
+            }
+            PythonSettings.reportedGlobalFormatOnType = true;
+        }
+        // Pass null to avoid VSC from complaining about not passing in a value.
+
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const config = workspace.getConfiguration('editor', resource || (null as any));
+        const formatOnType = config ? config.get('formatOnType', false) : false;
+        sendTelemetryEvent(EventName.FORMAT_ON_TYPE, undefined, { enabled: formatOnType });
     }
 
     @debounceSync(1)
@@ -193,15 +269,9 @@ export class PythonSettings implements IPythonSettings {
         workspace?: IWorkspaceService,
     ): { uri: Uri | undefined; target: ConfigurationTarget } {
         workspace = workspace || new WorkspaceService();
-        const workspaceFolder = resource ? workspace.getWorkspaceFolder(resource) : undefined;
-        let workspaceFolderUri: Uri | undefined = workspaceFolder ? workspaceFolder.uri : undefined;
-
-        if (!workspaceFolderUri && Array.isArray(workspace.workspaceFolders) && workspace.workspaceFolders.length > 0) {
-            workspaceFolderUri = workspace.workspaceFolders[0].uri;
-        }
-
-        const target = workspaceFolderUri ? ConfigurationTarget.WorkspaceFolder : ConfigurationTarget.Global;
-        return { uri: workspaceFolderUri, target };
+        const uri = PythonSettings.getWorkspaceFolder(resource, workspace)?.uri;
+        const target = uri ? ConfigurationTarget.WorkspaceFolder : ConfigurationTarget.Global;
+        return { uri, target };
     }
 
     public static dispose(): void {
@@ -209,8 +279,112 @@ export class PythonSettings implements IPythonSettings {
             throw new Error('Dispose can only be called from unit tests');
         }
 
-        PythonSettings.pythonSettings.forEach((item) => item && item.dispose());
-        PythonSettings.pythonSettings.clear();
+        PythonSettings.reset();
+    }
+
+    private static getWorkspaceFolder(resource: Resource, workspace: IWorkspaceService): WorkspaceFolder | undefined {
+        const folder = resource ? workspace.getWorkspaceFolder(resource) : undefined;
+        if (folder) {
+            return folder;
+        }
+        const folders = workspace.workspaceFolders;
+        return Array.isArray(folders) ? folders[0] : undefined;
+    }
+
+    private static subscribe(
+        workspace: IWorkspaceService,
+        interpreterAutoSelectionService: IInterpreterAutoSelectionProxyService,
+        interpreterPathService: IInterpreterPathService,
+    ): void {
+        if (PythonSettings.subscriptions) {
+            return;
+        }
+        const refresh = () => PythonSettings.refreshSettings();
+        PythonSettings.subscriptions = [
+            workspace.onDidChangeWorkspaceFolders((event) =>
+                PythonSettings.onWorkspaceFoldersChanged(workspace, event),
+            ),
+            workspace.onDidChangeConfiguration((event) => {
+                if (event.affectsConfiguration('python')) {
+                    PythonSettings.refreshSettings(event);
+                }
+            }),
+            interpreterAutoSelectionService.onDidChangeAutoSelectedInterpreter(refresh),
+        ];
+        if (interpreterPathService) {
+            PythonSettings.subscriptions.push(interpreterPathService.onDidChange(refresh));
+        }
+    }
+
+    private static refreshSettings(event?: ConfigurationChangeEvent): void {
+        const owners = Array.from(PythonSettings.ownersByUri.values(), ({ settings }) => settings.deref());
+        owners.push(PythonSettings.globalSettings);
+        for (const settings of owners) {
+            try {
+                if (settings && !settings.disposed) {
+                    settings.initialize();
+                }
+            } catch (error) {
+                // Each settings owner must still refresh when another owner's configuration fails to load.
+                traceError('Failed to refresh Python settings', error);
+            }
+        }
+        PythonSettings.debounceConfigChangeNotification(event);
+    }
+
+    private static rebindFolderSettings(folder: WorkspaceFolder): void {
+        const owner = PythonSettings.ownersByUri.get(folder.uri.toString());
+        const oldFolder = owner?.folder.deref();
+        if (owner && oldFolder !== folder) {
+            // An overlapping edit can replace the host's folder object even when its URI remains in the workspace.
+            if (oldFolder && PythonSettings.reportedFolderFormatOnType.has(oldFolder)) {
+                PythonSettings.reportedFolderFormatOnType.add(folder);
+            }
+            owner.folder = new WeakRef(folder);
+        }
+    }
+
+    private static onWorkspaceFoldersChanged(workspace: IWorkspaceService, event: WorkspaceFoldersChangeEvent): void {
+        for (const folder of event.removed) {
+            PythonSettings.reportedFolderFormatOnType.delete(folder);
+            PythonSettings.disposeFolderSettings(folder.uri.toString());
+        }
+        for (const folder of event.added) {
+            const key = folder.uri.toString();
+            const prior = PythonSettings.ownersByUri.get(key)?.folder.deref();
+            if (prior !== folder) {
+                PythonSettings.disposeFolderSettings(key);
+            }
+        }
+        if (event.added.length > 0) {
+            PythonSettings.globalSettings?.dispose();
+            PythonSettings.globalSettings = undefined;
+            PythonSettings.reportedGlobalFormatOnType = false;
+        }
+
+        const folders = workspace.workspaceFolders;
+        if (Array.isArray(folders)) {
+            folders.forEach((folder) => PythonSettings.rebindFolderSettings(folder));
+        }
+    }
+
+    private static disposeFolderSettings(key: string): void {
+        const owner = PythonSettings.ownersByUri.get(key);
+        if (owner) {
+            PythonSettings.ownersByUri.delete(key);
+            PythonSettings.collectedOwners.unregister(owner);
+            owner.settings.deref()?.dispose();
+        }
+    }
+
+    private static reset(): void {
+        PythonSettings.reportedFolderFormatOnType = new WeakSet();
+        PythonSettings.reportedGlobalFormatOnType = false;
+        PythonSettings.subscriptions?.forEach((subscription) => subscription?.dispose());
+        PythonSettings.subscriptions = undefined;
+        PythonSettings.ownersByUri.forEach((_owner, key) => PythonSettings.disposeFolderSettings(key));
+        PythonSettings.globalSettings?.dispose();
+        PythonSettings.globalSettings = undefined;
     }
 
     public static toSerializable(settings: IPythonSettings): IPythonSettings {
@@ -228,8 +402,7 @@ export class PythonSettings implements IPythonSettings {
     }
 
     public dispose(): void {
-        this.disposables.forEach((disposable) => disposable && disposable.dispose());
-        this.disposables = [];
+        this.disposed = true;
     }
 
     protected update(pythonSettings: WorkspaceConfiguration): void {
@@ -405,63 +578,15 @@ export class PythonSettings implements IPythonSettings {
         return getPythonExecutable(pythonPath);
     }
 
-    protected onWorkspaceFoldersChanged(): void {
-        // If an activated workspace folder was removed, delete its key
-        const workspaceKeys = this.workspace.workspaceFolders!.map((workspaceFolder) => workspaceFolder.uri.fsPath);
-        const activatedWkspcKeys = Array.from(PythonSettings.pythonSettings.keys());
-        const activatedWkspcFoldersRemoved = activatedWkspcKeys.filter((item) => workspaceKeys.indexOf(item) < 0);
-        if (activatedWkspcFoldersRemoved.length > 0) {
-            for (const folder of activatedWkspcFoldersRemoved) {
-                PythonSettings.pythonSettings.delete(folder);
-            }
-        }
-    }
-
     public register(): void {
-        PythonSettings.pythonSettings = new Map();
-        this.initialize();
-    }
-
-    private onDidChanged(event?: ConfigurationChangeEvent) {
-        const currentConfig = this.workspace.getConfiguration('python', this.workspaceRoot);
-        this.update(currentConfig);
-
-        // If workspace config changes, then we could have a cascading effect of on change events.
-        // Let's defer the change notification.
-        this.debounceChangeNotification(event);
+        PythonSettings.reset();
     }
 
     public initialize(): void {
-        this.disposables.push(this.workspace.onDidChangeWorkspaceFolders(this.onWorkspaceFoldersChanged, this));
-        this.disposables.push(
-            this.interpreterAutoSelectionService.onDidChangeAutoSelectedInterpreter(() => {
-                this.onDidChanged();
-            }),
-        );
-        this.disposables.push(
-            this.workspace.onDidChangeConfiguration((event: ConfigurationChangeEvent) => {
-                if (event.affectsConfiguration('python')) {
-                    this.onDidChanged(event);
-                }
-            }),
-        );
-        if (this.interpreterPathService) {
-            this.disposables.push(
-                this.interpreterPathService.onDidChange(() => {
-                    this.onDidChanged();
-                }),
-            );
-        }
-
         const initialConfig = this.workspace.getConfiguration('python', this.workspaceRoot);
         if (initialConfig) {
             this.update(initialConfig);
         }
-    }
-
-    @debounceSync(1)
-    protected debounceChangeNotification(event?: ConfigurationChangeEvent): void {
-        this.changed.fire(event);
     }
 
     private getPythonPath(systemVariables: SystemVariables, workspaceRoot: string | undefined) {

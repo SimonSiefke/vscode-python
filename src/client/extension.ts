@@ -27,6 +27,7 @@ initializeFileLogging(logDispose);
 import { ProgressLocation, ProgressOptions, window } from 'vscode';
 import { buildApi } from './api';
 import { IApplicationShell, IWorkspaceService } from './common/application/types';
+import { PythonSettings } from './common/configSettings';
 import { IDisposableRegistry, IExperimentService, IExtensionContext } from './common/types';
 import { createDeferred } from './common/utils/async';
 import { Common } from './common/utils/localize';
@@ -90,11 +91,16 @@ export async function activate(context: IExtensionContext): Promise<PythonExtens
 
 export async function deactivate(): Promise<void> {
     // Make sure to shutdown anybody who needs it.
-    if (activatedServiceContainer) {
-        const disposables = activatedServiceContainer.get<IDisposableRegistry>(IDisposableRegistry);
-        await disposeAll(disposables);
-        // Remove everything that is already disposed.
-        while (disposables.pop());
+    const serviceContainer = activatedServiceContainer;
+    if (serviceContainer) {
+        const disposables = serviceContainer.get<IDisposableRegistry>(IDisposableRegistry);
+        try {
+            await disposeAll(disposables);
+            // Remove everything that is already disposed.
+            while (disposables.pop());
+        } finally {
+            PythonSettings.deactivateFor(serviceContainer);
+        }
     }
 }
 
@@ -120,6 +126,7 @@ async function activateUnsafe(
     // First we initialize.
     const ext = initializeGlobals(context);
     activatedServiceContainer = ext.legacyIOC.serviceContainer;
+    PythonSettings.activateFor(activatedServiceContainer);
     // Note standard utils especially experiment and platform code are fundamental to the extension
     // and should be available before we activate anything else.Hence register them first.
     initializeStandard(ext);

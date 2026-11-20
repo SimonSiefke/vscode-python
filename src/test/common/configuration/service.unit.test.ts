@@ -35,6 +35,10 @@ suite('Configuration Service', () => {
         configService = new ConfigurationService(serviceContainer.object);
     });
 
+    teardown(() => {
+        PythonSettings.dispose();
+    });
+
     function setupConfigProvider(): TypeMoq.IMock<WorkspaceConfiguration> {
         const workspaceConfig = TypeMoq.Mock.ofType<WorkspaceConfiguration>();
         workspaceService
