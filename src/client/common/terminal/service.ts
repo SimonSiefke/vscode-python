@@ -2,16 +2,7 @@
 // Licensed under the MIT License.
 
 import { inject, injectable } from 'inversify';
-import {
-    CancellationError,
-    CancellationToken,
-    Disposable,
-    Event,
-    EventEmitter,
-    Terminal,
-    TerminalShellExecution,
-    TerminalShellExecutionEndEvent,
-} from 'vscode';
+import { CancellationToken, Disposable, Event, EventEmitter, Terminal, TerminalShellExecution } from 'vscode';
 import '../../common/extensions';
 import { IInterpreterService } from '../../interpreter/contracts';
 import { IServiceContainer } from '../../ioc/types';
@@ -19,7 +10,6 @@ import { captureTelemetry } from '../../telemetry';
 import { EventName } from '../../telemetry/constants';
 import { ITerminalAutoActivation } from '../../terminals/types';
 import { IApplicationShell, ITerminalManager } from '../application/types';
-import { Cancellation } from '../cancellation';
 import { _SCRIPTS_DIR } from '../process/internal/scripts/constants';
 import { IConfigurationService, IDisposableRegistry } from '../types';
 import {
@@ -77,29 +67,14 @@ export class TerminalService implements ITerminalService, Disposable {
             });
         }
     }
-    public sendCommand(command: string, args: string[], cancel?: CancellationToken): Promise<void> {
-        return this.sendCommandWithExecution(command, args, cancel);
-    }
-
-    public async sendCommandWithExecution(
-        command: string,
-        args: string[],
-        cancel?: CancellationToken,
-        onExecution?: (execution: TerminalShellExecution) => void,
-    ): Promise<void> {
-        Cancellation.throwIfCanceled(cancel);
+    public async sendCommand(command: string, args: string[], _?: CancellationToken): Promise<void> {
         await this.ensureTerminal();
-        Cancellation.throwIfCanceled(cancel);
         const text = this.terminalHelper.buildCommandForTerminal(this.terminalShellType, command, args);
         if (!this.options?.hideFromUser) {
             this.terminal!.show(true);
         }
 
-        await this.executeCommandInternal(text, cancel, onExecution);
-    }
-
-    public onDidEndTerminalShellExecution(listener: (event: TerminalShellExecutionEndEvent) => void): Disposable {
-        return this.terminalManager.onDidEndTerminalShellExecution(listener);
+        await this.executeCommand(text, false);
     }
     /** @deprecated */
     public async sendText(text: string): Promise<void> {
@@ -196,11 +171,7 @@ export class TerminalService implements ITerminalService, Disposable {
         }
     }
 
-    private async executeCommandInternal(
-        commandLine: string,
-        cancel?: CancellationToken,
-        onExecution?: (execution: TerminalShellExecution) => void,
-    ): Promise<TerminalShellExecution | undefined> {
+    private async executeCommandInternal(commandLine: string): Promise<TerminalShellExecution | undefined> {
         const terminal = this.terminal;
         if (!terminal) {
             traceVerbose('Terminal not available, cannot execute command');
@@ -230,10 +201,8 @@ export class TerminalService implements ITerminalService, Disposable {
             await promise;
         }
 
-        Cancellation.throwIfCanceled(cancel);
         if (terminal.shellIntegration) {
             const execution = terminal.shellIntegration.executeCommand(commandLine);
-            onExecution?.(execution);
             traceVerbose(`Shell Integration is enabled, executeCommand: ${commandLine}`);
             return execution;
         } else {
@@ -265,29 +234,21 @@ export class TerminalService implements ITerminalService, Disposable {
             return;
         } else {
             this.terminalShellType = this.terminalHelper.identifyTerminalShell(this.terminal);
-            const terminal = this.terminalManager.createTerminal({
+            this.terminal = this.terminalManager.createTerminal({
                 name: this.options?.title || 'Python',
                 hideFromUser: this.options?.hideFromUser,
                 iconPath: this.options?.iconPath,
             });
-            this.terminal = terminal;
-            this.terminalAutoActivator.disableAutoActivation(terminal);
+            this.terminalAutoActivator.disableAutoActivation(this.terminal);
 
             await sleep(100);
 
-            if (this.terminal !== terminal) {
-                throw new CancellationError();
-            }
-
-            await this.terminalActivator.activateEnvironmentInTerminal(terminal, {
+            await this.terminalActivator.activateEnvironmentInTerminal(this.terminal, {
                 resource: this.options?.resource,
                 preserveFocus,
                 interpreter: this.options?.interpreter,
                 hideFromUser: this.options?.hideFromUser,
             });
-            if (this.terminal !== terminal) {
-                throw new CancellationError();
-            }
         }
 
         if (!this.options?.hideFromUser) {

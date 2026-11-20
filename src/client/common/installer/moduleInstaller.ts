@@ -216,7 +216,7 @@ export abstract class ModuleInstaller implements IModuleInstaller {
                 .get<ITerminalServiceFactory>(ITerminalServiceFactory)
                 .getTerminalService(options);
 
-            await terminalService.sendCommand(command, args, token);
+            terminalService.sendCommand(command, args, token);
         } else {
             const processServiceFactory = this.serviceContainer.get<IProcessServiceFactory>(IProcessServiceFactory);
             const processService = await processServiceFactory.create(options.resource);

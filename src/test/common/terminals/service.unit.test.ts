@@ -2,19 +2,15 @@
 // Licensed under the MIT License.
 
 import { assert, expect } from 'chai';
-import { rejects } from 'node:assert/strict';
 import * as path from 'path';
 import * as sinon from 'sinon';
 import * as TypeMoq from 'typemoq';
 import {
-    CancellationError,
-    CancellationTokenSource,
     Disposable,
     EventEmitter,
     TerminalShellExecution,
     TerminalShellExecutionEndEvent,
     TerminalShellIntegration,
-    TerminalShellIntegrationChangeEvent,
     ThemeIcon,
     Uri,
     Terminal as VSCodeTerminal,
@@ -22,11 +18,9 @@ import {
     TerminalDataWriteEvent,
 } from 'vscode';
 import { IApplicationShell, ITerminalManager, IWorkspaceService } from '../../../client/common/application/types';
-import { CancellationError as CommandCancellationError } from '../../../client/common/cancellation';
 import { EXTENSION_ROOT_DIR } from '../../../client/common/constants';
-import { IFileSystem, IPlatformService } from '../../../client/common/platform/types';
+import { IPlatformService } from '../../../client/common/platform/types';
 import { TerminalService } from '../../../client/common/terminal/service';
-import { SynchronousTerminalService } from '../../../client/common/terminal/syncTerminalService';
 import {
     ITerminalActivator,
     ITerminalHelper,
@@ -36,7 +30,6 @@ import {
 import { IDisposableRegistry } from '../../../client/common/types';
 import { IServiceContainer } from '../../../client/ioc/types';
 import { ITerminalAutoActivation } from '../../../client/terminals/types';
-import * as asyncUtils from '../../../client/common/utils/async';
 import { noop } from '../../../client/common/utils/misc';
 import { createPythonInterpreter } from '../../utils/interpreters';
 import * as workspaceApis from '../../../client/common/vscodeApis/workspaceApis';
@@ -581,215 +574,6 @@ suite('Terminal Service', () => {
         expect(eventHandler).not.to.be.an('undefined', 'event handler not initialized');
         eventHandler!.bind(service)();
         expect(eventFired).to.be.equal(false, 'Event fired');
-    });
-
-    for (const [replacementTiming, reopenBeforeCancellation] of [
-        ['after cancellation', false],
-        ['before cancellation', true],
-    ] as const) {
-        test(`Closing a terminal during startup cancels its activation with a replacement ${replacementTiming}`, async () => {
-            const firstDelay = asyncUtils.createDeferred<number>();
-            const replacementDelay = asyncUtils.createDeferred<number>();
-            const sleep = sinon.stub(asyncUtils, 'sleep');
-            sleep.onFirstCall().returns(firstDelay.promise);
-            sleep.onSecondCall().returns(replacementDelay.promise);
-
-            const closed = new EventEmitter<VSCodeTerminal>();
-            disposables.push(closed);
-            terminalManager
-                .setup((manager) =>
-                    manager.onDidCloseTerminal(TypeMoq.It.isAny(), TypeMoq.It.isAny(), TypeMoq.It.isAny()),
-                )
-                .returns((listener) => closed.event((value) => listener.call(service, value)));
-            const replacement = TypeMoq.Mock.ofType<VSCodeTerminal>();
-            let nextTerminal = terminal.object;
-            terminalManager.setup((manager) => manager.createTerminal(TypeMoq.It.isAny())).returns(() => nextTerminal);
-            service = new TerminalService(mockServiceContainer.object);
-
-            const canceled = rejects(service.ensureTerminal(), CancellationError);
-            closed.fire(terminal.object);
-            const reopen = () => {
-                nextTerminal = replacement.object;
-                return service.ensureTerminal();
-            };
-            const reopened = reopenBeforeCancellation ? reopen() : undefined;
-            sinon.assert.callCount(sleep, reopenBeforeCancellation ? 2 : 1);
-
-            firstDelay.resolve(100);
-            await canceled;
-            terminalActivator.verify(
-                (activator) => activator.activateEnvironmentInTerminal(TypeMoq.It.isAny(), TypeMoq.It.isAny()),
-                TypeMoq.Times.never(),
-            );
-
-            const replacementStarted = reopened ?? reopen();
-            sinon.assert.calledTwice(sleep);
-            replacementDelay.resolve(100);
-            await replacementStarted;
-            terminalActivator.verify(
-                (activator) => activator.activateEnvironmentInTerminal(replacement.object, TypeMoq.It.isAny()),
-                TypeMoq.Times.once(),
-            );
-            replacement.verify((value) => value.show(true), TypeMoq.Times.once());
-        });
-    }
-
-    test('Closing during activation prevents the old command from running in the replacement', async () => {
-        sinon.stub(asyncUtils, 'sleep').resolves(100);
-        const closed = new EventEmitter<VSCodeTerminal>();
-        disposables.push(closed);
-        terminalManager
-            .setup((manager) => manager.onDidCloseTerminal(TypeMoq.It.isAny(), TypeMoq.It.isAny(), TypeMoq.It.isAny()))
-            .returns((listener) => closed.event((value) => listener.call(service, value)));
-        const replacement = TypeMoq.Mock.ofType<VSCodeTerminal>();
-        replacement.setup((value) => value.shellIntegration).returns(() => terminalShellIntegration.object);
-        let nextTerminal = terminal.object;
-        terminalManager.setup((manager) => manager.createTerminal(TypeMoq.It.isAny())).returns(() => nextTerminal);
-        terminalHelper
-            .setup((helper) =>
-                helper.buildCommandForTerminal(TypeMoq.It.isAny(), TypeMoq.It.isAny(), TypeMoq.It.isAny()),
-            )
-            .returns((_shell, command) => command);
-        const activating = asyncUtils.createDeferred<void>();
-        const activation = asyncUtils.createDeferred<boolean>();
-        terminalActivator
-            .setup((activator) => activator.activateEnvironmentInTerminal(TypeMoq.It.isAny(), TypeMoq.It.isAny()))
-            .returns((current) => {
-                if (current === terminal.object) {
-                    activating.resolve();
-                    return activation.promise;
-                }
-                return Promise.resolve(true);
-            });
-        service = new TerminalService(mockServiceContainer.object);
-
-        const canceled = rejects(service.sendCommand('old command', []), CancellationError);
-        await activating.promise;
-        closed.fire(terminal.object);
-        nextTerminal = replacement.object;
-        await service.sendCommand('replacement command', []);
-        activation.resolve(true);
-        await canceled;
-
-        terminalShellIntegration.verify((shell) => shell.executeCommand('old command'), TypeMoq.Times.never());
-        terminalShellIntegration.verify((shell) => shell.executeCommand('replacement command'), TypeMoq.Times.once());
-    });
-
-    test('Canceling during activation keeps the command off the terminal', async () => {
-        sinon.stub(asyncUtils, 'sleep').resolves(100);
-        terminalManager.setup((manager) => manager.createTerminal(TypeMoq.It.isAny())).returns(() => terminal.object);
-        const active = asyncUtils.createDeferred<void>();
-        const activation = asyncUtils.createDeferred<boolean>();
-        terminalActivator
-            .setup((activator) => activator.activateEnvironmentInTerminal(TypeMoq.It.isAny(), TypeMoq.It.isAny()))
-            .returns(() => {
-                active.resolve();
-                return activation.promise;
-            });
-        service = new TerminalService(mockServiceContainer.object);
-        const cancellation = new CancellationTokenSource();
-        try {
-            const canceled = rejects(service.sendCommand('install', [], cancellation.token), CommandCancellationError);
-            await active.promise;
-            cancellation.cancel();
-            activation.resolve(true);
-            await canceled;
-            terminalShellIntegration.verify((shell) => shell.executeCommand(TypeMoq.It.isAny()), TypeMoq.Times.never());
-            terminal.verify((value) => value.sendText(TypeMoq.It.isAny()), TypeMoq.Times.never());
-        } finally {
-            cancellation.dispose();
-        }
-    });
-
-    test('Canceling during the shell integration wait keeps the command off the terminal', async () => {
-        sinon.stub(asyncUtils, 'sleep').resolves(100);
-        const unintegrated = TypeMoq.Mock.ofType<VSCodeTerminal>();
-        unintegrated.setup((value) => value.shellIntegration).returns(() => undefined);
-        terminalManager
-            .setup((manager) => manager.createTerminal(TypeMoq.It.isAny()))
-            .returns(() => unintegrated.object);
-        terminalHelper
-            .setup((helper) =>
-                helper.buildCommandForTerminal(TypeMoq.It.isAny(), TypeMoq.It.isAny(), TypeMoq.It.isAny()),
-            )
-            .returns((_shell, command) => command);
-        const integration = new EventEmitter<TerminalShellIntegrationChangeEvent>();
-        disposables.push(integration);
-        const waiting = asyncUtils.createDeferred<void>();
-        terminalManager
-            .setup((manager) => manager.onDidChangeTerminalShellIntegration(TypeMoq.It.isAny()))
-            .returns((listener) => {
-                waiting.resolve();
-                return integration.event(listener);
-            });
-        service = new TerminalService(mockServiceContainer.object);
-        const cancellation = new CancellationTokenSource();
-        try {
-            const canceled = rejects(service.sendCommand('install', [], cancellation.token), CommandCancellationError);
-            await Promise.race([waiting.promise, canceled]);
-            expect(waiting.completed).to.equal(true);
-            cancellation.cancel();
-            integration.fire({ terminal: unintegrated.object, shellIntegration: terminalShellIntegration.object });
-            await canceled;
-            unintegrated.verify((value) => value.sendText('install'), TypeMoq.Times.never());
-        } finally {
-            cancellation.dispose();
-        }
-    });
-
-    test('A shell exit reaches the installer through real dispatch before a marker is written', async () => {
-        sinon.stub(asyncUtils, 'sleep').resolves(100);
-        const ended = new EventEmitter<TerminalShellExecutionEndEvent>();
-        const launched = asyncUtils.createDeferred<void>();
-        const disposeEndListener = sinon.spy();
-        disposables.push(ended);
-        terminalManager.reset();
-        terminalManager.setup((manager) => manager.createTerminal(TypeMoq.It.isAny())).returns(() => terminal.object);
-        terminalManager
-            .setup((manager) => manager.onDidEndTerminalShellExecution(TypeMoq.It.isAny()))
-            .returns((listener) => {
-                const subscription = ended.event(listener);
-                return new Disposable(() => {
-                    subscription.dispose();
-                    disposeEndListener();
-                });
-            });
-        terminalHelper
-            .setup((helper) =>
-                helper.buildCommandForTerminal(TypeMoq.It.isAny(), TypeMoq.It.isAny(), TypeMoq.It.isAny()),
-            )
-            .returns((_shell, command) => command);
-        terminalShellIntegration.reset();
-        terminalShellIntegration
-            .setup((shell) => shell.executeCommand(TypeMoq.It.isAny()))
-            .returns(() => {
-                queueMicrotask(() => {
-                    ended.fire({ ...event, execution: { ...event.execution }, exitCode: 0 });
-                    ended.fire({ ...event, exitCode: 1 });
-                });
-                launched.resolve();
-                return event.execution;
-            });
-        const marker = { filePath: 'installer status marker', dispose: sinon.spy() };
-        const fs = TypeMoq.Mock.ofType<IFileSystem>();
-        fs.setup((system) => system.createTemporaryFile('.log')).returns(async () => marker);
-        fs.setup((system) => system.readFile(marker.filePath)).returns(async () => '');
-        service = new TerminalService(mockServiceContainer.object);
-        const installer = new SynchronousTerminalService(fs.object, interpreterService.object, service);
-        const source = new CancellationTokenSource();
-        try {
-            const completion = asyncUtils.createDeferredFrom(installer.sendCommand('install', [], source.token));
-            completion.promise.ignoreErrors();
-            await launched.promise;
-            await new Promise<void>((resolve) => setImmediate(resolve));
-            expect(completion.rejected).to.equal(true);
-            await rejects(completion.promise, /Terminal command exited with code 1 before reporting completion/);
-            sinon.assert.calledOnce(marker.dispose);
-            sinon.assert.calledOnce(disposeEndListener);
-        } finally {
-            source.cancel();
-            source.dispose();
-        }
     });
 
     test('Ensure close event is not fired when terminal is closed', async () => {

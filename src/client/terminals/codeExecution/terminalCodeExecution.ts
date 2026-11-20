@@ -5,13 +5,12 @@
 
 import { inject, injectable } from 'inversify';
 import * as path from 'path';
-import { CancellationError, Disposable, TerminalOptions, Uri } from 'vscode';
+import { Disposable, TerminalOptions, Uri } from 'vscode';
 import { IApplicationShell, ICommandManager, IWorkspaceService } from '../../common/application/types';
 import '../../common/extensions';
 import { IPlatformService } from '../../common/platform/types';
 import { ITerminalService, ITerminalServiceFactory } from '../../common/terminal/types';
-import { IConfigurationService, IDisposableRegistry, Resource } from '../../common/types';
-import { createDeferred } from '../../common/utils/async';
+import { IConfigurationService, IDisposable, IDisposableRegistry, Resource } from '../../common/types';
 import { Diagnostics, Repl } from '../../common/utils/localize';
 import { showWarningMessage } from '../../common/vscodeApis/windowApis';
 import { IInterpreterService } from '../../interpreter/contracts';
@@ -26,7 +25,7 @@ export class TerminalCodeExecutionProvider implements ICodeExecutionService {
     private hasRanOutsideCurrentDrive = false;
     protected terminalTitle!: string;
     protected terminalIcon?: TerminalOptions['iconPath'];
-    private replActive?: { startup: Promise<void>; dispose(): void };
+    private replActive?: Promise<boolean>;
 
     constructor(
         @inject(ITerminalServiceFactory) protected readonly terminalServiceFactory: ITerminalServiceFactory,
@@ -37,9 +36,7 @@ export class TerminalCodeExecutionProvider implements ICodeExecutionService {
         @inject(IInterpreterService) protected readonly interpreterService: IInterpreterService,
         @inject(ICommandManager) protected readonly commandManager: ICommandManager,
         @inject(IApplicationShell) protected readonly applicationShell: IApplicationShell,
-    ) {
-        this.disposables.push(new Disposable(() => this.replActive?.dispose()));
-    }
+    ) {}
 
     public async executeFile(file: Uri, options?: { newTerminalPerFile: boolean }) {
         await this.setCwdForFileExecution(file, options);
@@ -69,70 +66,50 @@ export class TerminalCodeExecutionProvider implements ICodeExecutionService {
 
     public async initializeRepl(resource: Resource) {
         const terminalService = this.getTerminalService(resource);
-        const current = this.replActive;
-        if (current) {
-            await current.startup;
-            if (this.replActive !== current) {
-                throw new CancellationError();
-            }
+        if (this.replActive && (await this.replActive)) {
             await terminalService.show();
             return;
         }
         sendTelemetryEvent(EventName.REPL, undefined, { replType: 'Terminal' });
-        const canceled = createDeferred<never>();
-        let terminalCloseListener: Disposable | undefined;
-        const currentStartup = {
-            startup: this.startRepl(terminalService, resource, canceled.promise),
-            dispose: () => {
-                if (this.replActive === currentStartup) {
-                    this.replActive = undefined;
-                    terminalCloseListener?.dispose();
-                    canceled.reject(new CancellationError());
-                }
-            },
-        };
-        this.replActive = currentStartup;
-        terminalCloseListener = terminalService.onDidCloseTerminal(currentStartup.dispose);
-        try {
-            await currentStartup.startup;
-        } catch (error) {
-            currentStartup.dispose();
-            throw error;
-        }
-    }
-
-    private async startRepl(
-        terminalService: ITerminalService,
-        resource: Resource,
-        canceled: Promise<never>,
-    ): Promise<void> {
-        const { command, args } = await Promise.race([this.getExecutableInfo(resource), canceled]);
-        const prompt = createDeferred<void>();
-        let listener: Disposable | undefined;
-        let timeout: NodeJS.Timeout | undefined;
-        let count = 0;
-        const stopWaitingForPrompt = () => {
-            clearTimeout(timeout);
-            listener?.dispose();
-            listener = undefined;
-            prompt.resolve();
-        };
-        try {
-            listener = this.applicationShell.onDidWriteTerminalData((event) => {
-                for (const character of event.data) {
-                    if (character === '>') {
-                        count++;
-                        if (count === 3) {
-                            stopWaitingForPrompt();
+        this.replActive = new Promise<boolean>(async (resolve) => {
+            const replCommandArgs = await this.getExecutableInfo(resource);
+            let listener: IDisposable;
+            Promise.race([
+                new Promise<boolean>((resolve) => setTimeout(() => resolve(true), 3000)),
+                new Promise<boolean>((resolve) => {
+                    let count = 0;
+                    const terminalDataTimeout = setTimeout(() => {
+                        resolve(true); // Fall back for test case scenarios.
+                    }, 3000);
+                    // Watch TerminalData to see if REPL launched.
+                    listener = this.applicationShell.onDidWriteTerminalData((e) => {
+                        for (let i = 0; i < e.data.length; i++) {
+                            if (e.data[i] === '>') {
+                                count++;
+                                if (count === 3) {
+                                    clearTimeout(terminalDataTimeout);
+                                    resolve(true);
+                                }
+                            }
                         }
-                    }
+                    });
+                }),
+            ]).then(() => {
+                if (listener) {
+                    listener.dispose();
                 }
+                resolve(true);
             });
-            timeout = setTimeout(stopWaitingForPrompt, 3000);
-            await Promise.race([Promise.all([terminalService.sendCommand(command, args), prompt.promise]), canceled]);
-        } finally {
-            stopWaitingForPrompt();
-        }
+
+            await terminalService.sendCommand(replCommandArgs.command, replCommandArgs.args);
+        });
+        this.disposables.push(
+            terminalService.onDidCloseTerminal(() => {
+                this.replActive = undefined;
+            }),
+        );
+
+        await this.replActive;
     }
 
     public async getExecutableInfo(resource?: Uri, args: string[] = []): Promise<PythonExecInfo> {

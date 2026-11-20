@@ -2,20 +2,10 @@
 // Licensed under the MIT License.
 
 import { expect } from 'chai';
-import { rejects } from 'node:assert/strict';
 import * as path from 'path';
 import { SemVer } from 'semver';
 import * as TypeMoq from 'typemoq';
-import {
-    CancellationError,
-    Disposable,
-    EventEmitter,
-    Terminal,
-    TerminalDataWriteEvent,
-    ThemeIcon,
-    Uri,
-    WorkspaceFolder,
-} from 'vscode';
+import { Disposable, ThemeIcon, Uri, WorkspaceFolder } from 'vscode';
 import {
     IApplicationShell,
     ICommandManager,
@@ -32,7 +22,6 @@ import {
     TerminalCreationOptions,
 } from '../../../client/common/terminal/types';
 import { IConfigurationService, IPythonSettings, ITerminalSettings } from '../../../client/common/types';
-import { createDeferred } from '../../../client/common/utils/async';
 import { noop } from '../../../client/common/utils/misc';
 import { Conda, CONDA_RUN_VERSION } from '../../../client/pythonEnvironments/common/environmentManagers/conda';
 import { DjangoShellCodeExecutionProvider } from '../../../client/terminals/codeExecution/djangoShellCodeExecution';
@@ -616,132 +605,6 @@ suite('Terminal - Code Execution', () => {
                         t.sendCommand(TypeMoq.It.isValue(pythonPath), TypeMoq.It.isValue(expectedTerminalArgs)),
                     TypeMoq.Times.once(),
                 );
-            });
-
-            for (const promptBeforeDispatch of [true, false]) {
-                const order = promptBeforeDispatch ? 'prompt first' : 'dispatch first';
-                test(`Closing a starting REPL releases its listeners and lets its replacement start (${order})`, async () => {
-                    interpreterService
-                        .setup((s) => s.getActiveInterpreter(TypeMoq.It.isAny()))
-                        .returns(() => Promise.resolve(({ path: PYTHON_PATH } as unknown) as PythonEnvironment));
-                    terminalSettings.setup((t) => t.launchArgs).returns(() => []);
-
-                    const providerDisposables = [...disposables];
-                    const closed = new EventEmitter<void>();
-                    const output = new EventEmitter<TerminalDataWriteEvent>();
-                    const disposedCloseListener = sinon.spy();
-                    disposables.push(closed, output);
-                    terminalService
-                        .setup((t) => t.onDidCloseTerminal(TypeMoq.It.isAny()))
-                        .returns((listener) => {
-                            const subscription = closed.event(listener);
-                            return new Disposable(() => {
-                                subscription.dispose();
-                                disposedCloseListener();
-                            });
-                        });
-                    const disposedPromptListener = sinon.spy();
-                    applicationShell
-                        .setup((shell) => shell.onDidWriteTerminalData(TypeMoq.It.isAny()))
-                        .returns((listener) => {
-                            const subscription = output.event(listener);
-                            return new Disposable(() => {
-                                subscription.dispose();
-                                disposedPromptListener();
-                            });
-                        });
-
-                    const sends = [createDeferred<void>(), createDeferred<void>()];
-                    const started = [createDeferred<void>(), createDeferred<void>()];
-                    let sendCount = 0;
-                    terminalService
-                        .setup((t) => t.sendCommand(TypeMoq.It.isAny(), TypeMoq.It.isAny()))
-                        .returns(() => {
-                            const index = sendCount++;
-                            started[index].resolve();
-                            return sends[index].promise;
-                        });
-
-                    const givePrompt = () =>
-                        output.fire({ terminal: TypeMoq.Mock.ofType<Terminal>().object, data: '>>>' });
-                    const canceled = rejects(executor.execute('first selection'), CancellationError);
-                    await started[0].promise;
-                    if (promptBeforeDispatch) {
-                        givePrompt();
-                    } else {
-                        sends[0].resolve();
-                        await new Promise<void>((resolve) => setImmediate(resolve));
-                    }
-                    closed.fire();
-                    const replacement = executor.execute('replacement selection');
-                    await started[1].promise;
-
-                    await canceled;
-                    sinon.assert.calledOnce(disposedPromptListener);
-                    sinon.assert.calledOnce(disposedCloseListener);
-
-                    if (promptBeforeDispatch) {
-                        expect(sends[0].completed).to.equal(false);
-                        sends[0].reject(new CancellationError());
-                        givePrompt();
-                        sinon.assert.calledTwice(disposedPromptListener);
-                    } else {
-                        sends[1].resolve();
-                    }
-                    await new Promise<void>((resolve) => setImmediate(resolve));
-                    terminalService.verify((t) => t.executeCommand(TypeMoq.It.isAny(), true), TypeMoq.Times.never());
-
-                    if (promptBeforeDispatch) {
-                        sends[1].resolve();
-                    } else {
-                        givePrompt();
-                    }
-                    await replacement;
-                    sinon.assert.calledTwice(disposedPromptListener);
-                    await executor.execute('next selection');
-                    expect(sendCount).to.equal(2);
-                    terminalService.verify((t) => t.executeCommand('first selection', true), TypeMoq.Times.never());
-                    terminalService.verify(
-                        (t) => t.executeCommand('replacement selection', true),
-                        TypeMoq.Times.once(),
-                    );
-                    terminalService.verify((t) => t.executeCommand('next selection', true), TypeMoq.Times.once());
-                    providerDisposables.forEach((disposable) => disposable.dispose());
-                    sinon.assert.calledTwice(disposedCloseListener);
-                });
-            }
-
-            test('A failed REPL startup releases its close listener and can be retried', async () => {
-                interpreterService
-                    .setup((s) => s.getActiveInterpreter(TypeMoq.It.isAny()))
-                    .returns(() => Promise.resolve(({ path: PYTHON_PATH } as unknown) as PythonEnvironment));
-                terminalSettings.setup((t) => t.launchArgs).returns(() => []);
-                const output = new EventEmitter<TerminalDataWriteEvent>();
-                disposables.push(output);
-                applicationShell
-                    .setup((shell) => shell.onDidWriteTerminalData(TypeMoq.It.isAny()))
-                    .returns((listener) => output.event(listener));
-                const removeCloseListener = sinon.spy();
-                terminalService
-                    .setup((t) => t.onDidCloseTerminal(TypeMoq.It.isAny()))
-                    .returns(() => new Disposable(removeCloseListener));
-                const failed = new Error('Command dispatch failed');
-                let calls = 0;
-                terminalService
-                    .setup((t) => t.sendCommand(TypeMoq.It.isAny(), TypeMoq.It.isAny()))
-                    .returns(async () => {
-                        if (++calls === 1) {
-                            throw failed;
-                        }
-                        output.fire({ terminal: TypeMoq.Mock.ofType<Terminal>().object, data: '>>>' });
-                    });
-
-                await rejects(executor.execute('failed selection'), failed);
-                sinon.assert.calledOnce(removeCloseListener);
-                await executor.execute('retried selection');
-                expect(calls).to.equal(2);
-                terminalService.verify((t) => t.executeCommand('failed selection', true), TypeMoq.Times.never());
-                terminalService.verify((t) => t.executeCommand('retried selection', true), TypeMoq.Times.once());
             });
 
             test('Ensure REPL launches after reducing risk of command being ignored or duplicated', async () => {
