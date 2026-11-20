@@ -77,8 +77,7 @@ export class TerminalService implements ITerminalService, Disposable {
 
     constructor(
         @inject(IServiceContainer) private serviceContainer: IServiceContainer,
-        private readonly options?: TerminalCreationOptions,
-        private readonly disposeOnClose = false,
+        private readonly options?: TerminalCreationOptions & { disposeOnClose?: boolean },
     ) {
         const disposableRegistry = this.serviceContainer.get<Disposable[]>(IDisposableRegistry);
         this.terminalHelper = this.serviceContainer.get<ITerminalHelper>(ITerminalHelper);
@@ -284,7 +283,7 @@ export class TerminalService implements ITerminalService, Disposable {
         try {
             return await pending;
         } catch (error) {
-            if (this.disposeOnClose && !this.terminal) {
+            if (this.options?.disposeOnClose && !this.terminal) {
                 this.dispose();
             }
             throw error;
@@ -354,7 +353,7 @@ export class TerminalService implements ITerminalService, Disposable {
             this.disposeReplListener();
             this.pythonReplCommandQueue = [];
             this.terminalClosed.fire();
-            if (this.disposeOnClose) {
+            if (this.options?.disposeOnClose) {
                 this.dispose();
             }
         }
