@@ -41,9 +41,9 @@ function trackProcess(proc: ChildProcess, disposable: IDisposable, disposables?:
     processEvents.on(errorMonitor, releaseIfStopped);
 }
 
-function stopProcess(proc: ChildProcess): void {
-    // A child can stay alive after receiving a signal.
-    if (proc.pid && proc.exitCode === null && proc.signalCode === null) {
+function stopProcess(proc: ChildProcess, { retry = false } = {}): void {
+    // proc.killed records a sent signal. Explicit disposal can retry while a child is still live.
+    if (proc.pid && proc.exitCode === null && proc.signalCode === null && (retry || !proc.killed)) {
         killPid(proc.pid);
     }
 }
@@ -107,18 +107,7 @@ export function shellExec(
             }
         };
         const proc = exec(command, shellOptions, callback); // NOSONAR
-        trackProcess(
-            proc,
-            {
-                dispose: () => {
-                    // exec may have already signaled the child before rejecting.
-                    if (!proc.killed) {
-                        stopProcess(proc);
-                    }
-                },
-            },
-            disposables,
-        );
+        trackProcess(proc, { dispose: () => stopProcess(proc) }, disposables);
     });
 }
 
@@ -141,8 +130,7 @@ export function plainExec(
     proc.stdout?.on('error', noop);
     proc.stderr?.on('error', noop);
     const deferred = createDeferred<ExecutionResult<string>>();
-    const stop = () => stopProcess(proc);
-    trackProcess(proc, { dispose: stop }, disposables);
+    trackProcess(proc, { dispose: () => stopProcess(proc, { retry: true }) }, disposables);
     const internalDisposables: IDisposable[] = [];
 
     // eslint-disable-next-line @typescript-eslint/ban-types
@@ -154,7 +142,13 @@ export function plainExec(
     };
 
     if (options.token) {
-        internalDisposables.push(options.token.onCancellationRequested(stop));
+        internalDisposables.push(
+            options.token.onCancellationRequested(() => {
+                if (!deferred.completed) {
+                    stopProcess(proc);
+                }
+            }),
+        );
     }
 
     const stdoutBuffers: Buffer[] = [];
@@ -231,7 +225,7 @@ export function execObservable(
     }
     const proc = spawn(file, args, spawnOptions);
     const dispose = () => {
-        stopProcess(proc);
+        stopProcess(proc, { retry: true });
         proc.unref();
     };
     trackProcess(proc, { dispose }, disposables);

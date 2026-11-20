@@ -271,41 +271,87 @@ suite('Completed process handle lifetime', () => {
             });
         }
 
-        test('subscribing after observable cancellation does not send a second stop signal', async () => {
-            const handles = new Set<IDisposable>();
-            const cancellation = new ReplayingCancellationTokenSource();
-            const result = execObservable(
-                process.execPath,
-                ['-e', `${ignoreFirstSignal} process.stdout.write("ready"); ${exitIfNotStopped}`],
-                { doNotLog: true, token: cancellation.token },
-                undefined,
-                handles,
-            );
-            const { proc } = result;
-            assert.ok(proc?.stdout);
-            const closed = once(proc, 'close');
+        for (const firstStop of ['an observable subscription', 'a raw process consumer']) {
+            test(`late subscription shares one cancellation signal with ${firstStop}`, async () => {
+                const handles = new Set<IDisposable>();
+                const cancellation = new ReplayingCancellationTokenSource();
+                const result = execObservable(
+                    process.execPath,
+                    ['-e', `${ignoreFirstSignal} process.stdout.write("ready"); ${exitIfNotStopped}`],
+                    { doNotLog: true, token: cancellation.token },
+                    undefined,
+                    handles,
+                );
+                const { proc } = result;
+                assert.ok(proc?.stdout);
+                const closed = once(proc, 'close');
+                const kill = spy(process, 'kill');
+                try {
+                    const ready = nextOutput(proc.stdout, closed);
+                    const rawConsumer = firstStop === 'a raw process consumer';
+                    if (rawConsumer) {
+                        cancellation.token.onCancellationRequested(() => proc.kill());
+                    } else {
+                        result.out.subscribe();
+                    }
+                    assert.strictEqual(await ready, 'ready');
+                    const survived = nextOutput(proc.stdout, closed);
+                    cancellation.cancel();
+                    assert.strictEqual(await survived, 'survived');
+                    assert.strictEqual(proc.killed, rawConsumer);
+
+                    result.out.subscribe();
+                    await new Promise<void>((resolve) => cancellation.token.onCancellationRequested(resolve));
+                    assert.strictEqual(kill.withArgs(proc.pid).callCount, rawConsumer ? 0 : 1);
+                    assert.strictEqual(handles.size, 1);
+                    handles.forEach((handle) => handle.dispose());
+                    const [, signal] = await closed;
+                    assert.strictEqual(signal, 'SIGTERM');
+                    assert.strictEqual(handles.size, 0);
+                } finally {
+                    kill.restore();
+                    cancellation.dispose();
+                    if (proc.exitCode === null && proc.signalCode === null) proc.kill('SIGKILL');
+                    await closed;
+                }
+            });
+        }
+
+        test('plain cancellation preserves a native timeout signal and shutdown can retry', async () => {
+            const service = new ProcessService();
+            const cancellation = new CancellationTokenSource();
+            const survived = createDeferred<void>();
+            const outputChannel = {
+                append(text: string) {
+                    if (text === 'survived') survived.resolve();
+                },
+            } as OutputChannel;
+            const spawn = spy(childProcess, 'spawn');
+            const result = service.exec(process.execPath, ['-e', `${ignoreFirstSignal} ${exitIfNotStopped}`], {
+                timeout: 1500,
+                token: cancellation.token,
+                outputChannel,
+            });
+            const proc = spawn.firstCall?.returnValue;
+            spawn.restore();
+            assert.ok(proc);
             const kill = spy(process, 'kill');
             try {
-                const ready = nextOutput(proc.stdout, closed);
-                result.out.subscribe();
-                assert.strictEqual(await ready, 'ready');
-                const survived = nextOutput(proc.stdout, closed);
-                cancellation.cancel();
-                assert.strictEqual(await survived, 'survived');
+                await Promise.race([survived.promise, result]);
+                assert.ok(survived.completed);
+                assert.strictEqual(proc.killed, true);
 
-                result.out.subscribe();
-                await new Promise<void>((resolve) => cancellation.token.onCancellationRequested(resolve));
+                cancellation.cancel();
+                assert.strictEqual(kill.withArgs(proc.pid).callCount, 0);
+                service.dispose();
                 assert.strictEqual(kill.withArgs(proc.pid).callCount, 1);
-                assert.strictEqual(handles.size, 1);
-                handles.forEach((handle) => handle.dispose());
-                const [, signal] = await closed;
-                assert.strictEqual(signal, 'SIGTERM');
-                assert.strictEqual(handles.size, 0);
+                assert.strictEqual((await result).stdout, 'survived');
             } finally {
                 kill.restore();
                 cancellation.dispose();
                 if (proc.exitCode === null && proc.signalCode === null) proc.kill('SIGKILL');
-                await closed;
+                await result;
+                service.dispose();
             }
         });
 
